@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>dev.supirvast</groupId>
+        <artifactId>supir-vast</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>vastir</artifactId>
+
+    <name>Supir-Vast :: vastir</name>
+    <description>
+        The pure-Java intermediate representation. Models SPIR-V semantics in structured form and lowers to
+        SPIR-V binary. Deliberately free of any GraalVM/Truffle dependency so the lowering pipeline can be used
+        as a standalone library. This is the single source of truth from which the executable AST is generated.
+    </description>
+
+    <!-- No GraalVM/Truffle dependency here, by design. Only the inherited test stack applies. -->
+
+    <build>
+        <plugins>
+            <!--
+              Generate SPIR-V Java sources from the pinned grammar before compilation.
+              vastir-codegen is referenced as a PLUGIN dependency only (includeProjectDependencies=false),
+              so neither it nor its JSON parser leak onto vastir's compile/runtime classpath.
+            -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>generate-spirv-sources</id>
+                        <phase>generate-sources</phase>
+                        <goals>
+                            <goal>java</goal>
+                        </goals>
+                        <configuration>
+                            <mainClass>dev.supirvast.vastir.codegen.SpirvCodegen</mainClass>
+                            <includeProjectDependencies>false</includeProjectDependencies>
+                            <includePluginDependencies>true</includePluginDependencies>
+                            <arguments>
+                                <argument>${project.build.directory}/generated-sources/spirv</argument>
+                            </arguments>
+                        </configuration>
+                    </execution>
+                </executions>
+                <dependencies>
+                    <dependency>
+                        <groupId>dev.supirvast</groupId>
+                        <artifactId>vastir-codegen</artifactId>
+                        <version>${project.version}</version>
+                    </dependency>
+                </dependencies>
+            </plugin>
+
+            <!-- Register the generated directory so javac picks it up. -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>build-helper-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>add-spirv-generated-sources</id>
+                        <phase>generate-sources</phase>
+                        <goals>
+                            <goal>add-source</goal>
+                        </goals>
+                        <configuration>
+                            <sources>
+                                <source>${project.build.directory}/generated-sources/spirv</source>
+                            </sources>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

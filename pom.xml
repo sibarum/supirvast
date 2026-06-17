@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>dev.supirvast</groupId>
+    <artifactId>supir-vast</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+
+    <name>Supir-Vast</name>
+    <description>
+        A Java/GraalVM framework that models a SPIR-V program as an executable Truffle AST and lowers it to
+        SPIR-V binary on demand (and, via SPIRV-Cross, onward to GLSL/HLSL/Metal). The IR (vastir) is the
+        single source of truth: it emits SPIR-V and is the source from which the executable Truffle AST (vast)
+        is generated.
+    </description>
+
+    <modules>
+        <!-- Build-time generator: emits Java from the pinned official SPIR-V grammar. Built first. -->
+        <module>vastir-codegen</module>
+        <!-- Pure-Java IR: structured CFG, SPIR-V semantics, SPIR-V binary emitter. No GraalVM/Truffle dependency. -->
+        <module>vastir</module>
+        <!-- Executable Truffle AST generated from vastir; depends on Truffle. -->
+        <module>vast</module>
+        <!-- Bundled native SPIR-V toolchain + differential harness; depends on vastir and vast. -->
+        <module>vastir-tools</module>
+    </modules>
+
+    <properties>
+        <maven.compiler.release>25</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <!-- Matches the installed GraalVM for JDK 25.0.1; Truffle artifacts share that version line. -->
+        <truffle.version>25.0.1</truffle.version>
+        <junit.version>5.11.4</junit.version>
+        <!-- Vulkan compute dispatch (GPU execution) lives in vastir-tools. -->
+        <lwjgl.version>3.3.4</lwjgl.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- Truffle (used by the vast module only). -->
+            <dependency>
+                <groupId>org.graalvm.truffle</groupId>
+                <artifactId>truffle-api</artifactId>
+                <version>${truffle.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.graalvm.truffle</groupId>
+                <artifactId>truffle-dsl-processor</artifactId>
+                <version>${truffle.version}</version>
+                <scope>provided</scope>
+            </dependency>
+
+            <!-- Reactor-internal dependency: vast consumes vastir. -->
+            <dependency>
+                <groupId>dev.supirvast</groupId>
+                <artifactId>vastir</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+
+            <!-- Test stack. -->
+            <dependency>
+                <groupId>org.junit</groupId>
+                <artifactId>junit-bom</artifactId>
+                <version>${junit.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+
+            <!-- LWJGL: manages lwjgl + lwjgl-vulkan + native classifier versions together. -->
+            <dependency>
+                <groupId>org.lwjgl</groupId>
+                <artifactId>lwjgl-bom</artifactId>
+                <version>${lwjgl.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <version>3.13.0</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-surefire-plugin</artifactId>
+                    <version>3.5.2</version>
+                </plugin>
+                <!-- Runs the vastir-codegen generator during vastir's generate-sources phase. -->
+                <plugin>
+                    <groupId>org.codehaus.mojo</groupId>
+                    <artifactId>exec-maven-plugin</artifactId>
+                    <version>3.5.0</version>
+                </plugin>
+                <!-- Adds the generated-sources directory as a compile source root. -->
+                <plugin>
+                    <groupId>org.codehaus.mojo</groupId>
+                    <artifactId>build-helper-maven-plugin</artifactId>
+                    <version>3.6.0</version>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+    </build>
+</project>

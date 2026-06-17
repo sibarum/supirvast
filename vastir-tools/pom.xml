@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>dev.supirvast</groupId>
+        <artifactId>supir-vast</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>vastir-tools</artifactId>
+
+    <name>Supir-Vast :: vastir-tools</name>
+    <description>
+        Bundles the native SPIR-V toolchain (SPIRV-Tools: spirv-val/dis/as/opt, and SPIRV-Cross) for the host
+        platform and exposes a runtime API to validate, disassemble, and cross-compile SPIR-V produced by the
+        vastir emitter. Binaries are fetched from the pinned LunarG Vulkan SDK at build time (cached under
+        ~/.supirvast) and packaged into the jar; the runtime extracts and invokes them as processes.
+    </description>
+
+    <properties>
+        <!-- Pinned to match the SPIRV-Headers grammar tag used by vastir-codegen. -->
+        <vulkan.sdk.version>1.4.350.0</vulkan.sdk.version>
+        <!-- Set -Dvast.skipNativeTools=true to skip the SDK fetch/bundle (offline/CI without natives). -->
+        <vast.skipNativeTools>false</vast.skipNativeTools>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>dev.supirvast</groupId>
+            <artifactId>vastir</artifactId>
+        </dependency>
+        <!-- For the differential harness: lower the same core IR to an executable Truffle AST. -->
+        <dependency>
+            <groupId>dev.supirvast</groupId>
+            <artifactId>vast</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
+        <!-- Vulkan compute dispatch to execute our SPIR-V on the GPU. -->
+        <dependency>
+            <groupId>org.lwjgl</groupId>
+            <artifactId>lwjgl</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.lwjgl</groupId>
+            <artifactId>lwjgl-vulkan</artifactId>
+        </dependency>
+        <!-- lwjgl-vulkan dlopens the system Vulkan loader, so only the core natives are needed. -->
+        <dependency>
+            <groupId>org.lwjgl</groupId>
+            <artifactId>lwjgl</artifactId>
+            <classifier>natives-windows</classifier>
+            <scope>runtime</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!--
+              Fetch + bundle the native SPIR-V tools after compile (so this module's installer class exists)
+              and before test/package (so the binaries are on the test classpath and inside the jar).
+            -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>bundle-native-tools</id>
+                        <phase>process-classes</phase>
+                        <goals>
+                            <goal>java</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${vast.skipNativeTools}</skip>
+                            <mainClass>dev.supirvast.vastir.tools.NativeToolsInstaller</mainClass>
+                            <arguments>
+                                <argument>${project.build.outputDirectory}</argument>
+                                <argument>${vulkan.sdk.version}</argument>
+                            </arguments>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
