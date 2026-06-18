@@ -18,7 +18,9 @@ import java.nio.file.Path;
 import java.util.List;
 
 import static org.lwjgl.glfw.GLFW.GLFW_CLIENT_API;
+import static org.lwjgl.glfw.GLFW.GLFW_FALSE;
 import static org.lwjgl.glfw.GLFW.GLFW_NO_API;
+import static org.lwjgl.glfw.GLFW.GLFW_VISIBLE;
 import static org.lwjgl.glfw.GLFW.glfwCreateWindow;
 import static org.lwjgl.glfw.GLFW.glfwDestroyWindow;
 import static org.lwjgl.glfw.GLFW.glfwInit;
@@ -29,6 +31,7 @@ import static org.lwjgl.glfw.GLFW.glfwWindowShouldClose;
 import static org.lwjgl.glfw.GLFWVulkan.glfwCreateWindowSurface;
 import static org.lwjgl.glfw.GLFWVulkan.glfwGetRequiredInstanceExtensions;
 import static org.lwjgl.glfw.GLFWVulkan.glfwVulkanSupported;
+import static org.lwjgl.stb.STBImageWrite.stbi_write_png;
 import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.system.MemoryUtil.NULL;
 import static org.lwjgl.vulkan.KHRSurface.*;
@@ -70,6 +73,7 @@ public final class PreviewApp implements AutoCloseable {
     private int swapchainFormat;
     private int extentWidth;
     private int extentHeight;
+    private long[] swapchainImages = new long[0];
     private long[] imageViews = new long[0];
     private long[] framebuffers = new long[0];
     private long renderPass;
@@ -115,14 +119,15 @@ public final class PreviewApp implements AutoCloseable {
         }
     }
 
-    /** Initializes window + Vulkan, runs the render loop until the window closes (or the frame cap is hit). */
+    /** Initializes window + Vulkan, then either captures a one-shot screenshot or runs the render loop. */
     public void run() {
         initWindow();
         initVulkan();
         if (options.screenshot().isPresent()) {
-            System.err.println("[preview] --screenshot is not wired yet (lands in step 5); rendering to the window");
+            captureScreenshot(options.screenshot().get());
+        } else {
+            loop();
         }
-        loop();
     }
 
     private void initWindow() {
@@ -133,6 +138,9 @@ public final class PreviewApp implements AutoCloseable {
             throw new IllegalStateException("GLFW reports Vulkan is not supported on this machine");
         }
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);   // no OpenGL context; this is a Vulkan window
+        if (options.screenshot().isPresent()) {
+            glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);   // one-shot capture: render off-screen, don't flash a window
+        }
         window = glfwCreateWindow(options.width(), options.height(), "vastir-preview", NULL, NULL);
         if (window == NULL) {
             throw new IllegalStateException("failed to create the GLFW window");
@@ -275,8 +283,8 @@ public final class PreviewApp implements AutoCloseable {
         check(vkCreateSwapchainKHR(device, info, null, pSwapchain), "vkCreateSwapchainKHR");
         swapchain = pSwapchain.get(0);
 
-        long[] images = swapchainImages(stack);
-        createImageViews(stack, images);
+        swapchainImages = swapchainImages(stack);
+        createImageViews(stack, swapchainImages);
     }
 
     private VkSurfaceFormatKHR.Buffer surfaceFormats(MemoryStack stack) {
@@ -761,6 +769,134 @@ public final class PreviewApp implements AutoCloseable {
                     .pSwapchains(stack.longs(swapchain))
                     .pImageIndices(stack.ints(imageIndex));
             check(vkQueuePresentKHR(queue, present), "vkQueuePresentKHR");
+        }
+    }
+
+    /** Renders one frame off-screen, copies the rendered image to host memory, and writes it as a PNG. */
+    private void captureScreenshot(Path output) {
+        try (MemoryStack stack = stackPush()) {
+            check(vkWaitForFences(device, stack.longs(inFlight), true, Long.MAX_VALUE), "vkWaitForFences");
+            check(vkResetFences(device, stack.longs(inFlight)), "vkResetFences");
+
+            IntBuffer pImageIndex = stack.mallocInt(1);
+            check(vkAcquireNextImageKHR(device, swapchain, Long.MAX_VALUE, imageAvailable, VK_NULL_HANDLE,
+                    pImageIndex), "vkAcquireNextImageKHR");
+            int imageIndex = pImageIndex.get(0);
+
+            check(vkResetCommandBuffer(commandBuffer, 0), "vkResetCommandBuffer");
+            recordDraw(framebuffers[imageIndex], stack);
+
+            VkSubmitInfo submit = VkSubmitInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
+                    .waitSemaphoreCount(1)
+                    .pWaitSemaphores(stack.longs(imageAvailable))
+                    .pWaitDstStageMask(stack.ints(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT))
+                    .pCommandBuffers(stack.pointers(commandBuffer));
+            check(vkQueueSubmit(queue, submit, inFlight), "vkQueueSubmit");
+            check(vkWaitForFences(device, stack.longs(inFlight), true, Long.MAX_VALUE), "vkWaitForFences");
+
+            long bytes = (long) extentWidth * extentHeight * 4;
+            long buffer = createBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, stack);
+            long memory = bindHostVisible(buffer, stack);
+            copyImageToBuffer(swapchainImages[imageIndex], buffer, stack);
+            writePng(output, memory, bytes);
+            vkFreeMemory(device, memory, null);
+            vkDestroyBuffer(device, buffer, null);
+        }
+        System.out.println("[preview] wrote " + extentWidth + "x" + extentHeight + " screenshot to " + output);
+    }
+
+    /** Transitions the presented image to a transfer source and copies it into {@code buffer}. */
+    private void copyImageToBuffer(long image, long buffer, MemoryStack stack) {
+        VkCommandBufferAllocateInfo allocInfo = VkCommandBufferAllocateInfo.calloc(stack)
+                .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO)
+                .commandPool(commandPool)
+                .level(VK_COMMAND_BUFFER_LEVEL_PRIMARY)
+                .commandBufferCount(1);
+        PointerBuffer pCmd = stack.mallocPointer(1);
+        check(vkAllocateCommandBuffers(device, allocInfo, pCmd), "vkAllocateCommandBuffers");
+        VkCommandBuffer cmd = new VkCommandBuffer(pCmd.get(0), device);
+
+        VkCommandBufferBeginInfo begin = VkCommandBufferBeginInfo.calloc(stack)
+                .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+                .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+        check(vkBeginCommandBuffer(cmd, begin), "vkBeginCommandBuffer");
+
+        VkImageMemoryBarrier.Buffer barrier = VkImageMemoryBarrier.calloc(1, stack)
+                .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
+                .oldLayout(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
+                .newLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+                .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .srcAccessMask(0)
+                .dstAccessMask(VK_ACCESS_TRANSFER_READ_BIT);
+        barrier.subresourceRange()
+                .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, null, null, barrier);
+
+        VkBufferImageCopy.Buffer region = VkBufferImageCopy.calloc(1, stack)
+                .bufferOffset(0).bufferRowLength(0).bufferImageHeight(0);
+        region.imageSubresource().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0)
+                .baseArrayLayer(0).layerCount(1);
+        region.imageOffset().set(0, 0, 0);
+        region.imageExtent().width(extentWidth).height(extentHeight).depth(1);
+        vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, region);
+
+        check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
+        VkSubmitInfo submit = VkSubmitInfo.calloc(stack)
+                .sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
+                .pCommandBuffers(stack.pointers(cmd));
+        check(vkQueueSubmit(queue, submit, VK_NULL_HANDLE), "vkQueueSubmit(copy)");
+        check(vkQueueWaitIdle(queue), "vkQueueWaitIdle");
+        vkFreeCommandBuffers(device, commandPool, cmd);
+    }
+
+    /** Reads RGBA pixels from mapped {@code memory} (swizzling BGRA swapchains) and writes a PNG. */
+    private void writePng(Path output, long memory, long bytes) {
+        ensureParent(output);
+        try (MemoryStack stack = stackPush()) {
+            PointerBuffer pData = stack.mallocPointer(1);
+            check(vkMapMemory(device, memory, 0, bytes, 0, pData), "vkMapMemory");
+            ByteBuffer src = MemoryUtil.memByteBuffer(pData.get(0), (int) bytes);
+            boolean bgra = swapchainFormat == VK_FORMAT_B8G8R8A8_UNORM
+                    || swapchainFormat == VK_FORMAT_B8G8R8A8_SRGB;
+
+            ByteBuffer pixels = MemoryUtil.memAlloc((int) bytes);
+            for (int i = 0; i < extentWidth * extentHeight; i++) {
+                int k = i * 4;
+                byte c0 = src.get(k);
+                byte c1 = src.get(k + 1);
+                byte c2 = src.get(k + 2);
+                byte c3 = src.get(k + 3);
+                if (bgra) {
+                    pixels.put(c2).put(c1).put(c0).put(c3);   // BGRA → RGBA
+                } else {
+                    pixels.put(c0).put(c1).put(c2).put(c3);
+                }
+            }
+            pixels.flip();
+            vkUnmapMemory(device, memory);
+
+            boolean ok = stbi_write_png(output.toString(), extentWidth, extentHeight, 4, pixels, extentWidth * 4);
+            MemoryUtil.memFree(pixels);
+            if (!ok) {
+                throw new IllegalStateException("stbi_write_png failed for " + output);
+            }
+        }
+    }
+
+    private static void ensureParent(Path output) {
+        Path parent = output.getParent();
+        if (parent == null) {
+            return;
+        }
+        try {
+            Files.createDirectories(parent);
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot create screenshot directory " + parent, e);
         }
     }
 

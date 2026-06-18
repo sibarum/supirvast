@@ -119,12 +119,41 @@ Ordered by dependency. Each step should leave the module in a runnable/verifiabl
       statically: the vertex shader emits `gl_Position` from the model position, and `SampleAssets` generates
       the cube **pre-rotated in clip space** so several faces show. JOML is already a dependency, ready for it.
 
-### 5. Screenshot + acceptance
-- [ ] Copy the presented image to a host-visible buffer; write PNG via `lwjgl-stb` `stbi_write_png`.
-- [ ] `--screenshot <png>`: render one frame headlessly-ish (hidden/!visible window is fine), write, exit.
-- [ ] Optional: keypress (e.g. `F12`) screenshot during interactive preview.
-- [ ] Check in a sample vertex+fragment pair (authored in `core`, lowered to `.spv`) and a cube `.obj` so the
-      end-to-end run is reproducible: `--vert … --frag … --model cube.obj --screenshot out.png` → non-blank PNG.
+### 5. Screenshot + acceptance — ✅ done
+> Verified on the RTX 2070: `--screenshot` produced a 512×512 PNG of the depth-tested cube, three faces in
+> distinct normal-based colors. End-to-end proven: `.ply` model + `core`-authored shaders → SPIR-V → pipeline
+> → rendered → PNG.
+- [x] Copy the rendered image to a host-visible buffer (`vkCmdCopyImageToBuffer` + layout barrier); write PNG
+      via `lwjgl-stb` `stbi_write_png`, swizzling BGRA→RGBA.
+- [x] `--screenshot <png>`: render one frame off-screen (window hinted `GLFW_VISIBLE=false`), write, exit.
+- [x] Reproducible from the committed `SampleAssets` generator — see **Reproduce** below. The generator emits
+      `cube.obj`, a colored `cube.ply`, and the `core`-authored `model.vert/frag.spv`.
+- [ ] Deferred (optional): keypress (e.g. `F12`) screenshot during interactive preview.
+
+### Optional gate (nice-to-have)
+- [ ] Before building the pipeline, run the loaded `.spv` through `NativeTools.validate()` and fail with a
+      clear message if it's rejected — reuses the project's "validation as living requirements" ethos.
+
+## Reproduce
+
+From the repo root (assets are generated, not committed — the generator is the source of truth, à la the
+codegen convention). Output lands under `target/samples/` (git-ignored):
+
+```sh
+# 1. generate cube.obj, cube.ply, and the core-authored vertex/fragment SPIR-V
+mvn -pl vastir-preview exec:java -Dexec.mainClass=dev.supirvast.vastir.preview.SampleAssets \
+    -Dexec.args="target/samples"
+
+# 2a. interactive window (Esc/close to quit; --frames N to auto-exit)
+mvn -pl vastir-preview exec:java -Dexec.mainClass=dev.supirvast.vastir.preview.PreviewApp \
+    -Dexec.args="--vert target/samples/model.vert.spv --frag target/samples/model.frag.spv \
+                 --model target/samples/cube.ply"
+
+# 2b. one-shot PNG screenshot (off-screen)
+mvn -pl vastir-preview exec:java -Dexec.mainClass=dev.supirvast.vastir.preview.PreviewApp \
+    -Dexec.args="--vert target/samples/model.vert.spv --frag target/samples/model.frag.spv \
+                 --model target/samples/cube.ply --screenshot target/samples/cube.png"
+```
 
 ### Optional gate (nice-to-have)
 - [ ] Before building the pipeline, run the loaded `.spv` through `NativeTools.validate()` and fail with a
