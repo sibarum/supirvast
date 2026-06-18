@@ -141,6 +141,8 @@ public final class CoreToTruffle {
             case Expr.Param p -> new ParamNode(p.index());
             case Expr.Call c -> new CallNode(ctx.targets(), c.callee(),
                     c.arguments().stream().map(a -> lowerExpr(a, ctx)).toArray(ExprNode[]::new));
+            case Expr.MathCall ignored -> throw new UnsupportedOperationException(
+                    "math intrinsics (dot/normalize/pow/…) are graphics-only — no CPU backend yet");
         };
     }
 

@@ -133,4 +133,72 @@ public sealed interface Expr {
             return callee.signature().returnType();
         }
     }
+
+    /**
+     * A built-in floating-point math intrinsic ({@link MathFn}) over scalar/vector operands — {@code dot},
+     * {@code normalize}, {@code pow}, {@code clamp}, etc. The result {@code type} is carried explicitly; use the
+     * factory helpers, which derive it ({@code DOT}/{@code LENGTH} reduce to the vector's component type, the
+     * rest share the first argument's type). Lowers to {@code OpDot} or a {@code GLSL.std.450} {@code OpExtInst}.
+     */
+    record MathCall(MathFn fn, Type type, List<Expr> args) implements Expr {
+        public MathCall {
+            args = List.copyOf(args);
+        }
+
+        public static MathCall dot(Expr a, Expr b) {
+            return new MathCall(MathFn.DOT, componentOf(a), List.of(a, b));
+        }
+
+        public static MathCall length(Expr v) {
+            return new MathCall(MathFn.LENGTH, componentOf(v), List.of(v));
+        }
+
+        public static MathCall normalize(Expr v) {
+            return new MathCall(MathFn.NORMALIZE, v.type(), List.of(v));
+        }
+
+        public static MathCall abs(Expr v) {
+            return new MathCall(MathFn.ABS, v.type(), List.of(v));
+        }
+
+        public static MathCall sqrt(Expr v) {
+            return new MathCall(MathFn.SQRT, v.type(), List.of(v));
+        }
+
+        public static MathCall inverseSqrt(Expr v) {
+            return new MathCall(MathFn.INVERSE_SQRT, v.type(), List.of(v));
+        }
+
+        public static MathCall cross(Expr a, Expr b) {
+            return new MathCall(MathFn.CROSS, a.type(), List.of(a, b));
+        }
+
+        public static MathCall reflect(Expr incident, Expr normal) {
+            return new MathCall(MathFn.REFLECT, incident.type(), List.of(incident, normal));
+        }
+
+        public static MathCall pow(Expr base, Expr exponent) {
+            return new MathCall(MathFn.POW, base.type(), List.of(base, exponent));
+        }
+
+        public static MathCall min(Expr a, Expr b) {
+            return new MathCall(MathFn.MIN, a.type(), List.of(a, b));
+        }
+
+        public static MathCall max(Expr a, Expr b) {
+            return new MathCall(MathFn.MAX, a.type(), List.of(a, b));
+        }
+
+        public static MathCall clamp(Expr x, Expr lo, Expr hi) {
+            return new MathCall(MathFn.CLAMP, x.type(), List.of(x, lo, hi));
+        }
+
+        public static MathCall mix(Expr a, Expr b, Expr t) {
+            return new MathCall(MathFn.MIX, a.type(), List.of(a, b, t));
+        }
+
+        private static Type componentOf(Expr vector) {
+            return ((Type.Vector) vector.type()).component();
+        }
+    }
 }

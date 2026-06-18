@@ -5,6 +5,7 @@ import dev.supirvast.vastir.binary.SpirvModule;
 import dev.supirvast.vastir.core.BinaryOp;
 import dev.supirvast.vastir.core.Buffer;
 import dev.supirvast.vastir.core.Builtin;
+import dev.supirvast.vastir.core.MathFn;
 import dev.supirvast.vastir.core.CoreModule;
 import dev.supirvast.vastir.core.EntryPoint;
 import dev.supirvast.vastir.core.Expr;
@@ -250,6 +251,7 @@ public final class CoreToSpirv {
             case Expr.Convert cv -> collectBuffers(cv.operand(), out);
             case Expr.Unary u -> collectBuffers(u.operand(), out);
             case Expr.Call c -> c.arguments().forEach(a -> collectBuffers(a, out));
+            case Expr.MathCall mc -> mc.args().forEach(a -> collectBuffers(a, out));
             case Expr.ConstInt ignored -> { }
             case Expr.ConstFloat ignored -> { }
             case Expr.ConstBool ignored -> { }
@@ -297,6 +299,7 @@ public final class CoreToSpirv {
             case Expr.Convert cv -> scanForInvocationId(cv.operand(), found);
             case Expr.Unary u -> scanForInvocationId(u.operand(), found);
             case Expr.Call c -> c.arguments().forEach(a -> scanForInvocationId(a, found));
+            case Expr.MathCall mc -> mc.args().forEach(a -> scanForInvocationId(a, found));
             case Expr.ConstInt ignored -> { }
             case Expr.ConstFloat ignored -> { }
             case Expr.ConstBool ignored -> { }
@@ -371,6 +374,7 @@ public final class CoreToSpirv {
             case Expr.Convert cv -> scanInterface(cv.operand(), builtins, variables);
             case Expr.Unary u -> scanInterface(u.operand(), builtins, variables);
             case Expr.Call c -> c.arguments().forEach(a -> scanInterface(a, builtins, variables));
+            case Expr.MathCall mc -> mc.args().forEach(a -> scanInterface(a, builtins, variables));
             case Expr.ConstInt ignored -> { }
             case Expr.ConstFloat ignored -> { }
             case Expr.ConstBool ignored -> { }
@@ -468,6 +472,10 @@ public final class CoreToSpirv {
                 types.idOf(c.type());
                 c.arguments().forEach(a -> prepareExpr(a, types, constants));
             }
+            case Expr.MathCall mc -> {
+                types.idOf(mc.type());
+                mc.args().forEach(a -> prepareExpr(a, types, constants));
+            }
         }
     }
 
@@ -485,12 +493,14 @@ public final class CoreToSpirv {
     private static final class Builder {
         final SpirvModule module = new SpirvModule();
         final List<Instruction> capabilities = new ArrayList<>();
+        final List<Instruction> extInstImports = new ArrayList<>();
         final List<Instruction> memoryModel = new ArrayList<>();
         final List<Instruction> entryPoints = new ArrayList<>();
         final List<Instruction> executionModes = new ArrayList<>();
         final List<Instruction> annotations = new ArrayList<>();
         final List<Instruction> globals = new ArrayList<>(); // types, constants, global variables
         final List<Instruction> functions = new ArrayList<>();
+        private int glslStd450Id = 0;   // lazily imported on first use; 0 means "not yet imported"
 
         int allocateId() {
             return module.allocateId();
@@ -502,9 +512,19 @@ public final class CoreToSpirv {
             return instruction;
         }
 
+        /** The id of the imported {@code GLSL.std.450} extended instruction set, importing it on first use. */
+        int glslStd450() {
+            if (glslStd450Id == 0) {
+                glslStd450Id = allocateId();
+                emit(extInstImports, Op.OpExtInstImport).id(glslStd450Id).string("GLSL.std.450");
+            }
+            return glslStd450Id;
+        }
+
         SpirvModule finish() {
-            List<List<Instruction>> ordered =
-                    List.of(capabilities, memoryModel, entryPoints, executionModes, annotations, globals, functions);
+            // OpExtInstImport must follow capabilities/extensions and precede OpMemoryModel (SPIR-V layout).
+            List<List<Instruction>> ordered = List.of(capabilities, extInstImports, memoryModel, entryPoints,
+                    executionModes, annotations, globals, functions);
             for (List<Instruction> section : ordered) {
                 section.forEach(module::add);
             }
@@ -1038,6 +1058,42 @@ public final class CoreToSpirv {
                     }
                     yield result;
                 }
+                case Expr.MathCall mc -> lowerMathCall(mc);
+            };
+        }
+
+        /** Lowers a math intrinsic to {@code OpDot} or a {@code GLSL.std.450} {@code OpExtInst}. */
+        private int lowerMathCall(Expr.MathCall call) {
+            int resultType = types.idOf(call.type());
+            // Lower the arguments first, then emit the op — emitting first would place it before its operands.
+            int[] argIds = call.args().stream().mapToInt(this::lowerExpr).toArray();
+            int result = b.allocateId();
+            Instruction instruction = call.fn() == MathFn.DOT
+                    ? b.emit(b.functions, Op.OpDot).id(resultType).id(result)
+                    : b.emit(b.functions, Op.OpExtInst).id(resultType).id(result)
+                            .id(b.glslStd450()).literal(glslStd450Number(call.fn()));
+            for (int argId : argIds) {
+                instruction.id(argId);
+            }
+            return result;
+        }
+
+        /** GLSL.std.450 extended-instruction numbers (float variants); {@code DOT} is the core {@code OpDot}. */
+        private static int glslStd450Number(MathFn fn) {
+            return switch (fn) {
+                case LENGTH -> 66;
+                case CROSS -> 68;
+                case NORMALIZE -> 69;
+                case REFLECT -> 71;
+                case POW -> 26;
+                case SQRT -> 31;
+                case INVERSE_SQRT -> 32;
+                case ABS -> 4;      // FAbs
+                case MIN -> 37;     // FMin
+                case MAX -> 40;     // FMax
+                case CLAMP -> 43;   // FClamp
+                case MIX -> 46;     // FMix
+                case DOT -> throw new IllegalArgumentException("DOT lowers to OpDot, not a GLSL.std.450 instruction");
             };
         }
 
