@@ -42,11 +42,27 @@ public sealed interface Expr {
         }
     }
 
-    /** Reads {@code buffer[index]} (an i32 element of a storage buffer). */
+    /** Reads {@code buffer[index]} — an element of a storage buffer, typed by the buffer's element type. */
     record BufferLoad(Buffer buffer, Expr index) implements Expr {
         @Override
         public Type type() {
-            return Type.int32();
+            return buffer.element();
+        }
+    }
+
+    /** Reads a graphics-pipeline built-in input (e.g. {@code gl_VertexIndex}); its type is fixed by the builtin. */
+    record BuiltinRead(Builtin builtin) implements Expr {
+        @Override
+        public Type type() {
+            return builtin.type();
+        }
+    }
+
+    /** Reads a stage interface input variable at its declared {@code location}. */
+    record InterfaceRead(InterfaceVar variable) implements Expr {
+        @Override
+        public Type type() {
+            return variable.type();
         }
     }
 
@@ -57,6 +73,26 @@ public sealed interface Expr {
             return op.producesBool() ? Type.BOOL : lhs.type();
         }
     }
+
+    /**
+     * Reinterprets {@code operand}'s bits as {@code type}, without changing them — the core-level
+     * {@code OpBitcast}. Used to move between {@code i32} and {@code uint32} (same machine representation, so
+     * a no-op on the CPU) so that signed and unsigned operators can be selected explicitly: load an i32 buffer
+     * element, bitcast it to {@code uint32} to drive unsigned arithmetic, then bitcast the result back to
+     * {@code i32} to store it. Operand and target must have the same bit width.
+     */
+    record Bitcast(Expr operand, Type type) implements Expr {}
+
+    /**
+     * Converts {@code operand} to a different-width integer {@code type} — the core-level {@code OpSConvert}/
+     * {@code OpUConvert}. Extension when widening follows the <em>target</em> type's signedness (signed target
+     * sign-extends, unsigned target zero-extends), since SPIR-V ties the opcode to the result type; narrowing
+     * truncates to the low bits. This is what moves between {@code i32} and {@code i64} (e.g. widen an i32
+     * buffer element before 64-bit arithmetic, then narrow the result back to store it). Operand and target
+     * must have <em>different</em> bit widths (SPIR-V forbids a same-width convert; use {@link Bitcast} to
+     * change signedness at the same width).
+     */
+    record Convert(Expr operand, Type type) implements Expr {}
 
     /** A unary operation. */
     record Unary(UnaryOp op, Expr operand) implements Expr {

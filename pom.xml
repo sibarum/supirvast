@@ -26,6 +26,8 @@
         <module>vast</module>
         <!-- Bundled native SPIR-V toolchain + differential harness; depends on vastir and vast. -->
         <module>vastir-tools</module>
+        <!-- Windowed Vulkan shader previewer (application): loads exported SPIR-V + a model, renders it. -->
+        <module>vastir-preview</module>
     </modules>
 
     <properties>
@@ -35,8 +37,11 @@
         <!-- Matches the installed GraalVM for JDK 25.0.1; Truffle artifacts share that version line. -->
         <truffle.version>25.0.1</truffle.version>
         <junit.version>5.11.4</junit.version>
-        <!-- Vulkan compute dispatch (GPU execution) lives in vastir-tools. -->
+        <!-- Vulkan compute dispatch (GPU execution) lives in vastir-tools; the windowed previewer
+             (vastir-preview) adds GLFW + stb on top of the same LWJGL line. -->
         <lwjgl.version>3.3.4</lwjgl.version>
+        <!-- Pure-Java matrix/vector math for the previewer's MVP transform (no natives). -->
+        <joml.version>1.10.7</joml.version>
     </properties>
 
     <dependencyManagement>
@@ -70,13 +75,20 @@
                 <scope>import</scope>
             </dependency>
 
-            <!-- LWJGL: manages lwjgl + lwjgl-vulkan + native classifier versions together. -->
+            <!-- LWJGL: manages lwjgl + lwjgl-vulkan + lwjgl-glfw + lwjgl-stb + native classifiers together. -->
             <dependency>
                 <groupId>org.lwjgl</groupId>
                 <artifactId>lwjgl-bom</artifactId>
                 <version>${lwjgl.version}</version>
                 <type>pom</type>
                 <scope>import</scope>
+            </dependency>
+
+            <!-- JOML is not part of the LWJGL BOM, so its version is managed explicitly here. -->
+            <dependency>
+                <groupId>org.joml</groupId>
+                <artifactId>joml</artifactId>
+                <version>${joml.version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>

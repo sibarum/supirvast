@@ -95,6 +95,38 @@ public final class NativeTools {
         }
     }
 
+    /**
+     * Optimizes a SPIR-V module with {@code spirv-opt}, returning the rewritten binary. With no
+     * {@code passes}, runs the standard {@code -O} performance recipe; otherwise runs exactly the passes given
+     * (e.g. {@code "--ssa-rewrite"} to promote memory-based locals to SSA {@code OpPhi} — the {@code mem2reg}
+     * transformation that makes hand-written {@code OpPhi} unnecessary).
+     */
+    public byte[] optimize(byte[] spirv, String... passes) {
+        Path module = writeTempModule(spirv);
+        Path output = newTempPath();
+        try {
+            List<String> command = new ArrayList<>(List.of(toolPath("spirv-opt").toString()));
+            if (passes.length == 0) {
+                command.add("-O");
+            } else {
+                command.addAll(List.of(passes));
+            }
+            command.add(module.toString());
+            command.add("-o");
+            command.add(output.toString());
+            Execution exec = run(command);
+            if (exec.exitCode() != 0) {
+                throw new IllegalStateException("spirv-opt failed: " + exec.stderr());
+            }
+            return Files.readAllBytes(output);
+        } catch (IOException e) {
+            throw new UncheckedIOException("failed to read optimized module", e);
+        } finally {
+            deleteQuietly(module);
+            deleteQuietly(output);
+        }
+    }
+
     /** Cross-compiles a SPIR-V module to the given high-level language with {@code spirv-cross}. */
     public String crossCompile(byte[] spirv, ShaderLanguage language) {
         Path module = writeTempModule(spirv);
@@ -102,7 +134,9 @@ public final class NativeTools {
             List<String> command = new ArrayList<>(List.of(toolPath("spirv-cross").toString(), module.toString()));
             switch (language) {
                 case GLSL -> { /* default output */ }
-                case HLSL -> command.add("--hlsl");
+                // Shader Model 5.0 (DX11) is the baseline for modern HLSL: it supports compute/UAVs and
+                // system-value semantics like SV_VertexID, which the default SM 3.0 rejects.
+                case HLSL -> command.addAll(List.of("--hlsl", "--shader-model", "50"));
                 case MSL -> command.add("--msl");
             }
             Execution exec = run(command);

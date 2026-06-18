@@ -1,0 +1,89 @@
+package dev.supirvast.vastir.preview;
+
+import java.nio.file.Path;
+import java.util.Optional;
+
+/**
+ * Parsed command-line options for the previewer. Kept separate from {@link PreviewApp} so the parsing is unit
+ * testable without a GPU or a window.
+ *
+ * <pre>
+ * --vert &lt;file.spv&gt;     vertex-stage SPIR-V (required)
+ * --frag &lt;file.spv&gt;     fragment-stage SPIR-V (required)
+ * --model &lt;file.obj&gt;    Wavefront OBJ model (required)
+ * --width &lt;px&gt;          window width  (default 1280)
+ * --height &lt;px&gt;         window height (default 720)
+ * --screenshot &lt;png&gt;    render one frame to this PNG and exit (optional)
+ * --frames &lt;n&gt;          render at most n frames then exit (optional; for non-interactive runs)
+ * </pre>
+ */
+public record PreviewOptions(
+        Path vert, Path frag, Path model,
+        int width, int height,
+        Optional<Path> screenshot, Optional<Integer> frames) {
+
+    private static final int DEFAULT_WIDTH = 1280;
+    private static final int DEFAULT_HEIGHT = 720;
+
+    public PreviewOptions {
+        if (vert == null || frag == null || model == null) {
+            throw new IllegalArgumentException("--vert, --frag, and --model are required");
+        }
+        if (width <= 0 || height <= 0) {
+            throw new IllegalArgumentException("--width/--height must be positive, got " + width + "x" + height);
+        }
+        frames.ifPresent(n -> {
+            if (n <= 0) {
+                throw new IllegalArgumentException("--frames must be positive, got " + n);
+            }
+        });
+    }
+
+    /** Parses {@code argv}, throwing {@link IllegalArgumentException} with a usage-friendly message on error. */
+    public static PreviewOptions parse(String[] argv) {
+        Path vert = null;
+        Path frag = null;
+        Path model = null;
+        int width = DEFAULT_WIDTH;
+        int height = DEFAULT_HEIGHT;
+        Optional<Path> screenshot = Optional.empty();
+        Optional<Integer> frames = Optional.empty();
+
+        for (int i = 0; i < argv.length; i++) {
+            String flag = argv[i];
+            switch (flag) {
+                case "--vert" -> vert = Path.of(value(argv, ++i, flag));
+                case "--frag" -> frag = Path.of(value(argv, ++i, flag));
+                case "--model" -> model = Path.of(value(argv, ++i, flag));
+                case "--width" -> width = intValue(argv, ++i, flag);
+                case "--height" -> height = intValue(argv, ++i, flag);
+                case "--screenshot" -> screenshot = Optional.of(Path.of(value(argv, ++i, flag)));
+                case "--frames" -> frames = Optional.of(intValue(argv, ++i, flag));
+                default -> throw new IllegalArgumentException("unknown option: " + flag);
+            }
+        }
+        return new PreviewOptions(vert, frag, model, width, height, screenshot, frames);
+    }
+
+    /** One-line usage string for error reporting. */
+    public static String usage() {
+        return "usage: vastir-preview --vert <file.spv> --frag <file.spv> --model <file.obj> "
+                + "[--width <px>] [--height <px>] [--screenshot <png>] [--frames <n>]";
+    }
+
+    private static String value(String[] argv, int index, String flag) {
+        if (index >= argv.length) {
+            throw new IllegalArgumentException(flag + " requires a value");
+        }
+        return argv[index];
+    }
+
+    private static int intValue(String[] argv, int index, String flag) {
+        String raw = value(argv, index, flag);
+        try {
+            return Integer.parseInt(raw);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(flag + " expects an integer, got '" + raw + "'");
+        }
+    }
+}

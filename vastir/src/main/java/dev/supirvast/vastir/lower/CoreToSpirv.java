@@ -4,10 +4,12 @@ import dev.supirvast.vastir.binary.Instruction;
 import dev.supirvast.vastir.binary.SpirvModule;
 import dev.supirvast.vastir.core.BinaryOp;
 import dev.supirvast.vastir.core.Buffer;
+import dev.supirvast.vastir.core.Builtin;
 import dev.supirvast.vastir.core.CoreModule;
 import dev.supirvast.vastir.core.EntryPoint;
 import dev.supirvast.vastir.core.Expr;
 import dev.supirvast.vastir.core.Function;
+import dev.supirvast.vastir.core.InterfaceVar;
 import dev.supirvast.vastir.core.LocalVar;
 import dev.supirvast.vastir.core.Region;
 import dev.supirvast.vastir.core.ShaderStage;
@@ -31,8 +33,10 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Lowers the core IR to a {@link SpirvModule}.
@@ -46,7 +50,18 @@ import java.util.Map;
  */
 public final class CoreToSpirv {
 
+    /** Lowers with no capability restriction (emit whatever the kernel requires). */
     public SpirvModule lower(CoreModule module) {
+        return lower(module, SpirvTarget.unconstrained());
+    }
+
+    /**
+     * Lowers within {@code target}'s capability budget. The minimal capabilities the kernel requires are
+     * derived from its types; if any falls outside the budget, lowering fails with a witness naming the
+     * offending capabilities (so the orchestrator can reject the kernel rather than emit something the target
+     * can't run).
+     */
+    public SpirvModule lower(CoreModule module, SpirvTarget target) {
         Builder b = new Builder();
 
         Map<Function, Integer> functionIds = new LinkedHashMap<>();
@@ -59,13 +74,16 @@ public final class CoreToSpirv {
         boolean invocationId = usesInvocationId(module);
         KernelResources kernel = (!buffers.isEmpty() || invocationId)
                 ? new KernelResources(b, buffers, invocationId) : null;
+        InterfaceUsage iface = collectInterface(module);
+        InterfaceResources interfaceResources = iface.isEmpty()
+                ? null : new InterfaceResources(b, iface.builtins(), iface.variables());
 
         b.emit(b.capabilities, Op.OpCapability).enumValue(Capability.Shader.value());
         b.emit(b.memoryModel, Op.OpMemoryModel)
-                .enumValue(AddressingModel.Logical.value())
-                .enumValue(MemoryModel.GLSL450.value());
+                .enumValue(target.addressingModel())
+                .enumValue(target.memoryModel());
 
-        emitEntryPoints(module, b, functionIds, output, kernel);
+        emitEntryPoints(module, b, functionIds, output, kernel, interfaceResources);
         emitExecutionModes(module, b, functionIds);
 
         TypeTable types = new TypeTable(b);
@@ -76,17 +94,44 @@ public final class CoreToSpirv {
         if (kernel != null) {
             kernel.declare(b, types, constants);
         }
+        if (interfaceResources != null) {
+            interfaceResources.declare(b, types);
+        }
         prepareGlobals(module, types, constants);
 
         for (Function function : module.functions()) {
-            new FunctionLowering(b, types, constants, output, kernel, functionIds)
+            new FunctionLowering(b, types, constants, output, kernel, interfaceResources, functionIds)
                     .emit(function, functionIds.get(function));
+        }
+
+        // Capabilities the kernel actually requires (derived from declared types); emit them now (they sort to
+        // the top of the module via the capabilities section). A required capability outside the target's
+        // budget fails the lowering with a witness — the caller decides what to do (e.g. reject, fall back).
+        List<Capability> required = new ArrayList<>();
+        if (types.usesInt8()) {
+            required.add(Capability.Int8);
+        }
+        if (types.usesInt16()) {
+            required.add(Capability.Int16);
+        }
+        if (types.usesInt64()) {
+            required.add(Capability.Int64);
+        }
+        if (types.usesFloat64()) {
+            required.add(Capability.Float64);
+        }
+        List<Capability> disallowed = required.stream().filter(c -> !target.allows(c)).toList();
+        if (!disallowed.isEmpty()) {
+            throw new CapabilityException("kernel requires capabilities outside the target profile: " + disallowed);
+        }
+        for (Capability capability : required) {
+            b.emit(b.capabilities, Op.OpCapability).enumValue(capability.value());
         }
         return b.finish();
     }
 
     private void emitEntryPoints(CoreModule module, Builder b, Map<Function, Integer> functionIds,
-            OutputBuffer output, KernelResources kernel) {
+            OutputBuffer output, KernelResources kernel, InterfaceResources interfaceResources) {
         for (EntryPoint entryPoint : module.entryPoints()) {
             Instruction instruction = b.emit(b.entryPoints, Op.OpEntryPoint)
                     .enumValue(executionModel(entryPoint.stage()))
@@ -98,6 +143,11 @@ public final class CoreToSpirv {
             }
             if (kernel != null) {
                 for (int interfaceVar : kernel.interfaceVariables()) {
+                    instruction.id(interfaceVar);
+                }
+            }
+            if (interfaceResources != null) {
+                for (int interfaceVar : interfaceResources.interfaceVariables()) {
                     instruction.id(interfaceVar);
                 }
             }
@@ -166,6 +216,8 @@ public final class CoreToSpirv {
                 }
                 case Statement.Return r -> collectBuffers(r.value(), out);
                 case Statement.StoreResult s -> collectBuffers(s.value(), out);
+                case Statement.BuiltinWrite s -> collectBuffers(s.value(), out);
+                case Statement.InterfaceWrite s -> collectBuffers(s.value(), out);
                 case Statement.DeclareVar d -> collectBuffers(d.initializer(), out);
                 case Statement.Assign a -> collectBuffers(a.value(), out);
                 case Statement.If f -> {
@@ -194,6 +246,8 @@ public final class CoreToSpirv {
             }
             case Expr.VectorConstruct vc -> vc.components().forEach(c -> collectBuffers(c, out));
             case Expr.VectorExtract ve -> collectBuffers(ve.vector(), out);
+            case Expr.Bitcast bc -> collectBuffers(bc.operand(), out);
+            case Expr.Convert cv -> collectBuffers(cv.operand(), out);
             case Expr.Unary u -> collectBuffers(u.operand(), out);
             case Expr.Call c -> c.arguments().forEach(a -> collectBuffers(a, out));
             case Expr.ConstInt ignored -> { }
@@ -201,6 +255,8 @@ public final class CoreToSpirv {
             case Expr.ConstBool ignored -> { }
             case Expr.Read ignored -> { }
             case Expr.InvocationId ignored -> { }
+            case Expr.BuiltinRead ignored -> { }
+            case Expr.InterfaceRead ignored -> { }
             case Expr.Param ignored -> { }
         }
     }
@@ -219,6 +275,8 @@ public final class CoreToSpirv {
                 case Statement.BufferStore s -> { scanForInvocationId(s.index(), found); scanForInvocationId(s.value(), found); }
                 case Statement.Return r -> scanForInvocationId(r.value(), found);
                 case Statement.StoreResult s -> scanForInvocationId(s.value(), found);
+                case Statement.BuiltinWrite s -> scanForInvocationId(s.value(), found);
+                case Statement.InterfaceWrite s -> scanForInvocationId(s.value(), found);
                 case Statement.DeclareVar d -> scanForInvocationId(d.initializer(), found);
                 case Statement.Assign a -> scanForInvocationId(a.value(), found);
                 case Statement.If f -> { scanForInvocationId(f.condition(), found); scanForInvocationId(f.thenRegion(), found); scanForInvocationId(f.elseRegion(), found); }
@@ -235,12 +293,89 @@ public final class CoreToSpirv {
             case Expr.Binary b -> { scanForInvocationId(b.lhs(), found); scanForInvocationId(b.rhs(), found); }
             case Expr.VectorConstruct vc -> vc.components().forEach(c -> scanForInvocationId(c, found));
             case Expr.VectorExtract ve -> scanForInvocationId(ve.vector(), found);
+            case Expr.Bitcast bc -> scanForInvocationId(bc.operand(), found);
+            case Expr.Convert cv -> scanForInvocationId(cv.operand(), found);
             case Expr.Unary u -> scanForInvocationId(u.operand(), found);
             case Expr.Call c -> c.arguments().forEach(a -> scanForInvocationId(a, found));
             case Expr.ConstInt ignored -> { }
             case Expr.ConstFloat ignored -> { }
             case Expr.ConstBool ignored -> { }
             case Expr.Read ignored -> { }
+            case Expr.BuiltinRead ignored -> { }
+            case Expr.InterfaceRead ignored -> { }
+            case Expr.Param ignored -> { }
+        }
+    }
+
+    /** The graphics built-ins and interface variables a module references, in first-seen order. */
+    private record InterfaceUsage(List<Builtin> builtins, List<InterfaceVar> variables) {
+        boolean isEmpty() {
+            return builtins.isEmpty() && variables.isEmpty();
+        }
+    }
+
+    private InterfaceUsage collectInterface(CoreModule module) {
+        Set<Builtin> builtins = new LinkedHashSet<>();
+        Set<InterfaceVar> variables = new LinkedHashSet<>();
+        for (Function function : module.functions()) {
+            scanInterface(function.body(), builtins, variables);
+        }
+        return new InterfaceUsage(List.copyOf(builtins), List.copyOf(variables));
+    }
+
+    private void scanInterface(Region region, Set<Builtin> builtins, Set<InterfaceVar> variables) {
+        for (Statement statement : region.statements()) {
+            switch (statement) {
+                case Statement.BuiltinWrite s -> {
+                    builtins.add(s.builtin());
+                    scanInterface(s.value(), builtins, variables);
+                }
+                case Statement.InterfaceWrite s -> {
+                    variables.add(s.variable());
+                    scanInterface(s.value(), builtins, variables);
+                }
+                case Statement.BufferStore s -> {
+                    scanInterface(s.index(), builtins, variables);
+                    scanInterface(s.value(), builtins, variables);
+                }
+                case Statement.Return r -> scanInterface(r.value(), builtins, variables);
+                case Statement.StoreResult s -> scanInterface(s.value(), builtins, variables);
+                case Statement.DeclareVar d -> scanInterface(d.initializer(), builtins, variables);
+                case Statement.Assign a -> scanInterface(a.value(), builtins, variables);
+                case Statement.If f -> {
+                    scanInterface(f.condition(), builtins, variables);
+                    scanInterface(f.thenRegion(), builtins, variables);
+                    scanInterface(f.elseRegion(), builtins, variables);
+                }
+                case Statement.While w -> {
+                    scanInterface(w.condition(), builtins, variables);
+                    scanInterface(w.body(), builtins, variables);
+                }
+                case Statement.ReturnVoid ignored -> { }
+            }
+        }
+    }
+
+    private void scanInterface(Expr expr, Set<Builtin> builtins, Set<InterfaceVar> variables) {
+        switch (expr) {
+            case Expr.BuiltinRead r -> builtins.add(r.builtin());
+            case Expr.InterfaceRead r -> variables.add(r.variable());
+            case Expr.BufferLoad l -> scanInterface(l.index(), builtins, variables);
+            case Expr.Binary b -> {
+                scanInterface(b.lhs(), builtins, variables);
+                scanInterface(b.rhs(), builtins, variables);
+            }
+            case Expr.VectorConstruct vc -> vc.components().forEach(c -> scanInterface(c, builtins, variables));
+            case Expr.VectorExtract ve -> scanInterface(ve.vector(), builtins, variables);
+            case Expr.Bitcast bc -> scanInterface(bc.operand(), builtins, variables);
+            case Expr.Convert cv -> scanInterface(cv.operand(), builtins, variables);
+            case Expr.Unary u -> scanInterface(u.operand(), builtins, variables);
+            case Expr.Call c -> c.arguments().forEach(a -> scanInterface(a, builtins, variables));
+            case Expr.ConstInt ignored -> { }
+            case Expr.ConstFloat ignored -> { }
+            case Expr.ConstBool ignored -> { }
+            case Expr.Read ignored -> { }
+            case Expr.InvocationId ignored -> { }
             case Expr.Param ignored -> { }
         }
     }
@@ -260,6 +395,14 @@ public final class CoreToSpirv {
                 case Statement.ReturnVoid ignored -> { }
                 case Statement.Return r -> prepareExpr(r.value(), types, constants);
                 case Statement.StoreResult s -> prepareExpr(s.value(), types, constants);
+                case Statement.BuiltinWrite s -> {
+                    types.idOf(s.builtin().type());
+                    prepareExpr(s.value(), types, constants);
+                }
+                case Statement.InterfaceWrite s -> {
+                    types.idOf(s.variable().type());
+                    prepareExpr(s.value(), types, constants);
+                }
                 case Statement.BufferStore s -> {
                     prepareExpr(s.index(), types, constants);
                     prepareExpr(s.value(), types, constants);
@@ -289,8 +432,10 @@ public final class CoreToSpirv {
             case Expr.ConstBool c -> constants.boolConst(c.value());
             case Expr.Read r -> types.idOf(r.variable().type());
             case Expr.InvocationId ignored -> types.idOf(Type.int32());
+            case Expr.BuiltinRead r -> types.idOf(r.builtin().type());
+            case Expr.InterfaceRead r -> types.idOf(r.variable().type());
             case Expr.BufferLoad l -> {
-                types.idOf(Type.int32());
+                types.idOf(l.buffer().element());
                 prepareExpr(l.index(), types, constants);
             }
             case Expr.Binary b -> {
@@ -305,6 +450,14 @@ public final class CoreToSpirv {
             case Expr.VectorExtract ve -> {
                 types.idOf(ve.type());
                 prepareExpr(ve.vector(), types, constants);
+            }
+            case Expr.Bitcast bc -> {
+                types.idOf(bc.type());
+                prepareExpr(bc.operand(), types, constants);
+            }
+            case Expr.Convert cv -> {
+                types.idOf(cv.type());
+                prepareExpr(cv.operand(), types, constants);
             }
             case Expr.Unary u -> {
                 types.idOf(u.type());
@@ -416,8 +569,10 @@ public final class CoreToSpirv {
         private final Map<Integer, Integer> variableByBinding = new LinkedHashMap<>();
         private int gidVariable;
 
-        private int memberPointerType;  // StorageBuffer* i32
-        private int memberIndexConst;   // signed-int 0 (the struct member index)
+        private int memberIndexConst;   // signed-int 0 (the struct member index), shared by all blocks
+        // One Block/runtime-array per distinct element type; a buffer var uses the block for its element type.
+        private final Map<Type, Integer> blockPointerByElement = new LinkedHashMap<>();
+        private final Map<Type, Integer> memberPointerByElement = new LinkedHashMap<>();
         private int uintType;
         private int gidComponentPointer; // Input* uint
         private int uintZeroConst;       // the .x component index
@@ -433,6 +588,10 @@ public final class CoreToSpirv {
             }
         }
 
+        boolean usesInvocationId() {
+            return useInvocationId;
+        }
+
         List<Integer> interfaceVariables() {
             List<Integer> ids = new ArrayList<>();
             if (useInvocationId) {
@@ -443,35 +602,38 @@ public final class CoreToSpirv {
         }
 
         void declare(Builder b, TypeTable types, ConstantTable constants) {
-            int intType = types.idOf(Type.int32());
-            memberPointerType = types.pointerType(StorageClass.StorageBuffer.value(), Type.int32());
             memberIndexConst = constants.intConst(Type.int32(), 0);
 
-            if (!buffers.isEmpty()) {
+            // A Block (struct wrapping a runtime array) + its pointer types, one per distinct element type.
+            LinkedHashSet<Type> elementTypes = new LinkedHashSet<>();
+            for (Buffer buffer : buffers) {
+                elementTypes.add(buffer.element());
+            }
+            for (Type element : elementTypes) {
+                int elementType = types.idOf(element);
                 int runtimeArray = b.allocateId();
-                b.emit(b.globals, Op.OpTypeRuntimeArray).id(runtimeArray).id(intType);
+                b.emit(b.globals, Op.OpTypeRuntimeArray).id(runtimeArray).id(elementType);
                 int blockType = b.allocateId();
                 b.emit(b.globals, Op.OpTypeStruct).id(blockType).id(runtimeArray);
                 int blockPointer = b.allocateId();
                 b.emit(b.globals, Op.OpTypePointer).id(blockPointer)
                         .enumValue(StorageClass.StorageBuffer.value()).id(blockType);
-                for (Buffer buffer : buffers) {
-                    b.emit(b.globals, Op.OpVariable).id(blockPointer)
-                            .id(variableByBinding.get(buffer.binding()))
-                            .enumValue(StorageClass.StorageBuffer.value());
-                }
+                blockPointerByElement.put(element, blockPointer);
+                memberPointerByElement.put(element, types.pointerType(StorageClass.StorageBuffer.value(), element));
                 b.emit(b.annotations, Op.OpDecorate).id(runtimeArray)
-                        .enumValue(Decoration.ArrayStride.value()).literal(Integer.BYTES);
+                        .enumValue(Decoration.ArrayStride.value()).literal(byteSize(element));
                 b.emit(b.annotations, Op.OpMemberDecorate).id(blockType).literal(0)
                         .enumValue(Decoration.Offset.value()).literal(0);
                 b.emit(b.annotations, Op.OpDecorate).id(blockType).enumValue(Decoration.Block.value());
-                for (Buffer buffer : buffers) {
-                    int variable = variableByBinding.get(buffer.binding());
-                    b.emit(b.annotations, Op.OpDecorate).id(variable)
-                            .enumValue(Decoration.DescriptorSet.value()).literal(0);
-                    b.emit(b.annotations, Op.OpDecorate).id(variable)
-                            .enumValue(Decoration.Binding.value()).literal(buffer.binding());
-                }
+            }
+            for (Buffer buffer : buffers) {
+                int variable = variableByBinding.get(buffer.binding());
+                b.emit(b.globals, Op.OpVariable).id(blockPointerByElement.get(buffer.element()))
+                        .id(variable).enumValue(StorageClass.StorageBuffer.value());
+                b.emit(b.annotations, Op.OpDecorate).id(variable)
+                        .enumValue(Decoration.DescriptorSet.value()).literal(0);
+                b.emit(b.annotations, Op.OpDecorate).id(variable)
+                        .enumValue(Decoration.Binding.value()).literal(buffer.binding());
             }
 
             if (useInvocationId) {
@@ -502,7 +664,7 @@ public final class CoreToSpirv {
         int loadElement(Builder b, TypeTable types, Buffer buffer, int indexId) {
             int pointer = elementPointer(b, buffer, indexId);
             int loaded = b.allocateId();
-            b.emit(b.functions, Op.OpLoad).id(types.idOf(Type.int32())).id(loaded).id(pointer);
+            b.emit(b.functions, Op.OpLoad).id(types.idOf(buffer.element())).id(loaded).id(pointer);
             return loaded;
         }
 
@@ -513,9 +675,85 @@ public final class CoreToSpirv {
 
         private int elementPointer(Builder b, Buffer buffer, int indexId) {
             int pointer = b.allocateId();
-            b.emit(b.functions, Op.OpAccessChain).id(memberPointerType).id(pointer)
+            b.emit(b.functions, Op.OpAccessChain).id(memberPointerByElement.get(buffer.element())).id(pointer)
                     .id(variableByBinding.get(buffer.binding())).id(memberIndexConst).id(indexId);
             return pointer;
+        }
+
+        /** Element size in bytes — the runtime-array {@code ArrayStride}. */
+        private static int byteSize(Type element) {
+            return switch (element) {
+                case Type.Int i -> i.width() / 8;
+                case Type.Float f -> f.width() / 8;
+                default -> Integer.BYTES;
+            };
+        }
+    }
+
+    /**
+     * Graphics-stage interface: built-in variables (decorated {@code BuiltIn}, e.g. {@code gl_Position} as an
+     * Output, {@code gl_VertexIndex} as an Input) and user {@code location}-bound interface variables (Input or
+     * Output per their direction). Each is a whole-variable {@code OpLoad}/{@code OpStore} (no access chain),
+     * and all appear in the entry point's interface list.
+     */
+    private static final class InterfaceResources {
+        private final List<Builtin> builtins;
+        private final List<InterfaceVar> variables;
+        private final Map<Builtin, Integer> builtinIds = new LinkedHashMap<>();
+        private final Map<InterfaceVar, Integer> variableIds = new LinkedHashMap<>();
+
+        InterfaceResources(Builder b, List<Builtin> builtins, List<InterfaceVar> variables) {
+            this.builtins = builtins;
+            this.variables = variables;
+            for (Builtin builtin : builtins) {
+                builtinIds.put(builtin, b.allocateId());
+            }
+            for (InterfaceVar variable : variables) {
+                variableIds.put(variable, b.allocateId());
+            }
+        }
+
+        int builtinVariable(Builtin builtin) {
+            return builtinIds.get(builtin);
+        }
+
+        int variable(InterfaceVar variable) {
+            return variableIds.get(variable);
+        }
+
+        List<Integer> interfaceVariables() {
+            List<Integer> ids = new ArrayList<>(builtinIds.values());
+            ids.addAll(variableIds.values());
+            return ids;
+        }
+
+        void declare(Builder b, TypeTable types) {
+            for (Builtin builtin : builtins) {
+                int storageClass = builtin.isInput() ? StorageClass.Input.value() : StorageClass.Output.value();
+                // Resolve the pointer type (which emits OpTypePointer) BEFORE emitting OpVariable, so the type
+                // is defined first — `emit(OpVariable).id(pointerType(...))` would invert that order.
+                int pointerType = types.pointerType(storageClass, builtin.type());
+                int variableId = builtinIds.get(builtin);
+                b.emit(b.globals, Op.OpVariable).id(pointerType).id(variableId).enumValue(storageClass);
+                b.emit(b.annotations, Op.OpDecorate).id(variableId)
+                        .enumValue(Decoration.BuiltIn.value()).enumValue(builtInValue(builtin));
+            }
+            for (InterfaceVar variable : variables) {
+                int storageClass = variable.direction() == InterfaceVar.Direction.INPUT
+                        ? StorageClass.Input.value() : StorageClass.Output.value();
+                int pointerType = types.pointerType(storageClass, variable.type());
+                int variableId = variableIds.get(variable);
+                b.emit(b.globals, Op.OpVariable).id(pointerType).id(variableId).enumValue(storageClass);
+                b.emit(b.annotations, Op.OpDecorate).id(variableId)
+                        .enumValue(Decoration.Location.value()).literal(variable.location());
+            }
+        }
+
+        private static int builtInValue(Builtin builtin) {
+            return switch (builtin) {
+                case POSITION -> BuiltIn.Position.value();
+                case VERTEX_INDEX -> BuiltIn.VertexIndex.value();
+            };
         }
     }
 
@@ -528,18 +766,21 @@ public final class CoreToSpirv {
         private final ConstantTable constants;
         private final OutputBuffer output;
         private final KernelResources kernel;
+        private final InterfaceResources interfaceResources;
         private final Map<Function, Integer> functionIds;
         private final Map<LocalVar, Integer> variablePointers = new IdentityHashMap<>();
         private final List<Integer> parameterIds = new ArrayList<>();
         private int invocationIdValue; // cached per function (0 = not yet loaded)
+        private boolean terminated;    // whether the current block already has a terminator (e.g. early return)
 
         FunctionLowering(Builder b, TypeTable types, ConstantTable constants, OutputBuffer output,
-                KernelResources kernel, Map<Function, Integer> functionIds) {
+                KernelResources kernel, InterfaceResources interfaceResources, Map<Function, Integer> functionIds) {
             this.b = b;
             this.types = types;
             this.constants = constants;
             this.output = output;
             this.kernel = kernel;
+            this.interfaceResources = interfaceResources;
             this.functionIds = functionIds;
         }
 
@@ -565,30 +806,59 @@ public final class CoreToSpirv {
                 variablePointers.put(variable, pointerId);
             }
 
+            // Load gl_GlobalInvocationID in the entry block (it dominates all others) so the cached id is
+            // usable everywhere — a lazy load at first use can land in a branch/loop that doesn't dominate
+            // later uses (e.g. code after a loop that contained the first reference).
+            if (kernel != null && kernel.usesInvocationId()) {
+                invocationIdValue = kernel.loadInvocationId(b, types);
+            }
+
+            terminated = false;
             lowerRegion(function.body());
+            if (!terminated) {
+                // Fall-through off the end: void returns implicitly; a non-void body that fails to return is
+                // ill-formed, but keep the block well-formed (every block needs a terminator) with Unreachable.
+                b.emit(b.functions, function.signature().returnType() instanceof Type.Void
+                        ? Op.OpReturn : Op.OpUnreachable);
+            }
             b.emit(b.functions, Op.OpFunctionEnd);
         }
 
         private void lowerRegion(Region region) {
             for (Statement statement : region.statements()) {
+                if (terminated) {
+                    break; // statements after a return in the same block are unreachable
+                }
                 lowerStatement(statement);
             }
         }
 
         private void lowerStatement(Statement statement) {
             switch (statement) {
-                case Statement.ReturnVoid ignored -> b.emit(b.functions, Op.OpReturn);
+                case Statement.ReturnVoid ignored -> {
+                    b.emit(b.functions, Op.OpReturn);
+                    terminated = true;
+                }
                 case Statement.Return r -> {
                     // Lower the value (which emits its instructions) BEFORE emitting OpReturnValue, so the
                     // returned id is defined first — `emit(op).id(lowerExpr(...))` would invert that order.
                     int value = lowerExpr(r.value());
                     b.emit(b.functions, Op.OpReturnValue).id(value);
+                    terminated = true;
                 }
                 case Statement.StoreResult s -> output.store(b, lowerExpr(s.value()));
                 case Statement.BufferStore s -> {
                     int index = lowerExpr(s.index());
                     int value = lowerExpr(s.value());
                     kernel.storeElement(b, types, s.buffer(), index, value);
+                }
+                case Statement.BuiltinWrite s -> {
+                    int value = lowerExpr(s.value());
+                    b.emit(b.functions, Op.OpStore).id(interfaceResources.builtinVariable(s.builtin())).id(value);
+                }
+                case Statement.InterfaceWrite s -> {
+                    int value = lowerExpr(s.value());
+                    b.emit(b.functions, Op.OpStore).id(interfaceResources.variable(s.variable())).id(value);
                 }
                 case Statement.DeclareVar d -> store(d.variable(), lowerExpr(d.initializer()));
                 case Statement.Assign a -> store(a.variable(), lowerExpr(a.value()));
@@ -620,16 +890,35 @@ public final class CoreToSpirv {
             b.emit(b.functions, Op.OpBranchConditional).id(condition).id(thenLabel).id(elseLabel);
 
             b.emit(b.functions, Op.OpLabel).id(thenLabel);
+            terminated = false;
             lowerRegion(statement.thenRegion());
-            b.emit(b.functions, Op.OpBranch).id(mergeLabel);
+            if (!terminated) {
+                b.emit(b.functions, Op.OpBranch).id(mergeLabel); // skipped if the branch returned early
+            }
+            boolean thenTerminated = terminated;
 
+            // Without an else, the false edge of the conditional reaches the merge directly, so that path
+            // always falls through.
+            boolean elseTerminated = false;
             if (hasElse) {
                 b.emit(b.functions, Op.OpLabel).id(elseLabel);
+                terminated = false;
                 lowerRegion(statement.elseRegion());
-                b.emit(b.functions, Op.OpBranch).id(mergeLabel);
+                if (!terminated) {
+                    b.emit(b.functions, Op.OpBranch).id(mergeLabel);
+                }
+                elseTerminated = terminated;
             }
 
             b.emit(b.functions, Op.OpLabel).id(mergeLabel);
+            if (thenTerminated && elseTerminated) {
+                // Both arms returned, so the merge block has no predecessors; it must still exist (named by
+                // OpSelectionMerge) and carry a terminator.
+                b.emit(b.functions, Op.OpUnreachable);
+                terminated = true;
+            } else {
+                terminated = false;
+            }
         }
 
         private void lowerWhile(Statement.While statement) {
@@ -645,17 +934,22 @@ public final class CoreToSpirv {
             b.emit(b.functions, Op.OpBranch).id(checkLabel);
 
             b.emit(b.functions, Op.OpLabel).id(checkLabel);
+            terminated = false;
             int condition = lowerExpr(statement.condition());
             b.emit(b.functions, Op.OpBranchConditional).id(condition).id(bodyLabel).id(mergeLabel);
 
             b.emit(b.functions, Op.OpLabel).id(bodyLabel);
+            terminated = false;
             lowerRegion(statement.body());
-            b.emit(b.functions, Op.OpBranch).id(continueLabel);
+            if (!terminated) {
+                b.emit(b.functions, Op.OpBranch).id(continueLabel); // skipped if the body returned early
+            }
 
             b.emit(b.functions, Op.OpLabel).id(continueLabel);
             b.emit(b.functions, Op.OpBranch).id(headerLabel);
 
             b.emit(b.functions, Op.OpLabel).id(mergeLabel);
+            terminated = false; // the loop's false edge always reaches the merge
         }
 
         private int lowerExpr(Expr expr) {
@@ -674,6 +968,20 @@ public final class CoreToSpirv {
                     int index = lowerExpr(l.index());
                     yield kernel.loadElement(b, types, l.buffer(), index);
                 }
+                case Expr.BuiltinRead r -> {
+                    int resultType = types.idOf(r.builtin().type());
+                    int result = b.allocateId();
+                    b.emit(b.functions, Op.OpLoad).id(resultType).id(result)
+                            .id(interfaceResources.builtinVariable(r.builtin()));
+                    yield result;
+                }
+                case Expr.InterfaceRead r -> {
+                    int resultType = types.idOf(r.variable().type());
+                    int result = b.allocateId();
+                    b.emit(b.functions, Op.OpLoad).id(resultType).id(result)
+                            .id(interfaceResources.variable(r.variable()));
+                    yield result;
+                }
                 case Expr.Binary bin -> lowerBinary(bin);
                 case Expr.VectorConstruct vc -> {
                     int resultType = types.idOf(vc.type());
@@ -691,6 +999,23 @@ public final class CoreToSpirv {
                     int result = b.allocateId();
                     b.emit(b.functions, Op.OpCompositeExtract)
                             .id(resultType).id(result).id(composite).literal(ve.index());
+                    yield result;
+                }
+                case Expr.Bitcast bc -> {
+                    // Lower the operand (emitting its instructions) before OpBitcast, so the source id is
+                    // defined first — see the emit-order note on Statement.Return.
+                    int operand = lowerExpr(bc.operand());
+                    int resultType = types.idOf(bc.type());
+                    int result = b.allocateId();
+                    b.emit(b.functions, Op.OpBitcast).id(resultType).id(result).id(operand);
+                    yield result;
+                }
+                case Expr.Convert cv -> {
+                    int operand = lowerExpr(cv.operand());
+                    int resultType = types.idOf(cv.type());
+                    int result = b.allocateId();
+                    b.emit(b.functions, selectConvertOp(cv.operand().type(), cv.type()))
+                            .id(resultType).id(result).id(operand);
                     yield result;
                 }
                 case Expr.Unary u -> {
@@ -751,6 +1076,39 @@ public final class CoreToSpirv {
             };
         }
 
+        /**
+         * Numeric conversion opcode, by source and target domain:
+         * <ul>
+         *   <li>int→int — width change: {@code OpSConvert}/{@code OpUConvert} (SPIR-V ties the opcode, and so
+         *       the sign- vs zero-extension on widening, to the <em>result</em> type's signedness; flip
+         *       signedness at the same width with {@link Expr.Bitcast} instead);</li>
+         *   <li>int→float — {@code OpConvertSToF}/{@code OpConvertUToF}, interpreting the source by its own
+         *       signedness;</li>
+         *   <li>float→int — {@code OpConvertFToS}/{@code OpConvertFToU} (round toward zero), by target sign;</li>
+         *   <li>float→float — {@code OpFConvert} (width change).</li>
+         * </ul>
+         */
+        private static Op selectConvertOp(Type sourceType, Type targetType) {
+            Type source = sourceType instanceof Type.Vector v ? v.component() : sourceType;
+            Type target = targetType instanceof Type.Vector v ? v.component() : targetType;
+            boolean sourceFloat = source instanceof Type.Float;
+            boolean targetFloat = target instanceof Type.Float;
+            if (!sourceFloat && !targetFloat) {
+                return signedInt(target) ? Op.OpSConvert : Op.OpUConvert;
+            }
+            if (!sourceFloat) {
+                return signedInt(source) ? Op.OpConvertSToF : Op.OpConvertUToF;
+            }
+            if (!targetFloat) {
+                return signedInt(target) ? Op.OpConvertFToS : Op.OpConvertFToU;
+            }
+            return Op.OpFConvert;
+        }
+
+        private static boolean signedInt(Type type) {
+            return !(type instanceof Type.Int i) || i.signed();
+        }
+
         private static Op selectUnaryOp(UnaryOp op, Type operandType) {
             Type element = operandType instanceof Type.Vector v ? v.component() : operandType;
             boolean isFloat = element instanceof Type.Float;
@@ -781,6 +1139,8 @@ public final class CoreToSpirv {
                     case Statement.Return ignored -> { }
                     case Statement.StoreResult ignored -> { }
                     case Statement.BufferStore ignored -> { }
+                    case Statement.BuiltinWrite ignored -> { }
+                    case Statement.InterfaceWrite ignored -> { }
                 }
             }
         }
@@ -794,11 +1154,35 @@ public final class CoreToSpirv {
         private final Builder b;
         private final Map<Type, Integer> ids = new HashMap<>();
         private final Map<PointerKey, Integer> pointerIds = new HashMap<>();
+        private boolean usesInt8;
+        private boolean usesInt16;
+        private boolean usesInt64;
+        private boolean usesFloat64;
 
         private record PointerKey(int storageClass, Type pointee) {}
 
         TypeTable(Builder b) {
             this.b = b;
+        }
+
+        /** Whether an 8-bit integer type was declared — drives the {@code Int8} capability. */
+        boolean usesInt8() {
+            return usesInt8;
+        }
+
+        /** Whether a 16-bit integer type was declared — drives the {@code Int16} capability. */
+        boolean usesInt16() {
+            return usesInt16;
+        }
+
+        /** Whether any 64-bit integer type was declared — drives the {@code Int64} capability. */
+        boolean usesInt64() {
+            return usesInt64;
+        }
+
+        /** Whether any 64-bit float type was declared — drives the {@code Float64} capability. */
+        boolean usesFloat64() {
+            return usesFloat64;
         }
 
         int idOf(Type type) {
@@ -809,8 +1193,21 @@ public final class CoreToSpirv {
             int id = switch (type) {
                 case Type.Void ignored -> emit(Op.OpTypeVoid, i -> { });
                 case Type.Bool ignored -> emit(Op.OpTypeBool, i -> { });
-                case Type.Int t -> emit(Op.OpTypeInt, i -> i.literal(t.width()).literal(t.signed() ? 1 : 0));
-                case Type.Float t -> emit(Op.OpTypeFloat, i -> i.literal(t.width()));
+                case Type.Int t -> {
+                    switch (t.width()) {
+                        case 8 -> usesInt8 = true;
+                        case 16 -> usesInt16 = true;
+                        case 64 -> usesInt64 = true;
+                        default -> { }
+                    }
+                    yield emit(Op.OpTypeInt, i -> i.literal(t.width()).literal(t.signed() ? 1 : 0));
+                }
+                case Type.Float t -> {
+                    if (t.width() == 64) {
+                        usesFloat64 = true;
+                    }
+                    yield emit(Op.OpTypeFloat, i -> i.literal(t.width()));
+                }
                 case Type.Vector t -> {
                     int componentId = idOf(t.component());
                     yield emit(Op.OpTypeVector, i -> i.id(componentId).literal(t.count()));
@@ -866,17 +1263,37 @@ public final class CoreToSpirv {
         }
 
         int intConst(Type.Int type, long value) {
-            require32(type.width());
             return ids.computeIfAbsent(new Key("int", type, value), k -> {
                 int typeId = types.idOf(type);
                 int id = b.allocateId();
-                b.emit(b.globals, Op.OpConstant).id(typeId).id(id).literal((int) value);
+                // Narrow types still occupy a single 32-bit literal word (SPIR-V 2.2.1); 64-bit takes two.
+                Instruction constant = b.emit(b.globals, Op.OpConstant).id(typeId).id(id).literal((int) value);
+                switch (type.width()) {
+                    case 8, 16, 32 -> { }
+                    case 64 -> constant.literal((int) (value >>> 32)); // low word emitted above, then high
+                    default -> throw new IllegalArgumentException(
+                            "unsupported int constant width: " + type.width());
+                }
                 return id;
             });
         }
 
         int floatConst(Type.Float type, double value) {
-            require32(type.width());
+            if (type.width() == 64) {
+                long bits = Double.doubleToRawLongBits(value);
+                return ids.computeIfAbsent(new Key("float", type, bits), k -> {
+                    int typeId = types.idOf(type);
+                    int id = b.allocateId();
+                    // 64-bit float literals occupy two operand words, low-order first (SPIR-V 2.2.1).
+                    b.emit(b.globals, Op.OpConstant).id(typeId).id(id)
+                            .literal((int) bits).literal((int) (bits >>> 32));
+                    return id;
+                });
+            }
+            if (type.width() != 32) {
+                throw new IllegalArgumentException("only 32- and 64-bit float constants are supported, got "
+                        + type.width());
+            }
             int bits = Float.floatToIntBits((float) value);
             return ids.computeIfAbsent(new Key("float", type, bits & 0xFFFFFFFFL), k -> {
                 int typeId = types.idOf(type);
@@ -893,12 +1310,6 @@ public final class CoreToSpirv {
                 b.emit(b.globals, value ? Op.OpConstantTrue : Op.OpConstantFalse).id(typeId).id(id);
                 return id;
             });
-        }
-
-        private static void require32(int width) {
-            if (width != 32) {
-                throw new IllegalArgumentException("only 32-bit scalar constants are supported, got " + width);
-            }
         }
     }
 }

@@ -23,6 +23,12 @@ public sealed interface Statement {
     /** Writes {@code value} to {@code buffer[index]} (an i32 element of a storage buffer). */
     record BufferStore(Buffer buffer, Expr index, Expr value) implements Statement {}
 
+    /** Writes a graphics-pipeline built-in output (e.g. {@code gl_Position}). */
+    record BuiltinWrite(Builtin builtin, Expr value) implements Statement {}
+
+    /** Writes {@code value} to a stage interface output variable at its declared {@code location}. */
+    record InterfaceWrite(InterfaceVar variable, Expr value) implements Statement {}
+
     /** Declares a local variable and initializes it. */
     record DeclareVar(LocalVar variable, Expr initializer) implements Statement {}
 

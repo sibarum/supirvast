@@ -47,7 +47,27 @@ public sealed interface Type {
         return new Int(32, false);
     }
 
+    static Int int8() {
+        return new Int(8, true);
+    }
+
+    static Int int16() {
+        return new Int(16, true);
+    }
+
+    static Int int64() {
+        return new Int(64, true);
+    }
+
+    static Int uint64() {
+        return new Int(64, false);
+    }
+
     static Float float32() {
         return new Float(32);
+    }
+
+    static Float float64() {
+        return new Float(64);
     }
 }
