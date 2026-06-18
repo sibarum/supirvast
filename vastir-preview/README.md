@@ -19,7 +19,7 @@ vastir-preview --vert v.spv --frag f.spv --model cube.obj --screenshot out.png  
 ```
 core IR ──CoreToSpirv──▶ .spv files ──┐
                                        ├──▶ vastir-preview ──▶ window / screenshot
-3D model (.obj) ──────────────────────┘
+3D model (.obj/.ply) ──────────────────┘
 ```
 
 The previewer consumes **files**, not in-process objects, matching the workflow "test a shader I've written on
@@ -44,9 +44,13 @@ passes raw `.spv` and the spec *is* the v1 contract.
 - No headless render differential / CPU rasterizer reference (out of scope by design).
 - No ShaderLab DSL, materials, properties, multi-pass, or render-state authoring — `GraphicsPipelineSpec`
   stays a minimal typed record.
-- No textures/samplers, no UBOs beyond an MVP push constant, no built-in lighting model (the fragment shader
-  does whatever the author wrote).
-- No glTF/FBX (OBJ only), no scene graph, no camera controls (auto-rotate only).
+- No runtime MVP transform / camera / auto-rotation yet (needs `Matrix` + push constants in the `core` IR;
+  see step 4). v1 renders statically with the model pre-placed in clip space.
+- No textures/samplers, no UBOs, no built-in lighting model (the fragment shader does whatever the author
+  wrote).
+- Model formats: OBJ and PLY (ascii + binary, little/big endian). PLY's full named-channel model is parsed
+  and exposed, but only position+normal are drawn (colors/UVs/custom channels are read, not yet rendered). No
+  glTF/FBX, no scene graph.
 - Linux/macOS (Windows-only natives, matching `vastir-tools`).
 
 ## Build / run
@@ -99,15 +103,21 @@ Ordered by dependency. Each step should leave the module in a runnable/verifiabl
 - [x] Render loop (acquire/submit/present with semaphores + fence) that clears to cornflower blue and presents.
       **Checkpoint met: a colored window appears and presents.**
 
-### 4. Model + graphics pipeline (rotating model on screen)
-- [ ] Minimal OBJ loader: parse `v`/`f` (triangulate polygons), compute flat normals if absent → interleaved
-      `position+normal` vertex buffer + index buffer (device-local or host-visible for the PoC).
-- [ ] `D32_SFLOAT` depth attachment added to the render pass + framebuffers.
-- [ ] Graphics pipeline from the `GraphicsPipelineSpec`: load both `.spv` as `VkShaderModule`s, build
-      `VkPipelineVertexInputState` from the layout, viewport/scissor, back-face cull, depth test on, one
-      color attachment.
-- [ ] MVP `mat4` push constant (JOML `perspective` × `lookAt` × auto-rotation from `glfwGetTime`).
-- [ ] Bind vertex/index buffers, `vkCmdDrawIndexed`. **Checkpoint: the model renders and rotates.**
+### 4. Model + graphics pipeline (model on screen) — ✅ done (static; MVP deferred)
+> Verified on the RTX 2070: drew the sample cube (36 indices) for 120 frames, every `VkResult` clean — a
+> SupirVast-authored vertex+fragment pair lowered to SPIR-V now rasterizes a depth-tested 3D model.
+> `SampleAssets` generates the reproducible inputs (`cube.obj` + `model.vert/frag.spv`, authored in `core`).
+- [x] Minimal OBJ loader (`ObjMesh` + `ObjMeshTest`): `v`/`vn`/`f`, fan-triangulation, flat normals when
+      absent → interleaved `position+normal` (host-visible) vertex buffer + `uint32` index buffer.
+- [x] `D32_SFLOAT` depth attachment added to the render pass (+ subpass dependency) + framebuffers.
+- [x] Graphics pipeline from the `GraphicsPipelineSpec`: both `.spv` as shader modules,
+      `VkPipelineVertexInputState` from the layout (`Type`→`VkFormat`), viewport/scissor, depth test on, one
+      color attachment. (Cull = NONE: an arbitrary OBJ's winding is unknown; depth still resolves overlap.)
+- [x] Bind vertex/index buffers, per-frame command recording, `vkCmdDrawIndexed`. **Checkpoint met.**
+- [ ] **Deferred — runtime MVP transform + auto-rotation.** This needs a `Matrix` type, matrix×vector, and
+      push-constant read in the `core` IR (none exist yet) — a separate IR chunk, not pure Vulkan. v1 renders
+      statically: the vertex shader emits `gl_Position` from the model position, and `SampleAssets` generates
+      the cube **pre-rotated in clip space** so several faces show. JOML is already a dependency, ready for it.
 
 ### 5. Screenshot + acceptance
 - [ ] Copy the presented image to a host-visible buffer; write PNG via `lwjgl-stb` `stbi_write_png`.
