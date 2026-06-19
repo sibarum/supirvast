@@ -13,6 +13,7 @@ import sibarum.dasum.gui.core.input.FocusState;
 import sibarum.dasum.gui.core.input.Handlers;
 import sibarum.dasum.gui.core.input.HoverState;
 import sibarum.dasum.gui.core.input.InputState;
+import sibarum.dasum.gui.core.input.ScrollStates;
 import sibarum.dasum.gui.core.input.TextInputController;
 import sibarum.dasum.gui.core.input.TextStates;
 import sibarum.dasum.gui.core.layout.HitTest;
@@ -75,6 +76,9 @@ public final class Studio {
     private static final Color LABEL_FG      = new Color(0.92f, 0.94f, 0.97f, 1f);
     private static final Color EDITOR_FG     = new Color(0.85f, 0.90f, 0.85f, 1f);
     private static final Color STATUS_FG     = new Color(0.70f, 0.78f, 0.88f, 1f);
+
+    /** Pixels scrolled per wheel detent for page/editor scroll (matches the demo). */
+    private static final float WHEEL_PIXELS_PER_STEP = 40f;
 
     /** Press target for click dispatch; cleared on release (mirrors the demo). */
     private static Component pressTarget = null;
@@ -337,9 +341,38 @@ public final class Studio {
             // Scroll over the viewport zooms the camera. Hit-tested to the
             // rect so the wheel only zooms when the cursor is actually over
             // the scene; redraw only when the distance changed (clamp no-op).
-            if (overScene(ui, InputState.mouseX(), InputState.mouseY())
-                    && renderer.zoom(yOff)) {
-                Invalidator.invalidate();
+            // The wheel is then CONSUMED — over the viewport it's a zoom, not
+            // a page scroll.
+            if (overScene(ui, InputState.mouseX(), InputState.mouseY())) {
+                if (renderer.zoom(yOff)) {
+                    Invalidator.invalidate();
+                }
+                return;
+            }
+
+            // Anywhere else the wheel delegates to the framework's normal
+            // scroll routing, exactly like dasum-mvp-demo's App: walk the
+            // scroll chain innermost→outermost and let the first container
+            // that actually moves consume the wheel. This is what scrolls the
+            // editor (it's wrapped in a Component.Scroll). Without this the
+            // earlier zoom-only listener clobbered the framework's dispatch
+            // and every scrollable component — the editor included — got
+            // nothing.
+            LayoutResult lr = LatestLayout.result();
+            Component root = LatestLayout.root();
+            if (lr == null || root == null) return;
+            float mx = (float) InputState.mouseX();
+            float my = (float) InputState.mouseY();
+            // Vertical wheel scrolls vertically; the horizontal axis is left
+            // at zero (no shift-to-pan in this app). Sign matches the demo:
+            // wheel-up (+yOff) scrolls content up toward its start.
+            float dy = -(float) yOff * WHEEL_PIXELS_PER_STEP;
+            float dx = -(float) xOff * WHEEL_PIXELS_PER_STEP;
+            for (Component.Scroll s : HitTest.findScrollChain(root, lr, mx, my)) {
+                if (ScrollStates.of(s).scrollByPx(dx, dy)) {
+                    Invalidator.invalidate();
+                    break;
+                }
             }
         });
 
