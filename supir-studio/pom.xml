@@ -70,7 +70,8 @@
                 <artifactId>exec-maven-plugin</artifactId>
                 <configuration>
                     <mainClass>${main.class}</mainClass>
-                    <executable>java</executable>
+                    <!-- The build JDK (JAVA_HOME / GraalVM 25), not bare `java` on PATH (JDK 8 here). -->
+                    <executable>${java.home}/bin/java</executable>
                     <arguments>
                         <argument>--enable-native-access=ALL-UNNAMED</argument>
                         <argument>-classpath</argument>
