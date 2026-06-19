@@ -16,6 +16,7 @@ import java.nio.LongBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 
 import static org.lwjgl.glfw.GLFW.GLFW_CLIENT_API;
 import static org.lwjgl.glfw.GLFW.GLFW_FALSE;
@@ -31,6 +32,8 @@ import static org.lwjgl.glfw.GLFW.glfwWindowShouldClose;
 import static org.lwjgl.glfw.GLFWVulkan.glfwCreateWindowSurface;
 import static org.lwjgl.glfw.GLFWVulkan.glfwGetRequiredInstanceExtensions;
 import static org.lwjgl.glfw.GLFWVulkan.glfwVulkanSupported;
+import static org.lwjgl.stb.STBImage.stbi_image_free;
+import static org.lwjgl.stb.STBImage.stbi_load;
 import static org.lwjgl.stb.STBImageWrite.stbi_write_png;
 import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.system.MemoryUtil.NULL;
@@ -86,6 +89,16 @@ public final class PreviewApp implements AutoCloseable {
     private long fragmentShaderModule;
     private long pipelineLayout;
     private long graphicsPipeline;
+
+    // Combined image-sampler textures (one descriptor set holding all of them), parallel arrays by index.
+    private int[] textureBindings = new int[0];
+    private long[] textureImages = new long[0];
+    private long[] textureMemories = new long[0];
+    private long[] textureViews = new long[0];
+    private long[] textureSamplers = new long[0];
+    private long descriptorSetLayout;
+    private long descriptorPool;
+    private long descriptorSet;
 
     private long vertexBuffer;
     private long vertexMemory;
@@ -160,9 +173,10 @@ public final class PreviewApp implements AutoCloseable {
             createDepthResources(stack);
             createRenderPass(stack);
             createFramebuffers(stack);
+            createCommandPoolAndBuffer(stack);   // before textures (upload needs the pool) and the pipeline
+            createTextureResources(stack);       // descriptor set layout must exist before the pipeline layout
             createGraphicsPipeline(spec, stack);
             createVertexAndIndexBuffers(mesh, stack);
-            createCommandPoolAndBuffer(stack);
             createSyncObjects(stack);
         }
     }
@@ -533,7 +547,10 @@ public final class PreviewApp implements AutoCloseable {
                 .pAttachments(blendAttachment);
 
         VkPipelineLayoutCreateInfo layoutInfo = VkPipelineLayoutCreateInfo.calloc(stack)
-                .sType(VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO);   // no descriptor sets / push constants yet
+                .sType(VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO);
+        if (descriptorSetLayout != VK_NULL_HANDLE) {   // set 0 = the combined image samplers
+            layoutInfo.pSetLayouts(stack.longs(descriptorSetLayout));
+        }
         LongBuffer pLayout = stack.mallocLong(1);
         check(vkCreatePipelineLayout(device, layoutInfo, null, pLayout), "vkCreatePipelineLayout");
         pipelineLayout = pLayout.get(0);
@@ -665,6 +682,207 @@ public final class PreviewApp implements AutoCloseable {
         }
     }
 
+    private void createTextureResources(MemoryStack stack) {
+        Map<Integer, Path> requested = options.textures();
+        if (requested.isEmpty()) {
+            return;
+        }
+        int n = requested.size();
+        textureBindings = new int[n];
+        textureImages = new long[n];
+        textureMemories = new long[n];
+        textureViews = new long[n];
+        textureSamplers = new long[n];
+
+        int index = 0;
+        for (Map.Entry<Integer, Path> entry : requested.entrySet()) {
+            textureBindings[index] = entry.getKey();
+            loadTexture(index, entry.getValue());
+            index++;
+        }
+        createDescriptorSet(stack, n);
+    }
+
+    private void loadTexture(int index, Path path) {
+        try (MemoryStack stack = stackPush()) {
+            IntBuffer w = stack.mallocInt(1);
+            IntBuffer h = stack.mallocInt(1);
+            IntBuffer channels = stack.mallocInt(1);
+            ByteBuffer pixels = stbi_load(path.toString(), w, h, channels, 4);   // force 4-channel RGBA
+            if (pixels == null) {
+                throw new IllegalStateException("failed to load texture: " + path);
+            }
+            int width = w.get(0);
+            int height = h.get(0);
+            long size = (long) width * height * 4;
+            try {
+                long staging = createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, stack);
+                long stagingMemory = bindHostVisible(staging, stack);
+                writeBytes(stagingMemory, pixels, size);
+
+                textureImages[index] = createTextureImage(width, height, stack);
+                textureMemories[index] = bindImageMemory(textureImages[index], stack);
+                uploadTexture(textureImages[index], staging, width, height, stack);
+
+                vkDestroyBuffer(device, staging, null);
+                vkFreeMemory(device, stagingMemory, null);
+            } finally {
+                stbi_image_free(pixels);
+            }
+            textureViews[index] = createImageView(textureImages[index], VK_FORMAT_R8G8B8A8_UNORM,
+                    VK_IMAGE_ASPECT_COLOR_BIT, stack);
+            textureSamplers[index] = createSampler(stack);
+        }
+    }
+
+    private long createTextureImage(int width, int height, MemoryStack stack) {
+        VkImageCreateInfo info = VkImageCreateInfo.calloc(stack)
+                .sType(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO)
+                .imageType(VK_IMAGE_TYPE_2D)
+                .format(VK_FORMAT_R8G8B8A8_UNORM)
+                .mipLevels(1).arrayLayers(1)
+                .samples(VK_SAMPLE_COUNT_1_BIT)
+                .tiling(VK_IMAGE_TILING_OPTIMAL)
+                .usage(VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)
+                .sharingMode(VK_SHARING_MODE_EXCLUSIVE)
+                .initialLayout(VK_IMAGE_LAYOUT_UNDEFINED);
+        info.extent().width(width).height(height).depth(1);
+        LongBuffer pImage = stack.mallocLong(1);
+        check(vkCreateImage(device, info, null, pImage), "vkCreateImage(texture)");
+        return pImage.get(0);
+    }
+
+    private long bindImageMemory(long image, MemoryStack stack) {
+        VkMemoryRequirements requirements = VkMemoryRequirements.malloc(stack);
+        vkGetImageMemoryRequirements(device, image, requirements);
+        long memory = allocate(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, stack);
+        check(vkBindImageMemory(device, image, memory, 0), "vkBindImageMemory(texture)");
+        return memory;
+    }
+
+    /** Transitions the image to transfer-dst, copies the staging buffer in, and transitions it to shader-read. */
+    private void uploadTexture(long image, long staging, int width, int height, MemoryStack stack) {
+        VkCommandBuffer cmd = beginOneTimeCommands(stack);
+
+        transitionImage(cmd, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, stack);
+
+        VkBufferImageCopy.Buffer region = VkBufferImageCopy.calloc(1, stack)
+                .bufferOffset(0).bufferRowLength(0).bufferImageHeight(0);
+        region.imageSubresource().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0)
+                .baseArrayLayer(0).layerCount(1);
+        region.imageOffset().set(0, 0, 0);
+        region.imageExtent().width(width).height(height).depth(1);
+        vkCmdCopyBufferToImage(cmd, staging, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
+
+        transitionImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, stack);
+
+        endOneTimeCommands(cmd, stack);
+    }
+
+    private void transitionImage(VkCommandBuffer cmd, long image, int oldLayout, int newLayout,
+            int srcAccess, int dstAccess, int srcStage, int dstStage, MemoryStack stack) {
+        VkImageMemoryBarrier.Buffer barrier = VkImageMemoryBarrier.calloc(1, stack)
+                .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
+                .oldLayout(oldLayout).newLayout(newLayout)
+                .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                .image(image).srcAccessMask(srcAccess).dstAccessMask(dstAccess);
+        barrier.subresourceRange().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
+        vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, null, null, barrier);
+    }
+
+    private VkCommandBuffer beginOneTimeCommands(MemoryStack stack) {
+        VkCommandBufferAllocateInfo allocInfo = VkCommandBufferAllocateInfo.calloc(stack)
+                .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO)
+                .commandPool(commandPool).level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1);
+        PointerBuffer pCmd = stack.mallocPointer(1);
+        check(vkAllocateCommandBuffers(device, allocInfo, pCmd), "vkAllocateCommandBuffers");
+        VkCommandBuffer cmd = new VkCommandBuffer(pCmd.get(0), device);
+        VkCommandBufferBeginInfo begin = VkCommandBufferBeginInfo.calloc(stack)
+                .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+                .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+        check(vkBeginCommandBuffer(cmd, begin), "vkBeginCommandBuffer");
+        return cmd;
+    }
+
+    private void endOneTimeCommands(VkCommandBuffer cmd, MemoryStack stack) {
+        check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
+        VkSubmitInfo submit = VkSubmitInfo.calloc(stack)
+                .sType(VK_STRUCTURE_TYPE_SUBMIT_INFO).pCommandBuffers(stack.pointers(cmd));
+        check(vkQueueSubmit(queue, submit, VK_NULL_HANDLE), "vkQueueSubmit(oneTime)");
+        check(vkQueueWaitIdle(queue), "vkQueueWaitIdle");
+        vkFreeCommandBuffers(device, commandPool, cmd);
+    }
+
+    private long createSampler(MemoryStack stack) {
+        VkSamplerCreateInfo info = VkSamplerCreateInfo.calloc(stack)
+                .sType(VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO)
+                .magFilter(VK_FILTER_LINEAR).minFilter(VK_FILTER_LINEAR)
+                .addressModeU(VK_SAMPLER_ADDRESS_MODE_REPEAT)
+                .addressModeV(VK_SAMPLER_ADDRESS_MODE_REPEAT)
+                .addressModeW(VK_SAMPLER_ADDRESS_MODE_REPEAT)
+                .mipmapMode(VK_SAMPLER_MIPMAP_MODE_LINEAR)
+                .minLod(0).maxLod(0).maxAnisotropy(1.0f);
+        LongBuffer pSampler = stack.mallocLong(1);
+        check(vkCreateSampler(device, info, null, pSampler), "vkCreateSampler");
+        return pSampler.get(0);
+    }
+
+    private void createDescriptorSet(MemoryStack stack, int n) {
+        VkDescriptorSetLayoutBinding.Buffer bindings = VkDescriptorSetLayoutBinding.calloc(n, stack);
+        for (int i = 0; i < n; i++) {
+            bindings.get(i).binding(textureBindings[i])
+                    .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1)
+                    .stageFlags(VK_SHADER_STAGE_FRAGMENT_BIT);
+        }
+        VkDescriptorSetLayoutCreateInfo layoutInfo = VkDescriptorSetLayoutCreateInfo.calloc(stack)
+                .sType(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO).pBindings(bindings);
+        LongBuffer pLayout = stack.mallocLong(1);
+        check(vkCreateDescriptorSetLayout(device, layoutInfo, null, pLayout), "vkCreateDescriptorSetLayout");
+        descriptorSetLayout = pLayout.get(0);
+
+        VkDescriptorPoolSize.Buffer poolSize = VkDescriptorPoolSize.calloc(1, stack)
+                .type(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(n);
+        VkDescriptorPoolCreateInfo poolInfo = VkDescriptorPoolCreateInfo.calloc(stack)
+                .sType(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO).maxSets(1).pPoolSizes(poolSize);
+        LongBuffer pPool = stack.mallocLong(1);
+        check(vkCreateDescriptorPool(device, poolInfo, null, pPool), "vkCreateDescriptorPool");
+        descriptorPool = pPool.get(0);
+
+        VkDescriptorSetAllocateInfo allocInfo = VkDescriptorSetAllocateInfo.calloc(stack)
+                .sType(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO)
+                .descriptorPool(descriptorPool).pSetLayouts(stack.longs(descriptorSetLayout));
+        LongBuffer pSet = stack.mallocLong(1);
+        check(vkAllocateDescriptorSets(device, allocInfo, pSet), "vkAllocateDescriptorSets");
+        descriptorSet = pSet.get(0);
+
+        VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(n, stack);
+        for (int i = 0; i < n; i++) {
+            VkDescriptorImageInfo.Buffer imageInfo = VkDescriptorImageInfo.calloc(1, stack)
+                    .imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                    .imageView(textureViews[i]).sampler(textureSamplers[i]);
+            writes.get(i).sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET)
+                    .dstSet(descriptorSet).dstBinding(textureBindings[i]).dstArrayElement(0)
+                    .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1)
+                    .pImageInfo(imageInfo);
+        }
+        vkUpdateDescriptorSets(device, writes, null);
+    }
+
+    private void writeBytes(long memory, ByteBuffer data, long size) {
+        try (MemoryStack stack = stackPush()) {
+            PointerBuffer pData = stack.mallocPointer(1);
+            check(vkMapMemory(device, memory, 0, size, 0, pData), "vkMapMemory");
+            MemoryUtil.memCopy(MemoryUtil.memAddress(data), pData.get(0), size);
+            vkUnmapMemory(device, memory);
+        }
+    }
+
     private void createCommandPoolAndBuffer(MemoryStack stack) {
         VkCommandPoolCreateInfo poolInfo = VkCommandPoolCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO)
@@ -707,6 +925,10 @@ public final class PreviewApp implements AutoCloseable {
                 .pClearValues(clears);
         vkCmdBeginRenderPass(commandBuffer, rpBegin, VK_SUBPASS_CONTENTS_INLINE);
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
+        if (descriptorSet != VK_NULL_HANDLE) {
+            vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0,
+                    stack.longs(descriptorSet), null);
+        }
         vkCmdBindVertexBuffers(commandBuffer, 0, stack.longs(vertexBuffer), stack.longs(0));
         vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(commandBuffer, indexCount, 1, 0, 0, 0);
@@ -919,6 +1141,20 @@ public final class PreviewApp implements AutoCloseable {
             destroyIf(pipelineLayout, h -> vkDestroyPipelineLayout(device, h, null));
             destroyIf(fragmentShaderModule, h -> vkDestroyShaderModule(device, h, null));
             destroyIf(vertexShaderModule, h -> vkDestroyShaderModule(device, h, null));
+            for (long sampler : textureSamplers) {
+                destroyIf(sampler, h -> vkDestroySampler(device, h, null));
+            }
+            for (long view : textureViews) {
+                destroyIf(view, h -> vkDestroyImageView(device, h, null));
+            }
+            for (long image : textureImages) {
+                destroyIf(image, h -> vkDestroyImage(device, h, null));
+            }
+            for (long memory : textureMemories) {
+                destroyIf(memory, h -> vkFreeMemory(device, h, null));
+            }
+            destroyIf(descriptorPool, h -> vkDestroyDescriptorPool(device, h, null));
+            destroyIf(descriptorSetLayout, h -> vkDestroyDescriptorSetLayout(device, h, null));
             for (long framebuffer : framebuffers) {
                 vkDestroyFramebuffer(device, framebuffer, null);
             }

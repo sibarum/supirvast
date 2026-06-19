@@ -10,12 +10,15 @@ import java.util.List;
 /**
  * A minimal Wavefront OBJ loader producing the previewer's {@link Mesh}. Polygons are fan-triangulated and
  * faces expanded to one vertex per corner (no dedup — simple and correct for a PoC). When a face corner has no
- * normal, a flat per-triangle normal is computed from the triangle's positions.
+ * normal, a flat per-triangle normal is computed from the triangle's positions; missing texcoords default to
+ * zero.
  *
- * <p>Supports {@code v}, {@code vn}, and {@code f} with the {@code p}, {@code p//n}, and {@code p/t/n} corner
- * forms (positive 1-based indices). Texture coordinates are parsed-and-ignored; other directives are skipped.
+ * <p>Supports {@code v}, {@code vn}, {@code vt}, and {@code f} with the {@code p}, {@code p/t}, {@code p//n},
+ * and {@code p/t/n} corner forms (positive 1-based indices). Other directives are skipped.
  */
 public final class ObjLoader {
+
+    private static final float[] ZERO_UV = {0.0f, 0.0f};
 
     private ObjLoader() {
     }
@@ -31,7 +34,8 @@ public final class ObjLoader {
     public static Mesh parse(String text) {
         List<float[]> positions = new ArrayList<>();
         List<float[]> normals = new ArrayList<>();
-        List<int[]> triangleCorners = new ArrayList<>();   // each corner: [posIndex0Based, normIndex0BasedOr-1]
+        List<float[]> texcoords = new ArrayList<>();
+        List<int[]> corners = new ArrayList<>();   // each corner: [posIdx, uvIdxOr-1, normIdxOr-1] (0-based)
 
         for (String rawLine : text.split("\\R")) {
             String line = rawLine.strip();
@@ -42,14 +46,15 @@ public final class ObjLoader {
             switch (tokens[0]) {
                 case "v" -> positions.add(vec3(tokens, line));
                 case "vn" -> normals.add(vec3(tokens, line));
-                case "f" -> triangulate(tokens, triangleCorners);
-                default -> { /* vt, usemtl, o, g, s, … — ignored for the PoC */ }
+                case "vt" -> texcoords.add(vec2(tokens, line));
+                case "f" -> triangulate(tokens, corners);
+                default -> { /* usemtl, o, g, s, … — ignored for the PoC */ }
             }
         }
-        if (triangleCorners.isEmpty()) {
+        if (corners.isEmpty()) {
             throw new IllegalArgumentException("OBJ has no faces");
         }
-        return build(positions, normals, triangleCorners);
+        return build(positions, normals, texcoords, corners);
     }
 
     private static float[] vec3(String[] tokens, String line) {
@@ -60,7 +65,14 @@ public final class ObjLoader {
                 Float.parseFloat(tokens[1]), Float.parseFloat(tokens[2]), Float.parseFloat(tokens[3])};
     }
 
-    /** Fan-triangulates a face's corners into (0, i, i+1) triangles, recording position/normal indices. */
+    private static float[] vec2(String[] tokens, String line) {
+        if (tokens.length < 3) {
+            throw new IllegalArgumentException("expected 2 components in: " + line);
+        }
+        return new float[]{Float.parseFloat(tokens[1]), Float.parseFloat(tokens[2])};
+    }
+
+    /** Fan-triangulates a face's corners into (0, i, i+1) triangles, recording position/uv/normal indices. */
     private static void triangulate(String[] tokens, List<int[]> out) {
         int cornerCount = tokens.length - 1;
         if (cornerCount < 3) {
@@ -77,15 +89,17 @@ public final class ObjLoader {
         }
     }
 
-    /** Parses a face corner {@code p}, {@code p/t}, {@code p//n}, or {@code p/t/n} into [posIdx, normIdx]. */
+    /** Parses a face corner {@code p}, {@code p/t}, {@code p//n}, or {@code p/t/n} into [posIdx, uvIdx, normIdx]. */
     private static int[] parseCorner(String corner) {
         String[] parts = corner.split("/", -1);
         int position = Integer.parseInt(parts[0]) - 1;
+        int uv = parts.length >= 2 && !parts[1].isEmpty() ? Integer.parseInt(parts[1]) - 1 : -1;
         int normal = parts.length >= 3 && !parts[2].isEmpty() ? Integer.parseInt(parts[2]) - 1 : -1;
-        return new int[]{position, normal};
+        return new int[]{position, uv, normal};
     }
 
-    private static Mesh build(List<float[]> positions, List<float[]> normals, List<int[]> corners) {
+    private static Mesh build(List<float[]> positions, List<float[]> normals, List<float[]> texcoords,
+            List<int[]> corners) {
         int triangleCount = corners.size() / 3;
         float[] vertices = new float[corners.size() * Mesh.FLOATS_PER_VERTEX];
         int[] indices = new int[corners.size()];
@@ -100,7 +114,8 @@ public final class ObjLoader {
             for (int c = 0; c < 3; c++) {
                 int[] corner = corners.get(base + c);
                 float[] position = positions.get(corner[0]);
-                float[] normal = corner[1] >= 0 ? normals.get(corner[1]) : flat;
+                float[] normal = corner[2] >= 0 ? normals.get(corner[2]) : flat;
+                float[] uv = corner[1] >= 0 ? texcoords.get(corner[1]) : ZERO_UV;
                 int v = (base + c) * Mesh.FLOATS_PER_VERTEX;
                 vertices[v] = position[0];
                 vertices[v + 1] = position[1];
@@ -108,6 +123,8 @@ public final class ObjLoader {
                 vertices[v + 3] = normal[0];
                 vertices[v + 4] = normal[1];
                 vertices[v + 5] = normal[2];
+                vertices[v + 6] = uv[0];
+                vertices[v + 7] = uv[1];
                 indices[base + c] = base + c;
             }
         }

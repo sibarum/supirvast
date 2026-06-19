@@ -21,15 +21,16 @@ class GraphicsPipelineSpecTest {
     private static final Type VEC3 = new Type.Vector(Type.float32(), 3);
 
     @Test
-    void standardLayoutIsPositionThenNormalTightlyPacked() {
+    void standardLayoutIsPositionNormalUvTightlyPacked() {
         GraphicsPipelineSpec spec = GraphicsPipelineSpec.standard(FAKE_VERT, FAKE_FRAG);
 
         assertEquals("main", spec.vertexEntryPoint());
         assertEquals("main", spec.fragmentEntryPoint());
-        assertEquals(2, spec.vertexLayout().size());
+        assertEquals(3, spec.vertexLayout().size());
 
         VertexAttribute position = spec.vertexLayout().get(0);
         VertexAttribute normal = spec.vertexLayout().get(1);
+        VertexAttribute uv = spec.vertexLayout().get(2);
         assertEquals("position", position.name());
         assertEquals(0, position.location());
         assertEquals(0, position.offsetBytes());
@@ -37,8 +38,12 @@ class GraphicsPipelineSpecTest {
         assertEquals("normal", normal.name());
         assertEquals(1, normal.location());
         assertEquals(12, normal.offsetBytes());
+        assertEquals("uv", uv.name());
+        assertEquals(2, uv.location());
+        assertEquals(24, uv.offsetBytes());
+        assertEquals(8, uv.sizeBytes());
 
-        assertEquals(24, spec.vertexStrideBytes());
+        assertEquals(32, spec.vertexStrideBytes());
     }
 
     @Test

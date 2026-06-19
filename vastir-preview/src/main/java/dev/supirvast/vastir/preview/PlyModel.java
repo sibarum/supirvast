@@ -176,13 +176,35 @@ public final class PlyModel {
             }
         }
 
+        List<float[]> uvs = readUvs(vertex);
+
         int[][] faces = element("face").flatMap(Element::firstList)
                 .or(() -> elements.stream().map(Element::firstList).filter(Optional::isPresent)
                         .map(Optional::get).findFirst())
                 .orElseThrow(() -> new IllegalArgumentException("PLY has no face list property"));
 
         List<int[]> polygons = List.of(faces);
-        return Mesh.fromPolygons(positions, normals, polygons);
+        return Mesh.fromPolygons(positions, normals, uvs, polygons);
+    }
+
+    /** Reads per-vertex texcoords from the conventional {@code s}/{@code t} or {@code u}/{@code v} channels. */
+    private static List<float[]> readUvs(Element vertex) {
+        double[] u;
+        double[] v;
+        if (vertex.has("s") && vertex.has("t")) {
+            u = vertex.scalars.get("s");
+            v = vertex.scalars.get("t");
+        } else if (vertex.has("u") && vertex.has("v")) {
+            u = vertex.scalars.get("u");
+            v = vertex.scalars.get("v");
+        } else {
+            return null;
+        }
+        List<float[]> uvs = new ArrayList<>(vertex.count());
+        for (int i = 0; i < vertex.count(); i++) {
+            uvs.add(new float[]{(float) u[i], (float) v[i]});
+        }
+        return uvs;
     }
 
     private static double[] required(Element element, String property) {

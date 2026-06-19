@@ -92,16 +92,20 @@ public record GraphicsPipelineSpec(
     }
 
     /**
-     * The v1 standard layout — location 0 = position {@code vec3}, location 1 = normal {@code vec3}, tightly
-     * packed (stride 24 bytes) — with the conventional {@code "main"} entry point for both stages.
+     * The standard layout — location 0 = position {@code vec3}, location 1 = normal {@code vec3}, location 2 =
+     * uv {@code vec2}, tightly packed (stride 32 bytes) — with the conventional {@code "main"} entry point for
+     * both stages. UV is always present so there is a single vertex format; a shader that doesn't read it simply
+     * ignores location 2.
      */
     public static GraphicsPipelineSpec standard(byte[] vertexSpirv, byte[] fragmentSpirv) {
         Type vec3 = new Type.Vector(Type.float32(), 3);
+        Type vec2 = new Type.Vector(Type.float32(), 2);
         return new GraphicsPipelineSpec(
                 vertexSpirv, "main",
                 fragmentSpirv, "main",
                 List.of(new VertexAttribute("position", 0, vec3, 0),
-                        new VertexAttribute("normal", 1, vec3, byteSize(vec3))));
+                        new VertexAttribute("normal", 1, vec3, byteSize(vec3)),
+                        new VertexAttribute("uv", 2, vec2, byteSize(vec3) * 2)));
     }
 
     private static void requireSpirv(byte[] spirv, String stage) {

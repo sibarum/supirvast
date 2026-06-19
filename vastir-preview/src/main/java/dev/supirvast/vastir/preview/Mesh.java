@@ -3,15 +3,18 @@ package dev.supirvast.vastir.preview;
 import java.util.List;
 
 /**
- * A pipeline-ready mesh in the previewer's v1 vertex format: interleaved {@code position(vec3) + normal(vec3)}
- * (24-byte stride, matching {@link dev.supirvast.vastir.tools.GraphicsPipelineSpec#standard}) plus a
- * {@code uint32} index list. Every model loader ({@link ObjLoader}, {@link PlyModel}) produces this so the
- * renderer is format-agnostic.
+ * A pipeline-ready mesh in the previewer's vertex format: interleaved {@code position(vec3) + normal(vec3) +
+ * uv(vec2)} (32-byte stride, matching {@link dev.supirvast.vastir.tools.GraphicsPipelineSpec#standard}) plus a
+ * {@code uint32} index list. UV is always present (zero when a model has none) so there is a single vertex
+ * format; a shader that doesn't read UV simply ignores attribute location 2. Every model loader
+ * ({@link ObjLoader}, {@link PlyModel}) produces this so the renderer is format-agnostic.
  */
 public record Mesh(float[] vertices, int[] indices) {
 
-    /** Floats per interleaved vertex: position xyz + normal xyz. */
-    public static final int FLOATS_PER_VERTEX = 6;
+    /** Floats per interleaved vertex: position xyz + normal xyz + uv. */
+    public static final int FLOATS_PER_VERTEX = 8;
+
+    private static final float[] ZERO_UV = {0.0f, 0.0f};
 
     public int vertexCount() {
         return vertices.length / FLOATS_PER_VERTEX;
@@ -24,9 +27,11 @@ public record Mesh(float[] vertices, int[] indices) {
     /**
      * Builds a mesh from indexed polygons, fan-triangulated and expanded to one vertex per corner (no dedup).
      * Each polygon is a list of 0-based vertex indices. When {@code normals} is {@code null}, a flat per-triangle
-     * normal is computed; otherwise the per-vertex normal at each index is used.
+     * normal is computed; otherwise the per-vertex normal at each index is used. {@code uvs} may be {@code null}
+     * (UVs default to zero).
      */
-    static Mesh fromPolygons(List<float[]> positions, List<float[]> normals, List<int[]> polygons) {
+    static Mesh fromPolygons(List<float[]> positions, List<float[]> normals, List<float[]> uvs,
+            List<int[]> polygons) {
         int triangleCount = 0;
         for (int[] polygon : polygons) {
             if (polygon.length >= 3) {
@@ -44,18 +49,19 @@ public record Mesh(float[] vertices, int[] indices) {
                 int c = polygon[i + 1];
                 float[] flat = normals == null
                         ? flatNormal(positions.get(a), positions.get(b), positions.get(c)) : null;
-                corner = emit(vertices, indices, corner, positions, normals, flat, a);
-                corner = emit(vertices, indices, corner, positions, normals, flat, b);
-                corner = emit(vertices, indices, corner, positions, normals, flat, c);
+                corner = emit(vertices, indices, corner, positions, normals, uvs, flat, a);
+                corner = emit(vertices, indices, corner, positions, normals, uvs, flat, b);
+                corner = emit(vertices, indices, corner, positions, normals, uvs, flat, c);
             }
         }
         return new Mesh(vertices, indices);
     }
 
     private static int emit(float[] vertices, int[] indices, int corner, List<float[]> positions,
-            List<float[]> normals, float[] flat, int index) {
+            List<float[]> normals, List<float[]> uvs, float[] flat, int index) {
         float[] position = positions.get(index);
         float[] normal = normals != null ? normals.get(index) : flat;
+        float[] uv = uvs != null ? uvs.get(index) : ZERO_UV;
         int v = corner * FLOATS_PER_VERTEX;
         vertices[v] = position[0];
         vertices[v + 1] = position[1];
@@ -63,6 +69,8 @@ public record Mesh(float[] vertices, int[] indices) {
         vertices[v + 3] = normal[0];
         vertices[v + 4] = normal[1];
         vertices[v + 5] = normal[2];
+        vertices[v + 6] = uv[0];
+        vertices[v + 7] = uv[1];
         indices[corner] = corner;
         return corner + 1;
     }

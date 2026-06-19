@@ -23,6 +23,27 @@ class PreviewOptionsTest {
         assertEquals(720, options.height());
         assertTrue(options.screenshot().isEmpty());
         assertTrue(options.frames().isEmpty());
+        assertTrue(options.textures().isEmpty());
+    }
+
+    @Test
+    void parsesRepeatableTextureBindings() {
+        PreviewOptions options = PreviewOptions.parse(new String[]{
+                "--vert", "v.spv", "--frag", "f.spv", "--model", "cube.obj",
+                "--texture", "0=albedo.png", "--texture", "2=normal.png"});
+
+        assertEquals(2, options.textures().size());
+        assertEquals(Path.of("albedo.png"), options.textures().get(0));
+        assertEquals(Path.of("normal.png"), options.textures().get(2));
+    }
+
+    @Test
+    void rejectsMalformedOrDuplicateTexture() {
+        assertThrows(IllegalArgumentException.class, () -> PreviewOptions.parse(new String[]{
+                "--vert", "v.spv", "--frag", "f.spv", "--model", "cube.obj", "--texture", "no-equals"}));
+        assertThrows(IllegalArgumentException.class, () -> PreviewOptions.parse(new String[]{
+                "--vert", "v.spv", "--frag", "f.spv", "--model", "cube.obj",
+                "--texture", "0=a.png", "--texture", "0=b.png"}));
     }
 
     @Test
