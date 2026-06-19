@@ -28,6 +28,8 @@
         <module>vastir-tools</module>
         <!-- Windowed Vulkan shader previewer (application): loads exported SPIR-V + a model, renders it. -->
         <module>vastir-preview</module>
+        <!-- PBR surface-shader authoring: pick channels + a surface function, generate a lit shader pair. -->
+        <module>vastir-pbr</module>
     </modules>
 
     <properties>
