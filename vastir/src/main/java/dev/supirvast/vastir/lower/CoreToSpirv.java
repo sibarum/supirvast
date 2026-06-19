@@ -809,15 +809,15 @@ public final class CoreToSpirv {
     }
 
     /**
-     * Combined 2D image+sampler resources (GLSL {@code sampler2D}s). All textures share one {@code OpTypeImage}/
-     * {@code OpTypeSampledImage}/pointer type (each is a sampled RGBA-float 2D image); each gets one
-     * {@code UniformConstant} variable decorated with its descriptor set + binding, and is listed in the entry
-     * point's interface (SPIR-V >= 1.4).
+     * Combined image+sampler resources (GLSL {@code sampler2D} / {@code samplerCube}). All textures of a given
+     * {@link Texture.Kind} share one {@code OpTypeImage}/{@code OpTypeSampledImage}/pointer type (sampled
+     * RGBA-float, 2D or cube); each texture gets one {@code UniformConstant} variable decorated with its
+     * descriptor set + binding, and is listed in the entry point's interface (SPIR-V >= 1.4).
      */
     private static final class TextureResources {
         private final List<Texture> textures;
         private final Map<Texture, Integer> variableIds = new LinkedHashMap<>();
-        private int sampledImageType;
+        private final Map<Texture.Kind, Integer> sampledImageTypeByKind = new LinkedHashMap<>();
 
         TextureResources(Builder b, List<Texture> textures) {
             this.textures = textures;
@@ -826,9 +826,9 @@ public final class CoreToSpirv {
             }
         }
 
-        /** The {@code OpTypeSampledImage} id, loaded before each sample. Valid after {@link #declare}. */
-        int sampledImageType() {
-            return sampledImageType;
+        /** The {@code OpTypeSampledImage} id for a kind, loaded before each sample. Valid after {@link #declare}. */
+        int sampledImageType(Texture.Kind kind) {
+            return sampledImageTypeByKind.get(kind);
         }
 
         int variable(Texture texture) {
@@ -841,25 +841,35 @@ public final class CoreToSpirv {
 
         void declare(Builder b, TypeTable types) {
             int floatType = types.idOf(Type.float32());
-            int imageType = b.allocateId();
-            // OpTypeImage: sampled-type, Dim 2D, Depth 0, Arrayed 0, MS 0, Sampled 1 (with a sampler), Unknown fmt.
-            b.emit(b.globals, Op.OpTypeImage).id(imageType).id(floatType)
-                    .enumValue(Dim._2D.value()).literal(0).literal(0).literal(0).literal(1)
-                    .enumValue(ImageFormat.Unknown.value());
-            sampledImageType = b.allocateId();
-            b.emit(b.globals, Op.OpTypeSampledImage).id(sampledImageType).id(imageType);
-            int pointerType = b.allocateId();
-            b.emit(b.globals, Op.OpTypePointer).id(pointerType)
-                    .enumValue(StorageClass.UniformConstant.value()).id(sampledImageType);
+            Map<Texture.Kind, Integer> pointerTypeByKind = new LinkedHashMap<>();
             for (Texture texture : textures) {
+                Texture.Kind kind = texture.kind();
+                pointerTypeByKind.computeIfAbsent(kind, k -> declareKind(b, floatType, k));
                 int variableId = variableIds.get(texture);
-                b.emit(b.globals, Op.OpVariable).id(pointerType).id(variableId)
+                b.emit(b.globals, Op.OpVariable).id(pointerTypeByKind.get(kind)).id(variableId)
                         .enumValue(StorageClass.UniformConstant.value());
                 b.emit(b.annotations, Op.OpDecorate).id(variableId)
                         .enumValue(Decoration.DescriptorSet.value()).literal(texture.set());
                 b.emit(b.annotations, Op.OpDecorate).id(variableId)
                         .enumValue(Decoration.Binding.value()).literal(texture.binding());
             }
+        }
+
+        /** Emits the shared image/sampled-image/pointer types for a kind, returning the pointer-type id. */
+        private int declareKind(Builder b, int floatType, Texture.Kind kind) {
+            int dim = kind == Texture.Kind.CUBE ? Dim.Cube.value() : Dim._2D.value();
+            int imageType = b.allocateId();
+            // OpTypeImage: sampled-type, Dim, Depth 0, Arrayed 0, MS 0, Sampled 1 (with a sampler), Unknown fmt.
+            b.emit(b.globals, Op.OpTypeImage).id(imageType).id(floatType)
+                    .enumValue(dim).literal(0).literal(0).literal(0).literal(1)
+                    .enumValue(ImageFormat.Unknown.value());
+            int sampledImageType = b.allocateId();
+            b.emit(b.globals, Op.OpTypeSampledImage).id(sampledImageType).id(imageType);
+            sampledImageTypeByKind.put(kind, sampledImageType);
+            int pointerType = b.allocateId();
+            b.emit(b.globals, Op.OpTypePointer).id(pointerType)
+                    .enumValue(StorageClass.UniformConstant.value()).id(sampledImageType);
+            return pointerType;
         }
     }
 
@@ -1157,7 +1167,8 @@ public final class CoreToSpirv {
             int coordinate = lowerExpr(sample.uv());   // lower the coordinate before emitting the load/sample
             int loaded = b.allocateId();
             b.emit(b.functions, Op.OpLoad)
-                    .id(textures.sampledImageType()).id(loaded).id(textures.variable(sample.texture()));
+                    .id(textures.sampledImageType(sample.texture().kind())).id(loaded)
+                    .id(textures.variable(sample.texture()));
             int resultType = types.idOf(sample.type());
             int result = b.allocateId();
             b.emit(b.functions, Op.OpImageSampleImplicitLod).id(resultType).id(result).id(loaded).id(coordinate);
