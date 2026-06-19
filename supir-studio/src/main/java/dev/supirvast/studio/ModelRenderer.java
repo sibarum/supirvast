@@ -17,16 +17,24 @@ import static sibarum.dasum.gui.natives.gl.Gl.GL_TRIANGLES;
 import static sibarum.dasum.gui.natives.gl.Gl.GL_UNSIGNED_INT;
 
 /**
- * The studio's 3D viewport renderer: it owns the model's GPU buffers and the
- * live GL program, draws the model into a {@link Component.SceneView}'s rect
- * each frame with an auto-rotating MVP, and rebuilds the program from editor
- * text on demand.
+ * The studio's 3D viewport renderer: it owns the model's GPU buffers, the live
+ * GL program, and an orbit camera, draws the model into a
+ * {@link Component.SceneView}'s rect each frame, and rebuilds the program from
+ * editor text on demand.
  *
  * <p>It is registered against {@code Component.SceneView.class} in
  * {@link CustomRenderers} (see {@link #asRenderer()}). dasum-vis registers its
  * own SceneView renderer at {@code DasumVis.init()}; this one is registered
  * <em>after</em> that so it wins the (identity-keyed) slot for the studio's
  * single scene view.
+ *
+ * <p>The camera orbits a still model: {@link #orbit} turns mouse drag deltas
+ * into yaw/pitch, {@link #zoom} dollies the view distance, both clamped to
+ * sane ranges. The model matrix is identity — only the view changes — so the
+ * fragment shader sees a stationary surface the user inspects from any angle.
+ * Both mutators return whether the camera actually moved, so the app can keep
+ * the viewport retained-mode correct: it redraws on interaction and is
+ * otherwise idle (no per-frame invalidation, no time-based animation).
  *
  * <p>The render path mirrors the point-cloud renderer's contract: enter a
  * {@link ViewportScope} (which flushes the 2D batcher, scissors + retargets the
@@ -61,7 +69,21 @@ public final class ModelRenderer implements AutoCloseable {
     private final Matrix4f mvp = new Matrix4f();
     private final float[] matrixScratch = new float[16];
 
-    private final long startNanos = System.nanoTime();
+    // ---- orbit camera state (the model is still; the camera moves) ----
+
+    /** Pitch clamp: just shy of straight up/down so the view never gimbal-flips. */
+    private static final float PITCH_LIMIT = 1.55f;        // ~89°
+    private static final float DISTANCE_MIN = 1.5f;
+    private static final float DISTANCE_MAX = 20f;
+    private static final float ORBIT_RAD_PER_PIXEL = 0.008f;
+    private static final float ZOOM_FACTOR_PER_NOTCH = 1.15f;
+
+    /** Azimuth about the world Y axis, radians. */
+    private float yaw = 0f;
+    /** Elevation, radians, clamped to {@code ±PITCH_LIMIT}. */
+    private float pitch = 0.3f;
+    /** Camera-to-target distance, clamped to {@code [DISTANCE_MIN, DISTANCE_MAX]}. */
+    private float distance = 3.2f;
 
     /**
      * @param geometry         the model to draw (interleaved pos/normal/uv)
@@ -77,6 +99,43 @@ public final class ModelRenderer implements AutoCloseable {
     /** Adapter to the framework's custom-renderer hook. */
     public CustomRenderers.Renderer asRenderer() {
         return this::render;
+    }
+
+    /**
+     * Orbit the camera by a mouse-drag delta (pixels): {@code dx} turns the
+     * yaw, {@code dy} the pitch. Pitch is clamped to {@code ±PITCH_LIMIT} so
+     * the view can't flip over the poles.
+     *
+     * @return {@code true} iff the camera actually moved — the caller should
+     *         {@code Invalidator.invalidate()} only then, keeping the viewport
+     *         retained-mode correct (no redraw when nothing changed)
+     */
+    public boolean orbit(double dx, double dy) {
+        float newYaw = yaw + (float) dx * ORBIT_RAD_PER_PIXEL;
+        float newPitch = clamp(pitch + (float) dy * ORBIT_RAD_PER_PIXEL, -PITCH_LIMIT, PITCH_LIMIT);
+        if (newYaw == yaw && newPitch == pitch) return false;
+        yaw = newYaw;
+        pitch = newPitch;
+        return true;
+    }
+
+    /**
+     * Dolly the camera in/out by a scroll-wheel delta ({@code yOff} notches;
+     * positive scrolls up / zooms in). Distance is clamped to
+     * {@code [DISTANCE_MIN, DISTANCE_MAX]}.
+     *
+     * @return {@code true} iff the distance actually changed (see {@link #orbit})
+     */
+    public boolean zoom(double yOff) {
+        float factor = (float) Math.pow(ZOOM_FACTOR_PER_NOTCH, -yOff);
+        float newDistance = clamp(distance * factor, DISTANCE_MIN, DISTANCE_MAX);
+        if (newDistance == distance) return false;
+        distance = newDistance;
+        return true;
+    }
+
+    private static float clamp(float v, float min, float max) {
+        return Math.max(min, Math.min(max, v));
     }
 
     /**
@@ -125,11 +184,17 @@ public final class ModelRenderer implements AutoCloseable {
     }
 
     private void updateMatrices(PixelRect rect) {
-        float seconds = (System.nanoTime() - startNanos) / 1_000_000_000.0f;
-        float angle = seconds * 0.6f;
+        // The model is still; the camera orbits it. Place the eye on a sphere
+        // of radius `distance` about the origin from (yaw, pitch), then look
+        // back at the origin. Pitch is pre-clamped, so cos(pitch) > 0 and the
+        // up vector stays world-up without flipping.
+        float cosPitch = (float) Math.cos(pitch);
+        float eyeX = distance * cosPitch * (float) Math.sin(yaw);
+        float eyeY = distance * (float) Math.sin(pitch);
+        float eyeZ = distance * cosPitch * (float) Math.cos(yaw);
 
-        model.identity().rotateY(angle).rotateX(angle * 0.35f);
-        view.identity().lookAt(0f, 0f, 3.2f, 0f, 0f, 0f, 0f, 1f, 0f);
+        model.identity();
+        view.identity().lookAt(eyeX, eyeY, eyeZ, 0f, 0f, 0f, 0f, 1f, 0f);
 
         float aspect = rect.height() <= 0f ? 1f : rect.width() / rect.height();
         projection.identity().perspective((float) Math.toRadians(45.0), aspect, 0.1f, 100.0f);

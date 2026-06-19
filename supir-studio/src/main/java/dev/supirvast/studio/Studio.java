@@ -47,14 +47,16 @@ import static sibarum.dasum.gui.natives.gl.Gl.GL_COLOR_BUFFER_BIT;
  * app with an editable GLSL fragment shader on the left and a 3D preview on the
  * right.
  *
- * <p>The left panel is an editable {@link Component.Text} holding fragment-shader
- * source, a <strong>Compile</strong> button, and a status line. The right panel
- * is a {@link Component.SceneView} whose {@link ModelRenderer} draws an
- * auto-rotating UV sphere with a fixed MVP vertex shader and the editor's
- * fragment shader. Pressing Compile rebuilds the GL program from the editor text
- * via {@link ShaderUtil#buildProgram}; on failure the compile log is shown in the
- * status line and the last good program is kept (the app never crashes on bad
- * GLSL).
+ * <p>The left panel is an editable {@link Component.Text} (with a line-number
+ * gutter) holding fragment-shader source plus a <strong>Compile</strong>
+ * button. The right panel is a {@link Component.SceneView} whose
+ * {@link ModelRenderer} draws a UV sphere with a fixed MVP vertex shader and
+ * the editor's fragment shader; an orbit camera responds to mouse drag (orbit)
+ * and the scroll wheel (zoom) over the viewport. A full-width status bar runs
+ * along the bottom for notifications. Pressing Compile rebuilds the GL program
+ * from the editor text via {@link ShaderUtil#buildProgram}; on failure the
+ * compile log is shown in the status bar and the last good program is kept (the
+ * app never crashes on bad GLSL).
  *
  * <p>Phase 1 feeds GLSL straight into the editor — the Supir → core → SPIR-V →
  * GLSL pipeline is wired in Phase 2 (see the module README). The loop, layout,
@@ -110,7 +112,7 @@ public final class Studio {
 
                 Ui ui = buildUi(fragmentSource);
                 wireCompile(ui, ownedRenderer);
-                wireInput(window);
+                wireInput(window, ui, ownedRenderer);
 
                 long[] renderedFrames = {0};
                 EventLoop loop = new EventLoop(window, () -> {
@@ -119,10 +121,23 @@ public final class Studio {
                     if (frameLimit > 0 && renderedFrames[0] >= frameLimit) {
                         window.requestClose();
                     }
-                    // Drive continuous animation: re-dirty so the loop renders
-                    // the next frame rather than going idle (the model rotates).
-                    Invalidator.invalidate();
+                    // Retained-mode: no per-frame invalidation. The loop goes
+                    // idle after the first frame and wakes only when input
+                    // dirties it (camera orbit/zoom, editing, compile).
                 });
+
+                // Under a frame cap the loop would otherwise idle after the
+                // first frame (it blocks in glfwWaitEvents and nothing posts a
+                // wake on the main thread), never reaching the cap. For the
+                // non-interactive smoke path only, re-dirty AND post an empty
+                // event after each layout so glfwWaitEvents returns and renders
+                // the next frame. Interactive runs stay purely event-driven.
+                if (frameLimit > 0) {
+                    LatestLayout.addAfterStore(() -> {
+                        Invalidator.invalidate();
+                        Glfw.glfwPostEmptyEvent();
+                    });
+                }
                 loop.run();
 
                 System.out.println("Exited cleanly; frames rendered: " + loop.renderedFrameCount());
@@ -152,11 +167,13 @@ public final class Studio {
     // ---------- UI ----------
 
     /**
-     * The assembled UI plus the handles the compile wiring needs: the
-     * {@code editor} to read GLSL from, the {@code compileButton} to attach the
-     * click handler to, and the {@code status} line to write results to.
+     * The assembled UI plus the handles the wiring needs: the {@code editor}
+     * to read GLSL from, the {@code compileButton} to attach the click handler
+     * to, the {@code status} line to write results to, and the {@code scene}
+     * to hit-test mouse input against for camera control.
      */
-    private record Ui(Component root, Component.Text editor, Component compileButton, Component.Text status) {}
+    private record Ui(Component root, Component.Text editor, Component compileButton,
+                      Component.Text status, Component.SceneView scene) {}
 
     private static Ui buildUi(String initialFragment) {
         Component.Text title = new Component.Text("Fragment shader (GLSL)", Em.of(1.0f), LABEL_FG);
@@ -164,14 +181,12 @@ public final class Studio {
         Component.Text editor = new Component.Text(initialFragment, Em.of(0.85f), EDITOR_FG)
             .withEditable(true)
             .withAcceptsTab(true)
+            .withLineNumbers(true)
             .withWrapWidth(Em.of(34f))
             .withClip(true)
             .withFlexGrow(1);
 
         Component compileButton = Themed.button("Compile", Em.of(8f), Variant.PRIMARY, 0);
-
-        Component.Text status = new Component.Text("Ready.", Em.of(0.85f), STATUS_FG)
-            .withWrapWidth(Em.of(34f));
 
         Component editorScroll = new Component.Scroll(
             null, null, Em.of(0.5f), EDITOR_BG, editor, false, 1);
@@ -179,21 +194,41 @@ public final class Studio {
         Component leftPanel = new Component.Flex(
             Em.of(38f), null, Em.of(0.6f), PANEL_BG,
             Direction.COLUMN, JustifyContent.START, AlignItems.STRETCH, Em.of(0.5f),
-            List.of(title, editorScroll, compileButton, status),
+            List.of(title, editorScroll, compileButton),
             false, 0
         );
 
-        Component sceneView = new Component.SceneView(
+        Component.SceneView scene = new Component.SceneView(
             null, null, Em.ZERO, VIEWPORT_BG, true, 1);
+
+        Component contentRow = new Component.Flex(
+            null, null, Em.of(0.5f), FRAME_BG,
+            Direction.ROW, JustifyContent.START, AlignItems.STRETCH, Em.of(0.5f),
+            List.of(leftPanel, scene),
+            false, 1
+        );
+
+        // Bottom status bar: a full-width Flex strip wrapping a single Text,
+        // composed from stock Dasum components (no framework change). It spans
+        // the window because the COLUMN root stretches it on the cross axis;
+        // a null height lets it size to its content (one text line + padding).
+        Component.Text status = new Component.Text("Ready. Drag to orbit · scroll to zoom.",
+            Em.of(0.85f), STATUS_FG);
+        Component statusBar = new Component.Flex(
+            null, null, Em.of(0.4f), PANEL_BG,
+            Direction.ROW, JustifyContent.START, AlignItems.CENTER, Em.ZERO,
+            List.of(status),
+            false, 0
+        );
 
         Component root = new Component.Flex(
             null, null, Em.of(0.5f), FRAME_BG,
-            Direction.ROW, JustifyContent.START, AlignItems.STRETCH, Em.of(0.5f),
-            List.of(leftPanel, sceneView),
+            Direction.COLUMN, JustifyContent.START, AlignItems.STRETCH, Em.of(0.5f),
+            List.of(contentRow, statusBar),
             false, 0
         );
 
-        return new Ui(root, editor, compileButton, status);
+        return new Ui(root, editor, compileButton, status, scene);
     }
 
     private static void wireCompile(Ui ui, ModelRenderer renderer) {
@@ -211,14 +246,40 @@ public final class Studio {
 
     // ---------- input ----------
 
+    /** True while a left-drag that began over the scene viewport is in flight. */
+    private static boolean orbiting = false;
+    /** Last cursor position seen while orbiting, for per-move deltas. */
+    private static double lastOrbitX = 0d, lastOrbitY = 0d;
+
     /**
-     * Minimal input wiring for Phase 1: focus + caret placement on click,
-     * character + editing keys for the text editor, click activation for the
-     * Compile button, and hover tracking. The node-editor / table / overlay /
-     * tooltip controllers from the demo are intentionally omitted — this app
-     * has none of those widgets.
+     * Whether the point {@code (x, y)} falls inside the scene viewport's latest
+     * laid-out rect. dasum-core has no per-leaf drag/scroll handler registry —
+     * {@link Handlers} only carries click/focus/blur — so the studio hit-tests
+     * the raw GLFW callbacks against the SceneView's rect itself (the same
+     * approach dasum-vis's {@code SceneViewController} takes, minus its
+     * SceneStates camera model which this renderer doesn't use).
      */
-    private static void wireInput(Window window) {
+    private static boolean overScene(Ui ui, double x, double y) {
+        LayoutResult lr = LatestLayout.result();
+        if (lr == null) return false;
+        PixelRect rect = lr.rectOf(ui.scene());
+        return rect != null && rect.contains((float) x, (float) y);
+    }
+
+    /**
+     * Input wiring: focus + caret placement on click, character + editing keys
+     * for the text editor, click activation for the Compile button, hover
+     * tracking, and orbit/zoom camera control over the scene viewport. The
+     * node-editor / table / overlay / tooltip controllers from the demo are
+     * intentionally omitted — this app has none of those widgets.
+     *
+     * <p>Camera input is hit-tested against the SceneView rect directly:
+     * left-drag that starts over the viewport orbits the camera, and the
+     * scroll wheel zooms while the cursor is over it. Each only redraws (via
+     * {@link Invalidator#invalidate}) when the camera actually changed, so the
+     * idle viewport stays idle.
+     */
+    private static void wireInput(Window window, Ui ui, ModelRenderer renderer) {
         GlfwCallbacks.setKeyListener((win, key, scancode, action, mods) -> {
             InputState.setMods(mods);
             if (action != Glfw.GLFW_PRESS && action != Glfw.GLFW_REPEAT) return;
@@ -254,12 +315,32 @@ public final class Studio {
 
         GlfwCallbacks.setCursorPosListener((win, x, y) -> {
             InputState.updateMousePos(x, y);
+            if (orbiting) {
+                // Drag over the viewport orbits the camera. Redraw only when
+                // the camera moved (pitch may be clamped to a no-op).
+                if (renderer.orbit(x - lastOrbitX, y - lastOrbitY)) {
+                    Invalidator.invalidate();
+                }
+                lastOrbitX = x;
+                lastOrbitY = y;
+                return;
+            }
             LayoutResult lr = LatestLayout.result();
             Component root = LatestLayout.root();
             if (lr == null || root == null) return;
             Component hit = HitTest.test(root, lr, (float) x, (float) y);
             HoverState.update(hit);
             TextInputController.onCursorMove(hit, x, y);
+        });
+
+        GlfwCallbacks.setScrollListener((win, xOff, yOff) -> {
+            // Scroll over the viewport zooms the camera. Hit-tested to the
+            // rect so the wheel only zooms when the cursor is actually over
+            // the scene; redraw only when the distance changed (clamp no-op).
+            if (overScene(ui, InputState.mouseX(), InputState.mouseY())
+                    && renderer.zoom(yOff)) {
+                Invalidator.invalidate();
+            }
         });
 
         GlfwCallbacks.setMouseButtonListener((win, button, action, mods) -> {
@@ -276,11 +357,23 @@ public final class Studio {
                 Component hit = (lr != null && root != null)
                     ? HitTest.test(root, lr, (float) InputState.mouseX(), (float) InputState.mouseY())
                     : null;
+                if (hit == ui.scene()) {
+                    // Begin an orbit drag: the camera, not the editor, owns
+                    // this gesture. Move focus onto the viewport (clears the
+                    // editor caret) and arm the cursor-pos delta tracking.
+                    orbiting = true;
+                    lastOrbitX = InputState.mouseX();
+                    lastOrbitY = InputState.mouseY();
+                    pressTarget = null;
+                    FocusState.set(hit);
+                    return;
+                }
                 pressTarget = hit;
                 if (hit != null) FocusState.set(hit);
                 else FocusState.clear();
                 TextInputController.onMouseDown(hit, InputState.mouseX(), InputState.mouseY(), shift);
             } else {
+                orbiting = false;
                 Component released = (lr != null && root != null)
                     ? HitTest.test(root, lr, (float) InputState.mouseX(), (float) InputState.mouseY())
                     : null;
