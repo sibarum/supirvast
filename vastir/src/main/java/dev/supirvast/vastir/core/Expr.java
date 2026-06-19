@@ -134,6 +134,25 @@ public sealed interface Expr {
         }
     }
 
+    /** Reads member {@code member} of the module's push-constant block; its type is that member's type. */
+    record PushConstantRead(PushConstants block, int member) implements Expr {
+        @Override
+        public Type type() {
+            return block.members().get(member).type();
+        }
+    }
+
+    /**
+     * Matrix × vector ({@code OpMatrixTimesVector}) — e.g. {@code mvp * vec4(position, 1)}. The result is a
+     * vector of the matrix's column type.
+     */
+    record MatrixTimesVector(Expr matrix, Expr vector) implements Expr {
+        @Override
+        public Type type() {
+            return ((Type.Matrix) matrix.type()).column();
+        }
+    }
+
     /**
      * Samples a {@link Texture} at {@code uv} (a {@code vec2}), yielding the RGBA texel as a {@code vec4}.
      * Fragment-stage only — it lowers to implicit-LOD sampling, which needs fragment-quad derivatives.

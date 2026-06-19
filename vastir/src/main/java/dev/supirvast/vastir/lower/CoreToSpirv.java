@@ -6,6 +6,7 @@ import dev.supirvast.vastir.core.BinaryOp;
 import dev.supirvast.vastir.core.Buffer;
 import dev.supirvast.vastir.core.Builtin;
 import dev.supirvast.vastir.core.MathFn;
+import dev.supirvast.vastir.core.PushConstants;
 import dev.supirvast.vastir.core.Texture;
 import dev.supirvast.vastir.core.CoreModule;
 import dev.supirvast.vastir.core.EntryPoint;
@@ -83,13 +84,15 @@ public final class CoreToSpirv {
                 ? null : new InterfaceResources(b, iface.builtins(), iface.variables());
         TextureResources textures = iface.textures().isEmpty()
                 ? null : new TextureResources(b, iface.textures());
+        PushConstantResources pushConstants = iface.pushConstants() == null
+                ? null : new PushConstantResources(b, iface.pushConstants());
 
         b.emit(b.capabilities, Op.OpCapability).enumValue(Capability.Shader.value());
         b.emit(b.memoryModel, Op.OpMemoryModel)
                 .enumValue(target.addressingModel())
                 .enumValue(target.memoryModel());
 
-        emitEntryPoints(module, b, functionIds, output, kernel, interfaceResources, textures);
+        emitEntryPoints(module, b, functionIds, output, kernel, interfaceResources, textures, pushConstants);
         emitExecutionModes(module, b, functionIds);
 
         TypeTable types = new TypeTable(b);
@@ -106,10 +109,14 @@ public final class CoreToSpirv {
         if (textures != null) {
             textures.declare(b, types);
         }
+        if (pushConstants != null) {
+            pushConstants.declare(b, types, constants);
+        }
         prepareGlobals(module, types, constants);
 
         for (Function function : module.functions()) {
-            new FunctionLowering(b, types, constants, output, kernel, interfaceResources, textures, functionIds)
+            new FunctionLowering(b, types, constants, output, kernel, interfaceResources, textures,
+                    pushConstants, functionIds)
                     .emit(function, functionIds.get(function));
         }
 
@@ -141,7 +148,7 @@ public final class CoreToSpirv {
 
     private void emitEntryPoints(CoreModule module, Builder b, Map<Function, Integer> functionIds,
             OutputBuffer output, KernelResources kernel, InterfaceResources interfaceResources,
-            TextureResources textures) {
+            TextureResources textures, PushConstantResources pushConstants) {
         for (EntryPoint entryPoint : module.entryPoints()) {
             Instruction instruction = b.emit(b.entryPoints, Op.OpEntryPoint)
                     .enumValue(executionModel(entryPoint.stage()))
@@ -165,6 +172,9 @@ public final class CoreToSpirv {
                 for (int textureVar : textures.interfaceVariables()) {
                     instruction.id(textureVar);
                 }
+            }
+            if (pushConstants != null) {
+                instruction.id(pushConstants.variableId());
             }
         }
     }
@@ -267,6 +277,11 @@ public final class CoreToSpirv {
             case Expr.Call c -> c.arguments().forEach(a -> collectBuffers(a, out));
             case Expr.MathCall mc -> mc.args().forEach(a -> collectBuffers(a, out));
             case Expr.SampleTexture s -> collectBuffers(s.uv(), out);
+            case Expr.PushConstantRead ignored -> { }
+            case Expr.MatrixTimesVector m -> {
+                collectBuffers(m.matrix(), out);
+                collectBuffers(m.vector(), out);
+            }
             case Expr.ConstInt ignored -> { }
             case Expr.ConstFloat ignored -> { }
             case Expr.ConstBool ignored -> { }
@@ -316,6 +331,11 @@ public final class CoreToSpirv {
             case Expr.Call c -> c.arguments().forEach(a -> scanForInvocationId(a, found));
             case Expr.MathCall mc -> mc.args().forEach(a -> scanForInvocationId(a, found));
             case Expr.SampleTexture s -> scanForInvocationId(s.uv(), found);
+            case Expr.PushConstantRead ignored -> { }
+            case Expr.MatrixTimesVector m -> {
+                scanForInvocationId(m.matrix(), found);
+                scanForInvocationId(m.vector(), found);
+            }
             case Expr.ConstInt ignored -> { }
             case Expr.ConstFloat ignored -> { }
             case Expr.ConstBool ignored -> { }
@@ -326,8 +346,9 @@ public final class CoreToSpirv {
         }
     }
 
-    /** The graphics built-ins, interface variables, and textures a module references, in first-seen order. */
-    private record InterfaceUsage(List<Builtin> builtins, List<InterfaceVar> variables, List<Texture> textures) {
+    /** The graphics built-ins, interface variables, textures, and push constants a module references. */
+    private record InterfaceUsage(List<Builtin> builtins, List<InterfaceVar> variables, List<Texture> textures,
+            PushConstants pushConstants) {
         boolean isEmpty() {
             return builtins.isEmpty() && variables.isEmpty();
         }
@@ -338,6 +359,7 @@ public final class CoreToSpirv {
         final Set<Builtin> builtins = new LinkedHashSet<>();
         final Set<InterfaceVar> variables = new LinkedHashSet<>();
         final Set<Texture> textures = new LinkedHashSet<>();
+        PushConstants pushConstants;   // a module uses at most one push-constant block
     }
 
     private InterfaceUsage collectInterface(CoreModule module) {
@@ -346,7 +368,7 @@ public final class CoreToSpirv {
             scanInterface(function.body(), scan);
         }
         return new InterfaceUsage(List.copyOf(scan.builtins), List.copyOf(scan.variables),
-                List.copyOf(scan.textures));
+                List.copyOf(scan.textures), scan.pushConstants);
     }
 
     private void scanInterface(Region region, InterfaceScan scan) {
@@ -389,6 +411,11 @@ public final class CoreToSpirv {
             case Expr.SampleTexture s -> {
                 scan.textures.add(s.texture());
                 scanInterface(s.uv(), scan);
+            }
+            case Expr.PushConstantRead r -> scan.pushConstants = r.block();
+            case Expr.MatrixTimesVector m -> {
+                scanInterface(m.matrix(), scan);
+                scanInterface(m.vector(), scan);
             }
             case Expr.BufferLoad l -> scanInterface(l.index(), scan);
             case Expr.Binary b -> {
@@ -506,6 +533,16 @@ public final class CoreToSpirv {
             case Expr.SampleTexture s -> {
                 types.idOf(s.type());   // vec4 result
                 prepareExpr(s.uv(), types, constants);
+            }
+            case Expr.PushConstantRead r -> {
+                types.idOf(r.type());
+                constants.intConst(Type.int32(), r.member());   // the access-chain member index
+            }
+            case Expr.MatrixTimesVector m -> {
+                types.idOf(m.matrix().type());   // the matrix type (OpTypeMatrix)
+                types.idOf(m.type());
+                prepareExpr(m.matrix(), types, constants);
+                prepareExpr(m.vector(), types, constants);
             }
         }
     }
@@ -873,6 +910,78 @@ public final class CoreToSpirv {
         }
     }
 
+    /**
+     * The module's push-constant block: a {@code Block}-decorated struct of the declared members in the
+     * {@code PushConstant} storage class, with std430-style member offsets (matrices also carry
+     * {@code ColMajor} + {@code MatrixStride}). Read via {@link Expr.PushConstantRead}.
+     */
+    private static final class PushConstantResources {
+        private final PushConstants block;
+        private final int variableId;
+
+        PushConstantResources(Builder b, PushConstants block) {
+            this.block = block;
+            this.variableId = b.allocateId();
+        }
+
+        int variableId() {
+            return variableId;
+        }
+
+        void declare(Builder b, TypeTable types, ConstantTable constants) {
+            List<PushConstants.Member> members = block.members();
+            int[] memberTypeIds = members.stream().mapToInt(m -> types.idOf(m.type())).toArray();
+            int structType = b.allocateId();
+            Instruction struct = b.emit(b.globals, Op.OpTypeStruct).id(structType);
+            for (int memberTypeId : memberTypeIds) {
+                struct.id(memberTypeId);
+            }
+            int pointerType = b.allocateId();
+            b.emit(b.globals, Op.OpTypePointer).id(pointerType)
+                    .enumValue(StorageClass.PushConstant.value()).id(structType);
+            b.emit(b.globals, Op.OpVariable).id(pointerType).id(variableId)
+                    .enumValue(StorageClass.PushConstant.value());
+
+            b.emit(b.annotations, Op.OpDecorate).id(structType).enumValue(Decoration.Block.value());
+            int offset = 0;
+            for (int i = 0; i < members.size(); i++) {
+                Type type = members.get(i).type();
+                offset = align(offset, alignmentOf(type));
+                if (type instanceof Type.Matrix) {
+                    b.emit(b.annotations, Op.OpMemberDecorate).id(structType).literal(i)
+                            .enumValue(Decoration.ColMajor.value());
+                    b.emit(b.annotations, Op.OpMemberDecorate).id(structType).literal(i)
+                            .enumValue(Decoration.MatrixStride.value()).literal(16);
+                }
+                b.emit(b.annotations, Op.OpMemberDecorate).id(structType).literal(i)
+                        .enumValue(Decoration.Offset.value()).literal(offset);
+                offset += sizeOf(type);
+            }
+        }
+
+        private static int align(int offset, int alignment) {
+            return (offset + alignment - 1) / alignment * alignment;
+        }
+
+        /** std430-ish byte size of a push-constant member (32-bit components). */
+        private static int sizeOf(Type type) {
+            return switch (type) {
+                case Type.Matrix m -> m.columns() * 16;
+                case Type.Vector v -> v.count() == 3 ? 12 : v.count() * 4;
+                default -> 4;
+            };
+        }
+
+        /** std430-ish alignment of a push-constant member. */
+        private static int alignmentOf(Type type) {
+            return switch (type) {
+                case Type.Matrix ignored -> 16;
+                case Type.Vector v -> v.count() == 2 ? 8 : 16;
+                default -> 4;
+            };
+        }
+    }
+
     // --- per-function lowering -------------------------------------------------------------------------
 
     private static final class FunctionLowering {
@@ -884,6 +993,7 @@ public final class CoreToSpirv {
         private final KernelResources kernel;
         private final InterfaceResources interfaceResources;
         private final TextureResources textures;
+        private final PushConstantResources pushConstants;
         private final Map<Function, Integer> functionIds;
         private final Map<LocalVar, Integer> variablePointers = new IdentityHashMap<>();
         private final List<Integer> parameterIds = new ArrayList<>();
@@ -892,7 +1002,7 @@ public final class CoreToSpirv {
 
         FunctionLowering(Builder b, TypeTable types, ConstantTable constants, OutputBuffer output,
                 KernelResources kernel, InterfaceResources interfaceResources, TextureResources textures,
-                Map<Function, Integer> functionIds) {
+                PushConstantResources pushConstants, Map<Function, Integer> functionIds) {
             this.b = b;
             this.types = types;
             this.constants = constants;
@@ -900,6 +1010,7 @@ public final class CoreToSpirv {
             this.kernel = kernel;
             this.interfaceResources = interfaceResources;
             this.textures = textures;
+            this.pushConstants = pushConstants;
             this.functionIds = functionIds;
         }
 
@@ -1159,7 +1270,31 @@ public final class CoreToSpirv {
                 }
                 case Expr.MathCall mc -> lowerMathCall(mc);
                 case Expr.SampleTexture s -> lowerSampleTexture(s);
+                case Expr.PushConstantRead r -> lowerPushConstantRead(r);
+                case Expr.MatrixTimesVector m -> lowerMatrixTimesVector(m);
             };
+        }
+
+        /** Reads a push-constant member: access-chain into the block by member index, then load. */
+        private int lowerPushConstantRead(Expr.PushConstantRead read) {
+            int memberType = types.idOf(read.type());
+            int pointerType = types.pointerType(StorageClass.PushConstant.value(), read.type());
+            int memberIndex = constants.intConst(Type.int32(), read.member());
+            int pointer = b.allocateId();
+            b.emit(b.functions, Op.OpAccessChain).id(pointerType).id(pointer)
+                    .id(pushConstants.variableId()).id(memberIndex);
+            int result = b.allocateId();
+            b.emit(b.functions, Op.OpLoad).id(memberType).id(result).id(pointer);
+            return result;
+        }
+
+        private int lowerMatrixTimesVector(Expr.MatrixTimesVector mul) {
+            int matrix = lowerExpr(mul.matrix());
+            int vector = lowerExpr(mul.vector());
+            int resultType = types.idOf(mul.type());
+            int result = b.allocateId();
+            b.emit(b.functions, Op.OpMatrixTimesVector).id(resultType).id(result).id(matrix).id(vector);
+            return result;
         }
 
         /** Loads the combined image+sampler and samples it (implicit LOD) at the coordinate. */
@@ -1418,6 +1553,10 @@ public final class CoreToSpirv {
                 case Type.Vector t -> {
                     int componentId = idOf(t.component());
                     yield emit(Op.OpTypeVector, i -> i.id(componentId).literal(t.count()));
+                }
+                case Type.Matrix t -> {
+                    int columnId = idOf(t.column());
+                    yield emit(Op.OpTypeMatrix, i -> i.id(columnId).literal(t.columns()));
                 }
                 case Type.FunctionType t -> {
                     int returnId = idOf(t.returnType());

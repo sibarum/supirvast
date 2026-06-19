@@ -145,6 +145,10 @@ public final class CoreToTruffle {
                     "math intrinsics (dot/normalize/pow/…) are graphics-only — no CPU backend yet");
             case Expr.SampleTexture ignored -> throw new UnsupportedOperationException(
                     "texture sampling is graphics-only — no CPU backend");
+            case Expr.PushConstantRead ignored -> throw new UnsupportedOperationException(
+                    "push constants are graphics-only — no CPU backend");
+            case Expr.MatrixTimesVector ignored -> throw new UnsupportedOperationException(
+                    "matrix math is graphics-only — no CPU backend yet");
         };
     }
 

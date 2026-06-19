@@ -30,6 +30,9 @@ public sealed interface Type {
     /** A vector of {@code count} components of a scalar {@code component} type. */
     record Vector(Type component, int count) implements Type {}
 
+    /** A column-major matrix of {@code columns} columns, each a {@link Vector}. */
+    record Matrix(Vector column, int columns) implements Type {}
+
     /** A function signature: a return type and ordered parameter types. */
     record FunctionType(Type returnType, List<Type> parameterTypes) implements Type {
         public FunctionType {
@@ -69,5 +72,10 @@ public sealed interface Type {
 
     static Float float64() {
         return new Float(64);
+    }
+
+    /** A 4×4 single-precision matrix (e.g. a model-view-projection transform). */
+    static Matrix mat4() {
+        return new Matrix(new Vector(float32(), 4), 4);
     }
 }
