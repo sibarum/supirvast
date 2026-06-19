@@ -111,7 +111,7 @@ public final class ModelRenderer implements AutoCloseable {
      *         retained-mode correct (no redraw when nothing changed)
      */
     public boolean orbit(double dx, double dy) {
-        float newYaw = yaw + (float) dx * ORBIT_RAD_PER_PIXEL;
+        float newYaw = yaw - (float) dx * ORBIT_RAD_PER_PIXEL;   // inverted X: drag right turns the model left
         float newPitch = clamp(pitch + (float) dy * ORBIT_RAD_PER_PIXEL, -PITCH_LIMIT, PITCH_LIMIT);
         if (newYaw == yaw && newPitch == pitch) return false;
         yaw = newYaw;
