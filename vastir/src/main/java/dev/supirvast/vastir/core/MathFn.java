@@ -10,7 +10,16 @@ package dev.supirvast.vastir.core;
  * and share their (first) argument's type.
  */
 public enum MathFn {
-    DOT, LENGTH, NORMALIZE, CROSS, REFLECT,
-    POW, SQRT, INVERSE_SQRT, ABS,
-    MIN, MAX, CLAMP, MIX
+    // Geometric (DOT/LENGTH/DISTANCE reduce a vector to its scalar component type).
+    DOT, LENGTH, DISTANCE, NORMALIZE, CROSS, REFLECT, REFRACT, FACE_FORWARD,
+    // Common elementwise.
+    POW, SQRT, INVERSE_SQRT, ABS, SIGN, MIN, MAX, CLAMP, MIX, STEP, SMOOTHSTEP, FMA,
+    // Exponential / logarithmic.
+    EXP, LOG, EXP2, LOG2,
+    // Trigonometric.
+    SIN, COS, TAN, ASIN, ACOS, ATAN, ATAN2, RADIANS, DEGREES,
+    // Hyperbolic.
+    SINH, COSH, TANH, ASINH, ACOSH, ATANH,
+    // Rounding.
+    ROUND, ROUND_EVEN, TRUNC, FLOOR, CEIL, FRACT
 }

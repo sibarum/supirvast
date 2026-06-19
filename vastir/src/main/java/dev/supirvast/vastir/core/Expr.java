@@ -197,6 +197,147 @@ public sealed interface Expr {
             return new MathCall(MathFn.MIX, a.type(), List.of(a, b, t));
         }
 
+        // --- the rest of the float library (all elementwise, result shares the first argument's type) ------
+
+        public static MathCall sin(Expr v) {
+            return unary(MathFn.SIN, v);
+        }
+
+        public static MathCall cos(Expr v) {
+            return unary(MathFn.COS, v);
+        }
+
+        public static MathCall tan(Expr v) {
+            return unary(MathFn.TAN, v);
+        }
+
+        public static MathCall asin(Expr v) {
+            return unary(MathFn.ASIN, v);
+        }
+
+        public static MathCall acos(Expr v) {
+            return unary(MathFn.ACOS, v);
+        }
+
+        public static MathCall atan(Expr v) {
+            return unary(MathFn.ATAN, v);
+        }
+
+        public static MathCall atan2(Expr y, Expr x) {
+            return new MathCall(MathFn.ATAN2, y.type(), List.of(y, x));
+        }
+
+        public static MathCall sinh(Expr v) {
+            return unary(MathFn.SINH, v);
+        }
+
+        public static MathCall cosh(Expr v) {
+            return unary(MathFn.COSH, v);
+        }
+
+        public static MathCall tanh(Expr v) {
+            return unary(MathFn.TANH, v);
+        }
+
+        public static MathCall asinh(Expr v) {
+            return unary(MathFn.ASINH, v);
+        }
+
+        public static MathCall acosh(Expr v) {
+            return unary(MathFn.ACOSH, v);
+        }
+
+        public static MathCall atanh(Expr v) {
+            return unary(MathFn.ATANH, v);
+        }
+
+        public static MathCall exp(Expr v) {
+            return unary(MathFn.EXP, v);
+        }
+
+        public static MathCall log(Expr v) {
+            return unary(MathFn.LOG, v);
+        }
+
+        public static MathCall exp2(Expr v) {
+            return unary(MathFn.EXP2, v);
+        }
+
+        public static MathCall log2(Expr v) {
+            return unary(MathFn.LOG2, v);
+        }
+
+        public static MathCall round(Expr v) {
+            return unary(MathFn.ROUND, v);
+        }
+
+        public static MathCall roundEven(Expr v) {
+            return unary(MathFn.ROUND_EVEN, v);
+        }
+
+        public static MathCall trunc(Expr v) {
+            return unary(MathFn.TRUNC, v);
+        }
+
+        public static MathCall floor(Expr v) {
+            return unary(MathFn.FLOOR, v);
+        }
+
+        public static MathCall ceil(Expr v) {
+            return unary(MathFn.CEIL, v);
+        }
+
+        public static MathCall fract(Expr v) {
+            return unary(MathFn.FRACT, v);
+        }
+
+        public static MathCall sign(Expr v) {
+            return unary(MathFn.SIGN, v);
+        }
+
+        public static MathCall radians(Expr degrees) {
+            return unary(MathFn.RADIANS, degrees);
+        }
+
+        public static MathCall degrees(Expr radians) {
+            return unary(MathFn.DEGREES, radians);
+        }
+
+        /** {@code step(edge, x)} — 0 below {@code edge}, 1 at/above it. Operands share a type. */
+        public static MathCall step(Expr edge, Expr x) {
+            return new MathCall(MathFn.STEP, edge.type(), List.of(edge, x));
+        }
+
+        /** {@code smoothstep(edge0, edge1, x)} — a smooth 0→1 Hermite ramp. Operands share a type. */
+        public static MathCall smoothstep(Expr edge0, Expr edge1, Expr x) {
+            return new MathCall(MathFn.SMOOTHSTEP, edge0.type(), List.of(edge0, edge1, x));
+        }
+
+        /** {@code fma(a, b, c) = a*b + c} (fused). Operands share a type. */
+        public static MathCall fma(Expr a, Expr b, Expr c) {
+            return new MathCall(MathFn.FMA, a.type(), List.of(a, b, c));
+        }
+
+        /** {@code distance(a, b)} — the length of {@code a - b}; reduces to the scalar component type. */
+        public static MathCall distance(Expr a, Expr b) {
+            return new MathCall(MathFn.DISTANCE, componentOf(a), List.of(a, b));
+        }
+
+        /** {@code faceforward(n, i, nref)} — flips {@code n} to face away from {@code i}. */
+        public static MathCall faceForward(Expr n, Expr i, Expr nref) {
+            return new MathCall(MathFn.FACE_FORWARD, n.type(), List.of(n, i, nref));
+        }
+
+        /** {@code refract(i, n, eta)} — refraction of incident {@code i} through normal {@code n} ({@code eta}
+         * scalar). Result shares {@code i}'s vector type. */
+        public static MathCall refract(Expr i, Expr n, Expr eta) {
+            return new MathCall(MathFn.REFRACT, i.type(), List.of(i, n, eta));
+        }
+
+        private static MathCall unary(MathFn fn, Expr v) {
+            return new MathCall(fn, v.type(), List.of(v));
+        }
+
         private static Type componentOf(Expr vector) {
             return ((Type.Vector) vector.type()).component();
         }

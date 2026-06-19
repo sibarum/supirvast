@@ -85,6 +85,60 @@ class MathIntrinsicsShaderTest {
                 .toByteArray();
     }
 
+    /** A fragment shader exercising the broader float library (trig, hyperbolic, exp/log, rounding, etc.). */
+    private static byte[] extendedLibraryShader() {
+        InterfaceVar vNormal = InterfaceVar.input("vNormal", 0, VEC3);
+        InterfaceVar fragColor = InterfaceVar.output("fragColor", 0, VEC4);
+        Expr u = new Expr.InterfaceRead(vNormal);
+
+        Expr s = Expr.MathCall.sin(u);
+        Expr c = Expr.MathCall.cos(u);
+        Expr t = Expr.MathCall.tanh(u);
+        Expr e = Expr.MathCall.exp(Expr.MathCall.fract(u));
+        Expr lg = Expr.MathCall.log2(add(Expr.MathCall.abs(u), splat3(f(1))));
+        Expr fl = Expr.MathCall.floor(mul(u, splat3(f(4))));
+        Expr sg = Expr.MathCall.sign(u);
+        Expr ss = Expr.MathCall.smoothstep(splat3(f(0)), splat3(f(1)), u);
+        Expr st = Expr.MathCall.step(splat3(f(0.5)), u);
+        Expr fm = Expr.MathCall.fma(s, c, t);
+        Expr rd = Expr.MathCall.radians(mul(u, splat3(f(90))));
+        Expr rn = Expr.MathCall.round(u);
+        Expr a2 = Expr.MathCall.atan2(s, c);
+        Expr ff = Expr.MathCall.faceForward(u, u, sg);
+        Expr rf = Expr.MathCall.refract(Expr.MathCall.normalize(u), Expr.MathCall.normalize(c), f(0.9));
+        Expr d = Expr.MathCall.distance(s, c);   // scalar
+
+        Expr sum = add(add(add(s, c), add(t, e)), add(add(lg, fl), add(sg, ss)));
+        sum = add(sum, add(add(st, fm), add(rd, rn)));
+        sum = add(sum, add(add(a2, ff), rf));
+        Expr color = mul(sum, splat3(d));
+
+        Region body = Region.of(
+                new Statement.InterfaceWrite(fragColor, new Expr.VectorConstruct(VEC4, List.of(color, f(1)))),
+                new Statement.ReturnVoid());
+        Function main = new Function("main", new Type.FunctionType(Type.VOID, List.of()), body);
+        return new CoreToSpirv()
+                .lower(new CoreModule().addEntryPoint(EntryPoint.of(main, ShaderStage.FRAGMENT)))
+                .toByteArray();
+    }
+
+    @Test
+    void extendedFloatLibraryValidatesAndDisassembles() {
+        NativeTools tools = new NativeTools();
+        assumeTrue(tools.isAvailable(), "native SPIR-V toolchain not bundled for this platform");
+
+        byte[] spirv = extendedLibraryShader();
+        NativeTools.ValidationResult validation = tools.validate(spirv);
+        assertTrue(validation.valid(),
+                () -> "spirv-val rejected the extended-library shader:\n" + validation.output());
+
+        String disasm = tools.disassemble(spirv);
+        for (String fn : List.of("Sin", "Cos", "Atan2", "Tanh", "Exp", "Log2", "Floor", "Fract", "FSign",
+                "SmoothStep", "Step", "Fma", "Distance", "FaceForward", "Refract", "Radians", "Round")) {
+            assertTrue(disasm.contains(fn), () -> "expected a " + fn + " ext-instruction:\n" + disasm);
+        }
+    }
+
     @Test
     void mathIntrinsicsLowerValidateAndDisassemble() {
         NativeTools tools = new NativeTools();

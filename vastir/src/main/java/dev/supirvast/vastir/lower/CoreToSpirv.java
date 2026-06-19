@@ -1081,18 +1081,56 @@ public final class CoreToSpirv {
         /** GLSL.std.450 extended-instruction numbers (float variants); {@code DOT} is the core {@code OpDot}. */
         private static int glslStd450Number(MathFn fn) {
             return switch (fn) {
+                // Geometric.
                 case LENGTH -> 66;
+                case DISTANCE -> 67;
                 case CROSS -> 68;
                 case NORMALIZE -> 69;
+                case FACE_FORWARD -> 70;
                 case REFLECT -> 71;
+                case REFRACT -> 72;
+                // Common elementwise (float variants).
                 case POW -> 26;
                 case SQRT -> 31;
                 case INVERSE_SQRT -> 32;
-                case ABS -> 4;      // FAbs
-                case MIN -> 37;     // FMin
-                case MAX -> 40;     // FMax
-                case CLAMP -> 43;   // FClamp
-                case MIX -> 46;     // FMix
+                case ABS -> 4;          // FAbs
+                case SIGN -> 6;         // FSign
+                case MIN -> 37;         // FMin
+                case MAX -> 40;         // FMax
+                case CLAMP -> 43;       // FClamp
+                case MIX -> 46;         // FMix
+                case STEP -> 48;
+                case SMOOTHSTEP -> 49;  // SmoothStep
+                case FMA -> 50;         // Fma
+                // Exponential / logarithmic.
+                case EXP -> 27;
+                case LOG -> 28;
+                case EXP2 -> 29;
+                case LOG2 -> 30;
+                // Trigonometric.
+                case SIN -> 13;
+                case COS -> 14;
+                case TAN -> 15;
+                case ASIN -> 16;
+                case ACOS -> 17;
+                case ATAN -> 18;
+                case ATAN2 -> 25;       // Atan2
+                case RADIANS -> 11;
+                case DEGREES -> 12;
+                // Hyperbolic.
+                case SINH -> 19;
+                case COSH -> 20;
+                case TANH -> 21;
+                case ASINH -> 22;
+                case ACOSH -> 23;
+                case ATANH -> 24;
+                // Rounding.
+                case ROUND -> 1;
+                case ROUND_EVEN -> 2;   // RoundEven
+                case TRUNC -> 3;
+                case FLOOR -> 8;
+                case CEIL -> 9;
+                case FRACT -> 10;
                 case DOT -> throw new IllegalArgumentException("DOT lowers to OpDot, not a GLSL.std.450 instruction");
             };
         }
