@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import static dev.supirvast.vastir.pbr.Shade.VEC2;
 import static dev.supirvast.vastir.pbr.Shade.VEC3;
 import static dev.supirvast.vastir.pbr.Shade.VEC4;
 import static dev.supirvast.vastir.pbr.Shade.add;
@@ -85,18 +86,21 @@ public final class PbrShader {
                 .toByteArray();
     }
 
-    /** {@code gl_Position = vec4(position, 1); pass the geometric normal and position through as varyings.} */
+    /** {@code gl_Position = vec4(position, 1); pass the normal, position, and uv through as varyings.} */
     public Function vertexFunction() {
         InterfaceVar position = InterfaceVar.input("position", 0, VEC3);
         InterfaceVar normal = InterfaceVar.input("normal", 1, VEC3);
+        InterfaceVar uv = InterfaceVar.input("uv", 2, VEC2);
         InterfaceVar worldNormal = InterfaceVar.output("vWorldNormal", 0, VEC3);
         InterfaceVar worldPosition = InterfaceVar.output("vWorldPosition", 1, VEC3);
+        InterfaceVar varyingUv = InterfaceVar.output("vUv", 2, VEC2);
 
         Region body = Region.of(
                 new Statement.BuiltinWrite(Builtin.POSITION,
                         vec4(new Expr.InterfaceRead(position), f(1))),
                 new Statement.InterfaceWrite(worldNormal, new Expr.InterfaceRead(normal)),
                 new Statement.InterfaceWrite(worldPosition, new Expr.InterfaceRead(position)),
+                new Statement.InterfaceWrite(varyingUv, new Expr.InterfaceRead(uv)),
                 new Statement.ReturnVoid());
         return new Function("main", new Type.FunctionType(Type.VOID, List.of()), body);
     }
@@ -105,10 +109,11 @@ public final class PbrShader {
     public Function fragmentFunction() {
         InterfaceVar worldNormal = InterfaceVar.input("vWorldNormal", 0, VEC3);
         InterfaceVar worldPosition = InterfaceVar.input("vWorldPosition", 1, VEC3);
+        InterfaceVar uv = InterfaceVar.input("vUv", 2, VEC2);
         InterfaceVar fragColor = InterfaceVar.output("fragColor", 0, VEC4);
 
-        SurfaceInputs inputs =
-                new SurfaceInputs(new Expr.InterfaceRead(worldNormal), new Expr.InterfaceRead(worldPosition));
+        SurfaceInputs inputs = new SurfaceInputs(new Expr.InterfaceRead(worldNormal),
+                new Expr.InterfaceRead(worldPosition), new Expr.InterfaceRead(uv));
         Map<Channel, Expr> provided = surface.evaluate(inputs);
         validate(provided);
 

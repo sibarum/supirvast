@@ -2,6 +2,7 @@ package dev.supirvast.vastir.pbr;
 
 import dev.supirvast.vastir.core.BinaryOp;
 import dev.supirvast.vastir.core.Expr;
+import dev.supirvast.vastir.core.Texture;
 import dev.supirvast.vastir.type.Type;
 
 import java.util.List;
@@ -16,6 +17,7 @@ import java.util.List;
 public final class Shade {
 
     public static final Type.Float F32 = Type.float32();
+    public static final Type.Vector VEC2 = new Type.Vector(F32, 2);
     public static final Type.Vector VEC3 = new Type.Vector(F32, 3);
     public static final Type.Vector VEC4 = new Type.Vector(F32, 4);
 
@@ -71,5 +73,16 @@ public final class Shade {
     /** A {@code vec3} divided by a scalar. */
     public static Expr divScalar(Expr vector, Expr scalar) {
         return div(vector, splat3(scalar));
+    }
+
+    /** Samples a texture (descriptor set 0, given binding) at {@code uv}, yielding the RGBA {@code vec4} texel. */
+    public static Expr sample(String name, int binding, Expr uv) {
+        return new Expr.SampleTexture(new Texture(name, binding), uv);
+    }
+
+    /** The {@code xyz} of a {@code vec4} as a {@code vec3} (the IR has no swizzles). */
+    public static Expr xyz(Expr vec4) {
+        return new Expr.VectorConstruct(VEC3, List.of(
+                new Expr.VectorExtract(vec4, 0), new Expr.VectorExtract(vec4, 1), new Expr.VectorExtract(vec4, 2)));
     }
 }
