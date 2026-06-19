@@ -59,11 +59,12 @@ public final class SampleAssets {
             Files.write(outDir.resolve("textured.vert.spv"), texturedVertexShader());
             Files.write(outDir.resolve("textured.frag.spv"), texturedFragmentShader());
             writeChecker(outDir.resolve("checker.png"));
+            writeCubemap(outDir.resolve("env"));   // env_px.png … env_nz.png
         } catch (IOException e) {
             throw new UncheckedIOException("failed to write sample assets to " + outDir, e);
         }
-        System.out.println("[sample-assets] wrote cube.obj, cube.ply, quad.obj, checker.png, and the model/"
-                + "textured shaders to " + outDir);
+        System.out.println("[sample-assets] wrote cube.obj, cube.ply, quad.obj, checker.png, env_*.png, and the "
+                + "model/textured shaders to " + outDir);
     }
 
     /** A camera-facing unit quad in clip space with UVs spanning the full [0,1] range. */
@@ -125,6 +126,39 @@ public final class SampleAssets {
                         .put((byte) (light ? 245 : 30))
                         .put((byte) (light ? 245 : 160))
                         .put((byte) 255);
+            }
+        }
+        pixels.flip();
+        boolean ok = stbi_write_png(path.toString(), size, size, 4, pixels, size * 4);
+        MemoryUtil.memFree(pixels);
+        if (!ok) {
+            throw new IllegalStateException("stbi_write_png failed for " + path);
+        }
+    }
+
+    /**
+     * Writes six cubemap face PNGs ({@code <prefix>_px/_nx/_py/_ny/_pz/_nz.png}), one distinct color per face
+     * (with a vertical gradient), so a reflective surface shows a clearly directional environment.
+     */
+    static void writeCubemap(Path prefix) {
+        // Vulkan face order: +X, -X, +Y, -Y, +Z, -Z.
+        int[] colors = {0xE03030, 0x30D0D0, 0xF0F0F0, 0x303048, 0x30C040, 0x3050E0};
+        String[] suffixes = {"_px", "_nx", "_py", "_ny", "_pz", "_nz"};
+        for (int f = 0; f < 6; f++) {
+            writeFace(Path.of(prefix + suffixes[f] + ".png"), colors[f]);
+        }
+    }
+
+    private static void writeFace(Path path, int rgb) {
+        int size = 256;
+        int r = (rgb >> 16) & 0xFF;
+        int g = (rgb >> 8) & 0xFF;
+        int bl = rgb & 0xFF;
+        ByteBuffer pixels = MemoryUtil.memAlloc(size * size * 4);
+        for (int y = 0; y < size; y++) {
+            float t = 1.0f - 0.35f * y / size;   // brighten toward the top edge
+            for (int x = 0; x < size; x++) {
+                pixels.put((byte) (r * t)).put((byte) (g * t)).put((byte) (bl * t)).put((byte) 255);
             }
         }
         pixels.flip();

@@ -11,6 +11,7 @@ import dev.supirvast.vastir.core.LocalVar;
 import dev.supirvast.vastir.core.Region;
 import dev.supirvast.vastir.core.ShaderStage;
 import dev.supirvast.vastir.core.Statement;
+import dev.supirvast.vastir.core.UnaryOp;
 import dev.supirvast.vastir.lower.CoreToSpirv;
 import dev.supirvast.vastir.tools.GraphicsPipelineSpec;
 import dev.supirvast.vastir.type.Type;
@@ -57,20 +58,35 @@ public final class PbrShader {
 
     private final Set<Channel> channels;
     private final SurfaceFunction surface;
+    private final Integer environmentBinding;   // null = flat ambient; else IBL from a cubemap at this binding
 
-    private PbrShader(Set<Channel> channels, SurfaceFunction surface) {
+    private PbrShader(Set<Channel> channels, SurfaceFunction surface, Integer environmentBinding) {
         this.channels = channels;
         this.surface = surface;
+        this.environmentBinding = environmentBinding;
     }
 
     /**
      * A material exposing {@code channels}, whose values are computed by {@code surface}. The surface function
      * must return exactly the declared channels, each with an expression matching {@link Channel#type()};
-     * channels left out of {@code channels} use defaults.
+     * channels left out of {@code channels} use defaults. Lit by one directional light plus a small flat ambient.
      */
     public static PbrShader create(Set<Channel> channels, SurfaceFunction surface) {
-        return new PbrShader(channels.isEmpty() ? EnumSet.noneOf(Channel.class) : EnumSet.copyOf(channels),
-                surface);
+        return new PbrShader(normalize(channels), surface, null);
+    }
+
+    /**
+     * Like {@link #create}, but the ambient term is image-based: a cubemap bound at descriptor set 0,
+     * {@code environmentBinding} supplies the diffuse irradiance (sampled along the normal) and the specular
+     * reflection (sampled along the reflected view), so metals reflect the environment instead of going dark.
+     */
+    public static PbrShader createWithEnvironment(Set<Channel> channels, SurfaceFunction surface,
+            int environmentBinding) {
+        return new PbrShader(normalize(channels), surface, environmentBinding);
+    }
+
+    private static Set<Channel> normalize(Set<Channel> channels) {
+        return channels.isEmpty() ? EnumSet.noneOf(Channel.class) : EnumSet.copyOf(channels);
     }
 
     /** The generated vertex+fragment pair as a renderable spec (each stage lowered to SPIR-V). */
@@ -177,15 +193,34 @@ public final class PbrShader {
         Expr kd = b.let("kd", scale(sub(splat3(f(1)), fresnel), sub(f(1), metallic)));
         Expr diffuse = b.let("diffuse", divScalar(mul(kd, albedo), f(PI)));
 
-        // Outgoing radiance from the single light, plus ambient and emissive.
+        // Outgoing radiance from the single light, plus ambient (flat or image-based) and emissive.
         Expr lightColor = vec3(4, 4, 4);
         Expr lo = b.let("Lo", scale(mul(add(diffuse, specular), lightColor), nDotL));
-        Expr ambient = b.let("ambient", scale(scale(albedo, f(0.05)), ao));
+        Expr ambient = ambientTerm(b, albedo, metallic, ao, f0, n, v, nDotV);
         Expr color = b.let("color", add(add(ambient, lo), emissive));
 
         // Reinhard tone-map then gamma-encode for display.
         Expr mapped = b.let("mapped", div(color, add(color, splat3(f(1)))));
         return b.let("gamma", MathCall.pow(mapped, splat3(f(INV_GAMMA))));
+    }
+
+    /**
+     * The ambient contribution: a small flat term by default, or — when an environment is set — image-based
+     * lighting that samples the cubemap for diffuse irradiance (along {@code n}) and the specular reflection
+     * (along the reflected view), so metals reflect the environment.
+     */
+    private Expr ambientTerm(Body b, Expr albedo, Expr metallic, Expr ao, Expr f0, Expr n, Expr v, Expr nDotV) {
+        if (environmentBinding == null) {
+            return b.let("ambient", scale(scale(albedo, f(0.05)), ao));
+        }
+        Expr reflected = b.let("R", MathCall.reflect(new Expr.Unary(UnaryOp.NEGATE, v), n));
+        Expr envSpecular = b.let("envSpec", Shade.xyz(Shade.sampleCube("environment", environmentBinding, reflected)));
+        Expr envDiffuse = b.let("envDiff", Shade.xyz(Shade.sampleCube("environment", environmentBinding, n)));
+        Expr fresnel = b.let("Fa", add(f0, scale(sub(splat3(f(1)), f0), MathCall.pow(sub(f(1), nDotV), f(5)))));
+        Expr kd = b.let("kdA", scale(sub(splat3(f(1)), fresnel), sub(f(1), metallic)));
+        Expr diffuse = b.let("ambDiff", mul(mul(kd, envDiffuse), albedo));
+        Expr specular = b.let("ambSpec", mul(fresnel, envSpecular));
+        return b.let("ambient", scale(add(diffuse, specular), ao));
     }
 
     private Expr resolved(Map<Channel, Expr> provided, Channel channel, SurfaceInputs inputs) {

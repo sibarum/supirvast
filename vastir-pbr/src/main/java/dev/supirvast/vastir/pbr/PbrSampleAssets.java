@@ -62,7 +62,19 @@ public final class PbrSampleAssets {
         out.put("dielectric-rough", dielectric(vec3(0.85, 0.13, 0.1), 0.6));
         out.put("metal-copper", metal(vec3(0.95, 0.64, 0.54), 0.3));
         out.put("textured", textured());
+        out.put("ibl-metal", iblMetal());
         return out;
+    }
+
+    /** A polished metal lit by an environment cubemap (set 0, binding 0) — reflects instead of going dark. */
+    private static PbrShader iblMetal() {
+        return PbrShader.createWithEnvironment(
+                Set.of(Channel.ALBEDO, Channel.METALLIC, Channel.ROUGHNESS),
+                inputs -> Map.of(
+                        Channel.ALBEDO, vec3(0.95, 0.85, 0.55),   // gold-ish
+                        Channel.METALLIC, f(1.0),
+                        Channel.ROUGHNESS, f(0.15)),
+                0);
     }
 
     /** A dielectric whose albedo is sampled from a texture (descriptor set 0, binding 0) at the surface UV. */

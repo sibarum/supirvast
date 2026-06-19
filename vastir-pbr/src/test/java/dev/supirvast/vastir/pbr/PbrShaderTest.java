@@ -45,6 +45,23 @@ class PbrShaderTest {
     }
 
     @Test
+    void environmentLitMaterialValidatesAndUsesACubemap() {
+        NativeTools tools = new NativeTools();
+        assumeTrue(tools.isAvailable(), "native SPIR-V toolchain not bundled for this platform");
+
+        PbrShader shader = PbrShader.createWithEnvironment(
+                Set.of(Channel.METALLIC, Channel.ROUGHNESS),
+                inputs -> Map.of(Channel.METALLIC, f(1.0), Channel.ROUGHNESS, f(0.2)),
+                0);
+        GraphicsPipelineSpec spec = shader.spec();
+
+        assertTrue(tools.validate(spec.vertexSpirv()).valid(), "vertex invalid");
+        assertTrue(tools.validate(spec.fragmentSpirv()).valid(), "fragment invalid");
+        String glsl = tools.crossCompile(spec.fragmentSpirv(), NativeTools.ShaderLanguage.GLSL);
+        assertTrue(glsl.contains("samplerCube"), () -> "expected an environment samplerCube:\n" + glsl);
+    }
+
+    @Test
     void allDefaultsStillProduceAValidShader() {
         NativeTools tools = new NativeTools();
         assumeTrue(tools.isAvailable(), "native SPIR-V toolchain not bundled for this platform");

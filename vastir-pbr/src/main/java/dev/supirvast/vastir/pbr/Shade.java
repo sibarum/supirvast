@@ -75,9 +75,14 @@ public final class Shade {
         return div(vector, splat3(scalar));
     }
 
-    /** Samples a texture (descriptor set 0, given binding) at {@code uv}, yielding the RGBA {@code vec4} texel. */
+    /** Samples a 2D texture (descriptor set 0, given binding) at {@code uv}, yielding the RGBA {@code vec4}. */
     public static Expr sample(String name, int binding, Expr uv) {
         return new Expr.SampleTexture(new Texture(name, binding), uv);
+    }
+
+    /** Samples a cubemap (descriptor set 0, given binding) along {@code direction}, yielding the RGBA {@code vec4}. */
+    public static Expr sampleCube(String name, int binding, Expr direction) {
+        return new Expr.SampleTexture(Texture.cube(name, binding), direction);
     }
 
     /** The {@code xyz} of a {@code vec4} as a {@code vec3} (the IR has no swizzles). */

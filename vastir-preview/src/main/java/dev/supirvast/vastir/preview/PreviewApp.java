@@ -683,11 +683,10 @@ public final class PreviewApp implements AutoCloseable {
     }
 
     private void createTextureResources(MemoryStack stack) {
-        Map<Integer, Path> requested = options.textures();
-        if (requested.isEmpty()) {
+        int n = options.textures().size() + options.cubemaps().size();
+        if (n == 0) {
             return;
         }
-        int n = requested.size();
         textureBindings = new int[n];
         textureImages = new long[n];
         textureMemories = new long[n];
@@ -695,9 +694,14 @@ public final class PreviewApp implements AutoCloseable {
         textureSamplers = new long[n];
 
         int index = 0;
-        for (Map.Entry<Integer, Path> entry : requested.entrySet()) {
+        for (Map.Entry<Integer, Path> entry : options.textures().entrySet()) {
             textureBindings[index] = entry.getKey();
             loadTexture(index, entry.getValue());
+            index++;
+        }
+        for (Map.Entry<Integer, Path> entry : options.cubemaps().entrySet()) {
+            textureBindings[index] = entry.getKey();
+            loadCubemap(index, entry.getValue());
             index++;
         }
         createDescriptorSet(stack, n);
@@ -766,7 +770,7 @@ public final class PreviewApp implements AutoCloseable {
 
         transitionImage(cmd, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 0, VK_ACCESS_TRANSFER_WRITE_BIT,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, stack);
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 1, stack);
 
         VkBufferImageCopy.Buffer region = VkBufferImageCopy.calloc(1, stack)
                 .bufferOffset(0).bufferRowLength(0).bufferImageHeight(0);
@@ -779,20 +783,136 @@ public final class PreviewApp implements AutoCloseable {
         transitionImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, stack);
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 1, stack);
 
         endOneTimeCommands(cmd, stack);
     }
 
+    /** Loads six face PNGs ({@code <prefix>_px/_nx/_py/_ny/_pz/_nz.png}) into a cubemap image + sampler. */
+    private void loadCubemap(int index, Path prefix) {
+        String[] suffixes = {"_px", "_nx", "_py", "_ny", "_pz", "_nz"};
+        try (MemoryStack stack = stackPush()) {
+            ByteBuffer[] faces = new ByteBuffer[6];
+            IntBuffer w = stack.mallocInt(1);
+            IntBuffer h = stack.mallocInt(1);
+            IntBuffer channels = stack.mallocInt(1);
+            int width = 0;
+            int height = 0;
+            try {
+                for (int f = 0; f < 6; f++) {
+                    Path facePath = Path.of(prefix + suffixes[f] + ".png");
+                    faces[f] = stbi_load(facePath.toString(), w, h, channels, 4);
+                    if (faces[f] == null) {
+                        throw new IllegalStateException("failed to load cubemap face: " + facePath);
+                    }
+                    if (f == 0) {
+                        width = w.get(0);
+                        height = h.get(0);
+                    }
+                }
+                long faceSize = (long) width * height * 4;
+                long staging = createBuffer(faceSize * 6, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, stack);
+                long stagingMemory = bindHostVisible(staging, stack);
+                writeFaces(stagingMemory, faces, faceSize);
+
+                textureImages[index] = createCubeImage(width, height, stack);
+                textureMemories[index] = bindImageMemory(textureImages[index], stack);
+                uploadCubemap(textureImages[index], staging, width, height, faceSize, stack);
+
+                vkDestroyBuffer(device, staging, null);
+                vkFreeMemory(device, stagingMemory, null);
+            } finally {
+                for (ByteBuffer face : faces) {
+                    if (face != null) {
+                        stbi_image_free(face);
+                    }
+                }
+            }
+            textureViews[index] = createCubeView(textureImages[index], stack);
+            textureSamplers[index] = createSampler(stack);
+        }
+    }
+
+    private long createCubeImage(int width, int height, MemoryStack stack) {
+        VkImageCreateInfo info = VkImageCreateInfo.calloc(stack)
+                .sType(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO)
+                .flags(VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)
+                .imageType(VK_IMAGE_TYPE_2D)
+                .format(VK_FORMAT_R8G8B8A8_UNORM)
+                .mipLevels(1).arrayLayers(6)
+                .samples(VK_SAMPLE_COUNT_1_BIT)
+                .tiling(VK_IMAGE_TILING_OPTIMAL)
+                .usage(VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)
+                .sharingMode(VK_SHARING_MODE_EXCLUSIVE)
+                .initialLayout(VK_IMAGE_LAYOUT_UNDEFINED);
+        info.extent().width(width).height(height).depth(1);
+        LongBuffer pImage = stack.mallocLong(1);
+        check(vkCreateImage(device, info, null, pImage), "vkCreateImage(cubemap)");
+        return pImage.get(0);
+    }
+
+    private long createCubeView(long image, MemoryStack stack) {
+        VkImageViewCreateInfo info = VkImageViewCreateInfo.calloc(stack)
+                .sType(VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO)
+                .image(image)
+                .viewType(VK_IMAGE_VIEW_TYPE_CUBE)
+                .format(VK_FORMAT_R8G8B8A8_UNORM);
+        info.subresourceRange()
+                .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(6);
+        LongBuffer pView = stack.mallocLong(1);
+        check(vkCreateImageView(device, info, null, pView), "vkCreateImageView(cubemap)");
+        return pView.get(0);
+    }
+
+    /** Copies the six staged faces into the cube image's array layers (Vulkan order +X,-X,+Y,-Y,+Z,-Z). */
+    private void uploadCubemap(long image, long staging, int width, int height, long faceSize, MemoryStack stack) {
+        VkCommandBuffer cmd = beginOneTimeCommands(stack);
+
+        transitionImage(cmd, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 6, stack);
+
+        VkBufferImageCopy.Buffer regions = VkBufferImageCopy.calloc(6, stack);
+        for (int f = 0; f < 6; f++) {
+            regions.get(f).bufferOffset(faceSize * f).bufferRowLength(0).bufferImageHeight(0);
+            regions.get(f).imageSubresource().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0)
+                    .baseArrayLayer(f).layerCount(1);
+            regions.get(f).imageOffset().set(0, 0, 0);
+            regions.get(f).imageExtent().width(width).height(height).depth(1);
+        }
+        vkCmdCopyBufferToImage(cmd, staging, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, regions);
+
+        transitionImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 6, stack);
+
+        endOneTimeCommands(cmd, stack);
+    }
+
+    private void writeFaces(long memory, ByteBuffer[] faces, long faceSize) {
+        try (MemoryStack stack = stackPush()) {
+            long total = faceSize * faces.length;
+            PointerBuffer pData = stack.mallocPointer(1);
+            check(vkMapMemory(device, memory, 0, total, 0, pData), "vkMapMemory");
+            long dst = pData.get(0);
+            for (int f = 0; f < faces.length; f++) {
+                MemoryUtil.memCopy(MemoryUtil.memAddress(faces[f]), dst + faceSize * f, faceSize);
+            }
+            vkUnmapMemory(device, memory);
+        }
+    }
+
     private void transitionImage(VkCommandBuffer cmd, long image, int oldLayout, int newLayout,
-            int srcAccess, int dstAccess, int srcStage, int dstStage, MemoryStack stack) {
+            int srcAccess, int dstAccess, int srcStage, int dstStage, int layerCount, MemoryStack stack) {
         VkImageMemoryBarrier.Buffer barrier = VkImageMemoryBarrier.calloc(1, stack)
                 .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
                 .oldLayout(oldLayout).newLayout(newLayout)
                 .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
                 .image(image).srcAccessMask(srcAccess).dstAccessMask(dstAccess);
         barrier.subresourceRange().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
-                .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
+                .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(layerCount);
         vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, null, null, barrier);
     }
 

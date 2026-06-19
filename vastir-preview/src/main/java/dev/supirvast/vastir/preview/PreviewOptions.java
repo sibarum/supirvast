@@ -17,14 +17,15 @@ import java.util.Optional;
  * --height &lt;px&gt;            window height (default 720)
  * --screenshot &lt;png&gt;       render one frame to this PNG and exit (optional)
  * --frames &lt;n&gt;             render at most n frames then exit (optional; for non-interactive runs)
- * --texture &lt;binding&gt;=&lt;png&gt; bind a texture (combined image sampler) at the descriptor binding (repeatable)
+ * --texture &lt;binding&gt;=&lt;png&gt; bind a 2D texture (combined image sampler) at the binding (repeatable)
+ * --cubemap &lt;binding&gt;=&lt;prefix&gt; bind a cubemap; faces are &lt;prefix&gt;_px/_nx/_py/_ny/_pz/_nz.png (repeatable)
  * </pre>
  */
 public record PreviewOptions(
         Path vert, Path frag, Path model,
         int width, int height,
         Optional<Path> screenshot, Optional<Integer> frames,
-        Map<Integer, Path> textures) {
+        Map<Integer, Path> textures, Map<Integer, Path> cubemaps) {
 
     private static final int DEFAULT_WIDTH = 1280;
     private static final int DEFAULT_HEIGHT = 720;
@@ -42,6 +43,7 @@ public record PreviewOptions(
             }
         });
         textures = Map.copyOf(textures);
+        cubemaps = Map.copyOf(cubemaps);
     }
 
     /** Parses {@code argv}, throwing {@link IllegalArgumentException} with a usage-friendly message on error. */
@@ -54,6 +56,7 @@ public record PreviewOptions(
         Optional<Path> screenshot = Optional.empty();
         Optional<Integer> frames = Optional.empty();
         Map<Integer, Path> textures = new LinkedHashMap<>();
+        Map<Integer, Path> cubemaps = new LinkedHashMap<>();
 
         for (int i = 0; i < argv.length; i++) {
             String flag = argv[i];
@@ -65,28 +68,35 @@ public record PreviewOptions(
                 case "--height" -> height = intValue(argv, ++i, flag);
                 case "--screenshot" -> screenshot = Optional.of(Path.of(value(argv, ++i, flag)));
                 case "--frames" -> frames = Optional.of(intValue(argv, ++i, flag));
-                case "--texture" -> parseTexture(value(argv, ++i, flag), textures);
+                case "--texture" -> parseBinding(value(argv, ++i, flag), textures, flag);
+                case "--cubemap" -> parseBinding(value(argv, ++i, flag), cubemaps, flag);
                 default -> throw new IllegalArgumentException("unknown option: " + flag);
             }
         }
-        return new PreviewOptions(vert, frag, model, width, height, screenshot, frames, textures);
+        // A 2D texture and a cubemap can't share a descriptor binding.
+        for (Integer binding : cubemaps.keySet()) {
+            if (textures.containsKey(binding)) {
+                throw new IllegalArgumentException("binding " + binding + " is bound as both texture and cubemap");
+            }
+        }
+        return new PreviewOptions(vert, frag, model, width, height, screenshot, frames, textures, cubemaps);
     }
 
-    /** Parses a {@code <binding>=<path>} texture assignment into {@code out}. */
-    private static void parseTexture(String assignment, Map<Integer, Path> out) {
+    /** Parses a {@code <binding>=<path>} assignment into {@code out}. */
+    private static void parseBinding(String assignment, Map<Integer, Path> out, String flag) {
         int eq = assignment.indexOf('=');
         if (eq <= 0) {
-            throw new IllegalArgumentException("--texture expects <binding>=<file>, got '" + assignment + "'");
+            throw new IllegalArgumentException(flag + " expects <binding>=<path>, got '" + assignment + "'");
         }
         int binding;
         try {
             binding = Integer.parseInt(assignment.substring(0, eq));
         } catch (NumberFormatException e) {
-            throw new IllegalArgumentException("--texture binding must be an integer, got '"
+            throw new IllegalArgumentException(flag + " binding must be an integer, got '"
                     + assignment.substring(0, eq) + "'");
         }
         if (out.put(binding, Path.of(assignment.substring(eq + 1))) != null) {
-            throw new IllegalArgumentException("--texture binding " + binding + " specified twice");
+            throw new IllegalArgumentException(flag + " binding " + binding + " specified twice");
         }
     }
 
@@ -94,7 +104,7 @@ public record PreviewOptions(
     public static String usage() {
         return "usage: vastir-preview --vert <file.spv> --frag <file.spv> --model <file.obj|ply> "
                 + "[--width <px>] [--height <px>] [--screenshot <png>] [--frames <n>] "
-                + "[--texture <binding>=<png> ...]";
+                + "[--texture <binding>=<png> ...] [--cubemap <binding>=<prefix> ...]";
     }
 
     private static String value(String[] argv, int index, String flag) {
