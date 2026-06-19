@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>dev.supirvast</groupId>
+        <artifactId>supir-vast</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>supir-studio</artifactId>
+
+    <name>Supir-Vast :: supir-studio</name>
+    <description>
+        A live shader-playground GUI: edit a shader in a text panel, click compile, and see it applied to a 3D
+        model in an OpenGL viewport — instantly. Built on the dasumGUIshi retained-mode UI (sibarum.dasum.gui,
+        OpenGL 3.3 core). The render path is Supir → core (vastir) → SPIR-V (CoreToSpirv) → GLSL (spirv-cross,
+        bundled in vastir-tools) → an OpenGL program, since GL 3.3 can't ingest SPIR-V directly.
+
+        Phased: (1) the GUI shell + the live edit→compile→render loop with GLSL in the editor, proving the
+        dasumGUIshi/OpenGL integration; (2) swap the editor input to the Supir S-expression language once the
+        `supir` parser exists, completing Supir→Vastir→SPIR-V→OpenGL.
+    </description>
+
+    <dependencies>
+        <!-- dasumGUIshi retained-mode UI (install it from ../dasumGUIshi first: mvn install). -->
+        <dependency>
+            <groupId>sibarum.dasum.gui</groupId>
+            <artifactId>dasum-core</artifactId>
+            <version>1.0-SNAPSHOT</version>
+        </dependency>
+        <dependency>
+            <groupId>sibarum.dasum.gui</groupId>
+            <artifactId>dasum-vis</artifactId>
+            <version>1.0-SNAPSHOT</version>
+        </dependency>
+        <dependency>
+            <groupId>sibarum.dasum.gui</groupId>
+            <artifactId>dasum-glfw</artifactId>
+            <version>1.0-SNAPSHOT</version>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- Phase 2: Supir → core → SPIR-V → GLSL uses CoreToSpirv + NativeTools.crossCompile from here. -->
+        <dependency>
+            <groupId>dev.supirvast</groupId>
+            <artifactId>vastir-tools</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+    </dependencies>
+</project>

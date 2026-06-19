@@ -30,6 +30,8 @@
         <module>vastir-preview</module>
         <!-- PBR surface-shader authoring: pick channels + a surface function, generate a lit shader pair. -->
         <module>vastir-pbr</module>
+        <!-- Live shader-playground GUI (dasumGUIshi/OpenGL): edit a shader, compile, preview a model. -->
+        <module>supir-studio</module>
     </modules>
 
     <properties>
