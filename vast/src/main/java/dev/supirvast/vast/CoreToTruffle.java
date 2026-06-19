@@ -143,6 +143,8 @@ public final class CoreToTruffle {
                     c.arguments().stream().map(a -> lowerExpr(a, ctx)).toArray(ExprNode[]::new));
             case Expr.MathCall ignored -> throw new UnsupportedOperationException(
                     "math intrinsics (dot/normalize/pow/…) are graphics-only — no CPU backend yet");
+            case Expr.SampleTexture ignored -> throw new UnsupportedOperationException(
+                    "texture sampling is graphics-only — no CPU backend");
         };
     }
 

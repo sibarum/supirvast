@@ -6,6 +6,7 @@ import dev.supirvast.vastir.core.BinaryOp;
 import dev.supirvast.vastir.core.Buffer;
 import dev.supirvast.vastir.core.Builtin;
 import dev.supirvast.vastir.core.MathFn;
+import dev.supirvast.vastir.core.Texture;
 import dev.supirvast.vastir.core.CoreModule;
 import dev.supirvast.vastir.core.EntryPoint;
 import dev.supirvast.vastir.core.Expr;
@@ -27,6 +28,8 @@ import dev.supirvast.vastir.spirv.LoopControl;
 import dev.supirvast.vastir.spirv.MemoryModel;
 import dev.supirvast.vastir.spirv.Op;
 import dev.supirvast.vastir.spirv.SelectionControl;
+import dev.supirvast.vastir.spirv.Dim;
+import dev.supirvast.vastir.spirv.ImageFormat;
 import dev.supirvast.vastir.spirv.StorageClass;
 import dev.supirvast.vastir.type.Type;
 
@@ -78,13 +81,15 @@ public final class CoreToSpirv {
         InterfaceUsage iface = collectInterface(module);
         InterfaceResources interfaceResources = iface.isEmpty()
                 ? null : new InterfaceResources(b, iface.builtins(), iface.variables());
+        TextureResources textures = iface.textures().isEmpty()
+                ? null : new TextureResources(b, iface.textures());
 
         b.emit(b.capabilities, Op.OpCapability).enumValue(Capability.Shader.value());
         b.emit(b.memoryModel, Op.OpMemoryModel)
                 .enumValue(target.addressingModel())
                 .enumValue(target.memoryModel());
 
-        emitEntryPoints(module, b, functionIds, output, kernel, interfaceResources);
+        emitEntryPoints(module, b, functionIds, output, kernel, interfaceResources, textures);
         emitExecutionModes(module, b, functionIds);
 
         TypeTable types = new TypeTable(b);
@@ -98,10 +103,13 @@ public final class CoreToSpirv {
         if (interfaceResources != null) {
             interfaceResources.declare(b, types);
         }
+        if (textures != null) {
+            textures.declare(b, types);
+        }
         prepareGlobals(module, types, constants);
 
         for (Function function : module.functions()) {
-            new FunctionLowering(b, types, constants, output, kernel, interfaceResources, functionIds)
+            new FunctionLowering(b, types, constants, output, kernel, interfaceResources, textures, functionIds)
                     .emit(function, functionIds.get(function));
         }
 
@@ -132,7 +140,8 @@ public final class CoreToSpirv {
     }
 
     private void emitEntryPoints(CoreModule module, Builder b, Map<Function, Integer> functionIds,
-            OutputBuffer output, KernelResources kernel, InterfaceResources interfaceResources) {
+            OutputBuffer output, KernelResources kernel, InterfaceResources interfaceResources,
+            TextureResources textures) {
         for (EntryPoint entryPoint : module.entryPoints()) {
             Instruction instruction = b.emit(b.entryPoints, Op.OpEntryPoint)
                     .enumValue(executionModel(entryPoint.stage()))
@@ -150,6 +159,11 @@ public final class CoreToSpirv {
             if (interfaceResources != null) {
                 for (int interfaceVar : interfaceResources.interfaceVariables()) {
                     instruction.id(interfaceVar);
+                }
+            }
+            if (textures != null) {
+                for (int textureVar : textures.interfaceVariables()) {
+                    instruction.id(textureVar);
                 }
             }
         }
@@ -252,6 +266,7 @@ public final class CoreToSpirv {
             case Expr.Unary u -> collectBuffers(u.operand(), out);
             case Expr.Call c -> c.arguments().forEach(a -> collectBuffers(a, out));
             case Expr.MathCall mc -> mc.args().forEach(a -> collectBuffers(a, out));
+            case Expr.SampleTexture s -> collectBuffers(s.uv(), out);
             case Expr.ConstInt ignored -> { }
             case Expr.ConstFloat ignored -> { }
             case Expr.ConstBool ignored -> { }
@@ -300,6 +315,7 @@ public final class CoreToSpirv {
             case Expr.Unary u -> scanForInvocationId(u.operand(), found);
             case Expr.Call c -> c.arguments().forEach(a -> scanForInvocationId(a, found));
             case Expr.MathCall mc -> mc.args().forEach(a -> scanForInvocationId(a, found));
+            case Expr.SampleTexture s -> scanForInvocationId(s.uv(), found);
             case Expr.ConstInt ignored -> { }
             case Expr.ConstFloat ignored -> { }
             case Expr.ConstBool ignored -> { }
@@ -310,71 +326,82 @@ public final class CoreToSpirv {
         }
     }
 
-    /** The graphics built-ins and interface variables a module references, in first-seen order. */
-    private record InterfaceUsage(List<Builtin> builtins, List<InterfaceVar> variables) {
+    /** The graphics built-ins, interface variables, and textures a module references, in first-seen order. */
+    private record InterfaceUsage(List<Builtin> builtins, List<InterfaceVar> variables, List<Texture> textures) {
         boolean isEmpty() {
             return builtins.isEmpty() && variables.isEmpty();
         }
     }
 
-    private InterfaceUsage collectInterface(CoreModule module) {
-        Set<Builtin> builtins = new LinkedHashSet<>();
-        Set<InterfaceVar> variables = new LinkedHashSet<>();
-        for (Function function : module.functions()) {
-            scanInterface(function.body(), builtins, variables);
-        }
-        return new InterfaceUsage(List.copyOf(builtins), List.copyOf(variables));
+    /** Mutable accumulator threaded through the interface scan. */
+    private static final class InterfaceScan {
+        final Set<Builtin> builtins = new LinkedHashSet<>();
+        final Set<InterfaceVar> variables = new LinkedHashSet<>();
+        final Set<Texture> textures = new LinkedHashSet<>();
     }
 
-    private void scanInterface(Region region, Set<Builtin> builtins, Set<InterfaceVar> variables) {
+    private InterfaceUsage collectInterface(CoreModule module) {
+        InterfaceScan scan = new InterfaceScan();
+        for (Function function : module.functions()) {
+            scanInterface(function.body(), scan);
+        }
+        return new InterfaceUsage(List.copyOf(scan.builtins), List.copyOf(scan.variables),
+                List.copyOf(scan.textures));
+    }
+
+    private void scanInterface(Region region, InterfaceScan scan) {
         for (Statement statement : region.statements()) {
             switch (statement) {
                 case Statement.BuiltinWrite s -> {
-                    builtins.add(s.builtin());
-                    scanInterface(s.value(), builtins, variables);
+                    scan.builtins.add(s.builtin());
+                    scanInterface(s.value(), scan);
                 }
                 case Statement.InterfaceWrite s -> {
-                    variables.add(s.variable());
-                    scanInterface(s.value(), builtins, variables);
+                    scan.variables.add(s.variable());
+                    scanInterface(s.value(), scan);
                 }
                 case Statement.BufferStore s -> {
-                    scanInterface(s.index(), builtins, variables);
-                    scanInterface(s.value(), builtins, variables);
+                    scanInterface(s.index(), scan);
+                    scanInterface(s.value(), scan);
                 }
-                case Statement.Return r -> scanInterface(r.value(), builtins, variables);
-                case Statement.StoreResult s -> scanInterface(s.value(), builtins, variables);
-                case Statement.DeclareVar d -> scanInterface(d.initializer(), builtins, variables);
-                case Statement.Assign a -> scanInterface(a.value(), builtins, variables);
+                case Statement.Return r -> scanInterface(r.value(), scan);
+                case Statement.StoreResult s -> scanInterface(s.value(), scan);
+                case Statement.DeclareVar d -> scanInterface(d.initializer(), scan);
+                case Statement.Assign a -> scanInterface(a.value(), scan);
                 case Statement.If f -> {
-                    scanInterface(f.condition(), builtins, variables);
-                    scanInterface(f.thenRegion(), builtins, variables);
-                    scanInterface(f.elseRegion(), builtins, variables);
+                    scanInterface(f.condition(), scan);
+                    scanInterface(f.thenRegion(), scan);
+                    scanInterface(f.elseRegion(), scan);
                 }
                 case Statement.While w -> {
-                    scanInterface(w.condition(), builtins, variables);
-                    scanInterface(w.body(), builtins, variables);
+                    scanInterface(w.condition(), scan);
+                    scanInterface(w.body(), scan);
                 }
                 case Statement.ReturnVoid ignored -> { }
             }
         }
     }
 
-    private void scanInterface(Expr expr, Set<Builtin> builtins, Set<InterfaceVar> variables) {
+    private void scanInterface(Expr expr, InterfaceScan scan) {
         switch (expr) {
-            case Expr.BuiltinRead r -> builtins.add(r.builtin());
-            case Expr.InterfaceRead r -> variables.add(r.variable());
-            case Expr.BufferLoad l -> scanInterface(l.index(), builtins, variables);
-            case Expr.Binary b -> {
-                scanInterface(b.lhs(), builtins, variables);
-                scanInterface(b.rhs(), builtins, variables);
+            case Expr.BuiltinRead r -> scan.builtins.add(r.builtin());
+            case Expr.InterfaceRead r -> scan.variables.add(r.variable());
+            case Expr.SampleTexture s -> {
+                scan.textures.add(s.texture());
+                scanInterface(s.uv(), scan);
             }
-            case Expr.VectorConstruct vc -> vc.components().forEach(c -> scanInterface(c, builtins, variables));
-            case Expr.VectorExtract ve -> scanInterface(ve.vector(), builtins, variables);
-            case Expr.Bitcast bc -> scanInterface(bc.operand(), builtins, variables);
-            case Expr.Convert cv -> scanInterface(cv.operand(), builtins, variables);
-            case Expr.Unary u -> scanInterface(u.operand(), builtins, variables);
-            case Expr.Call c -> c.arguments().forEach(a -> scanInterface(a, builtins, variables));
-            case Expr.MathCall mc -> mc.args().forEach(a -> scanInterface(a, builtins, variables));
+            case Expr.BufferLoad l -> scanInterface(l.index(), scan);
+            case Expr.Binary b -> {
+                scanInterface(b.lhs(), scan);
+                scanInterface(b.rhs(), scan);
+            }
+            case Expr.VectorConstruct vc -> vc.components().forEach(c -> scanInterface(c, scan));
+            case Expr.VectorExtract ve -> scanInterface(ve.vector(), scan);
+            case Expr.Bitcast bc -> scanInterface(bc.operand(), scan);
+            case Expr.Convert cv -> scanInterface(cv.operand(), scan);
+            case Expr.Unary u -> scanInterface(u.operand(), scan);
+            case Expr.Call c -> c.arguments().forEach(a -> scanInterface(a, scan));
+            case Expr.MathCall mc -> mc.args().forEach(a -> scanInterface(a, scan));
             case Expr.ConstInt ignored -> { }
             case Expr.ConstFloat ignored -> { }
             case Expr.ConstBool ignored -> { }
@@ -475,6 +502,10 @@ public final class CoreToSpirv {
             case Expr.MathCall mc -> {
                 types.idOf(mc.type());
                 mc.args().forEach(a -> prepareExpr(a, types, constants));
+            }
+            case Expr.SampleTexture s -> {
+                types.idOf(s.type());   // vec4 result
+                prepareExpr(s.uv(), types, constants);
             }
         }
     }
@@ -777,6 +808,61 @@ public final class CoreToSpirv {
         }
     }
 
+    /**
+     * Combined 2D image+sampler resources (GLSL {@code sampler2D}s). All textures share one {@code OpTypeImage}/
+     * {@code OpTypeSampledImage}/pointer type (each is a sampled RGBA-float 2D image); each gets one
+     * {@code UniformConstant} variable decorated with its descriptor set + binding, and is listed in the entry
+     * point's interface (SPIR-V >= 1.4).
+     */
+    private static final class TextureResources {
+        private final List<Texture> textures;
+        private final Map<Texture, Integer> variableIds = new LinkedHashMap<>();
+        private int sampledImageType;
+
+        TextureResources(Builder b, List<Texture> textures) {
+            this.textures = textures;
+            for (Texture texture : textures) {
+                variableIds.put(texture, b.allocateId());
+            }
+        }
+
+        /** The {@code OpTypeSampledImage} id, loaded before each sample. Valid after {@link #declare}. */
+        int sampledImageType() {
+            return sampledImageType;
+        }
+
+        int variable(Texture texture) {
+            return variableIds.get(texture);
+        }
+
+        List<Integer> interfaceVariables() {
+            return new ArrayList<>(variableIds.values());
+        }
+
+        void declare(Builder b, TypeTable types) {
+            int floatType = types.idOf(Type.float32());
+            int imageType = b.allocateId();
+            // OpTypeImage: sampled-type, Dim 2D, Depth 0, Arrayed 0, MS 0, Sampled 1 (with a sampler), Unknown fmt.
+            b.emit(b.globals, Op.OpTypeImage).id(imageType).id(floatType)
+                    .enumValue(Dim._2D.value()).literal(0).literal(0).literal(0).literal(1)
+                    .enumValue(ImageFormat.Unknown.value());
+            sampledImageType = b.allocateId();
+            b.emit(b.globals, Op.OpTypeSampledImage).id(sampledImageType).id(imageType);
+            int pointerType = b.allocateId();
+            b.emit(b.globals, Op.OpTypePointer).id(pointerType)
+                    .enumValue(StorageClass.UniformConstant.value()).id(sampledImageType);
+            for (Texture texture : textures) {
+                int variableId = variableIds.get(texture);
+                b.emit(b.globals, Op.OpVariable).id(pointerType).id(variableId)
+                        .enumValue(StorageClass.UniformConstant.value());
+                b.emit(b.annotations, Op.OpDecorate).id(variableId)
+                        .enumValue(Decoration.DescriptorSet.value()).literal(texture.set());
+                b.emit(b.annotations, Op.OpDecorate).id(variableId)
+                        .enumValue(Decoration.Binding.value()).literal(texture.binding());
+            }
+        }
+    }
+
     // --- per-function lowering -------------------------------------------------------------------------
 
     private static final class FunctionLowering {
@@ -787,6 +873,7 @@ public final class CoreToSpirv {
         private final OutputBuffer output;
         private final KernelResources kernel;
         private final InterfaceResources interfaceResources;
+        private final TextureResources textures;
         private final Map<Function, Integer> functionIds;
         private final Map<LocalVar, Integer> variablePointers = new IdentityHashMap<>();
         private final List<Integer> parameterIds = new ArrayList<>();
@@ -794,13 +881,15 @@ public final class CoreToSpirv {
         private boolean terminated;    // whether the current block already has a terminator (e.g. early return)
 
         FunctionLowering(Builder b, TypeTable types, ConstantTable constants, OutputBuffer output,
-                KernelResources kernel, InterfaceResources interfaceResources, Map<Function, Integer> functionIds) {
+                KernelResources kernel, InterfaceResources interfaceResources, TextureResources textures,
+                Map<Function, Integer> functionIds) {
             this.b = b;
             this.types = types;
             this.constants = constants;
             this.output = output;
             this.kernel = kernel;
             this.interfaceResources = interfaceResources;
+            this.textures = textures;
             this.functionIds = functionIds;
         }
 
@@ -1059,7 +1148,20 @@ public final class CoreToSpirv {
                     yield result;
                 }
                 case Expr.MathCall mc -> lowerMathCall(mc);
+                case Expr.SampleTexture s -> lowerSampleTexture(s);
             };
+        }
+
+        /** Loads the combined image+sampler and samples it (implicit LOD) at the coordinate. */
+        private int lowerSampleTexture(Expr.SampleTexture sample) {
+            int coordinate = lowerExpr(sample.uv());   // lower the coordinate before emitting the load/sample
+            int loaded = b.allocateId();
+            b.emit(b.functions, Op.OpLoad)
+                    .id(textures.sampledImageType()).id(loaded).id(textures.variable(sample.texture()));
+            int resultType = types.idOf(sample.type());
+            int result = b.allocateId();
+            b.emit(b.functions, Op.OpImageSampleImplicitLod).id(resultType).id(result).id(loaded).id(coordinate);
+            return result;
         }
 
         /** Lowers a math intrinsic to {@code OpDot} or a {@code GLSL.std.450} {@code OpExtInst}. */

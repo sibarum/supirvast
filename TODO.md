@@ -154,6 +154,14 @@ highest-value next proof; **P1** deepens the language; **P2** broadens targets; 
 - [ ] Property/fuzz tests — random `core` programs → `spirv-val` + CPU==GPU agreement
 - [ ] Explicit SSA mid-level IR (the MLIR-style split) — only if/when a concrete need appears, not speculatively
 
+## Supir — S-expression reference language (after the current roadmap)
+
+- [ ] `supir` — a new module holding a thin S-expression surface syntax for SupirVast. Ideally the grammar is
+      **generated automatically from the core AST** (the `Expr`/`Statement`/type records), so the language *is*
+      the AST with no semantic gap. Simple parser, direct 1-to-1 lowering to `core` IR — a reference front end,
+      not an optimizing compiler. Sequenced **after** the current roadmap (textures/samplers, IBL, MVP +
+      uniforms).
+
 ---
 
 ## Known scope limits (tracked, intentional)

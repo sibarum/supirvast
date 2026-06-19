@@ -135,6 +135,17 @@ public sealed interface Expr {
     }
 
     /**
+     * Samples a {@link Texture} at {@code uv} (a {@code vec2}), yielding the RGBA texel as a {@code vec4}.
+     * Fragment-stage only — it lowers to implicit-LOD sampling, which needs fragment-quad derivatives.
+     */
+    record SampleTexture(Texture texture, Expr uv) implements Expr {
+        @Override
+        public Type type() {
+            return new Type.Vector(Type.float32(), 4);
+        }
+    }
+
+    /**
      * A built-in floating-point math intrinsic ({@link MathFn}) over scalar/vector operands — {@code dot},
      * {@code normalize}, {@code pow}, {@code clamp}, etc. The result {@code type} is carried explicitly; use the
      * factory helpers, which derive it ({@code DOT}/{@code LENGTH} reduce to the vector's component type, the
