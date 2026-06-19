@@ -12,6 +12,10 @@
 
     <artifactId>supir-studio</artifactId>
 
+    <properties>
+        <main.class>dev.supirvast.studio.Studio</main.class>
+    </properties>
+
     <name>Supir-Vast :: supir-studio</name>
     <description>
         A live shader-playground GUI: edit a shader in a text panel, click compile, and see it applied to a 3D
@@ -43,6 +47,12 @@
             <scope>runtime</scope>
         </dependency>
 
+        <!-- Pure-Java matrix/vector math for the preview's MVP transform (no natives). -->
+        <dependency>
+            <groupId>org.joml</groupId>
+            <artifactId>joml</artifactId>
+        </dependency>
+
         <!-- Phase 2: Supir → core → SPIR-V → GLSL uses CoreToSpirv + NativeTools.crossCompile from here. -->
         <dependency>
             <groupId>dev.supirvast</groupId>
@@ -50,4 +60,25 @@
             <version>${project.version}</version>
         </dependency>
     </dependencies>
+
+    <build>
+        <plugins>
+            <!-- mvn exec:java runs the studio with the native-access flag dasumGUIshi's
+                 Panama FFM bindings require (mirrors dasum-mvp-demo's exec config). -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <configuration>
+                    <mainClass>${main.class}</mainClass>
+                    <executable>java</executable>
+                    <arguments>
+                        <argument>--enable-native-access=ALL-UNNAMED</argument>
+                        <argument>-classpath</argument>
+                        <classpath/>
+                        <argument>${main.class}</argument>
+                    </arguments>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
 </project>
