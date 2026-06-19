@@ -3,6 +3,7 @@ package dev.supirvast.vastir.preview;
 import dev.supirvast.vastir.tools.GraphicsPipelineSpec;
 import dev.supirvast.vastir.tools.GraphicsPipelineSpec.VertexAttribute;
 import dev.supirvast.vastir.type.Type;
+import org.joml.Matrix4f;
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
@@ -24,6 +25,7 @@ import static org.lwjgl.glfw.GLFW.GLFW_NO_API;
 import static org.lwjgl.glfw.GLFW.GLFW_VISIBLE;
 import static org.lwjgl.glfw.GLFW.glfwCreateWindow;
 import static org.lwjgl.glfw.GLFW.glfwDestroyWindow;
+import static org.lwjgl.glfw.GLFW.glfwGetTime;
 import static org.lwjgl.glfw.GLFW.glfwInit;
 import static org.lwjgl.glfw.GLFW.glfwPollEvents;
 import static org.lwjgl.glfw.GLFW.glfwTerminate;
@@ -61,6 +63,7 @@ public final class PreviewApp implements AutoCloseable {
     // A recognizable, non-black clear color (cornflower-ish) so the rendered model stands out.
     private static final float[] CLEAR_RGBA = {0.39f, 0.58f, 0.93f, 1.0f};
     private static final int DEPTH_FORMAT = VK_FORMAT_D32_SFLOAT;
+    private static final int MVP_BYTES = 16 * Float.BYTES;   // a mat4 push constant
 
     private final PreviewOptions options;
 
@@ -550,6 +553,10 @@ public final class PreviewApp implements AutoCloseable {
                 .sType(VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO);
         if (descriptorSetLayout != VK_NULL_HANDLE) {   // set 0 = the combined image samplers
             layoutInfo.pSetLayouts(stack.longs(descriptorSetLayout));
+        }
+        if (options.mvp()) {   // a single mat4 (64 bytes) at offset 0, read by the vertex stage
+            layoutInfo.pPushConstantRanges(VkPushConstantRange.calloc(1, stack)
+                    .stageFlags(VK_SHADER_STAGE_VERTEX_BIT).offset(0).size(MVP_BYTES));
         }
         LongBuffer pLayout = stack.mallocLong(1);
         check(vkCreatePipelineLayout(device, layoutInfo, null, pLayout), "vkCreatePipelineLayout");
@@ -1049,11 +1056,29 @@ public final class PreviewApp implements AutoCloseable {
             vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0,
                     stack.longs(descriptorSet), null);
         }
+        if (options.mvp()) {
+            vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                    modelViewProjection(stack));
+        }
         vkCmdBindVertexBuffers(commandBuffer, 0, stack.longs(vertexBuffer), stack.longs(0));
         vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(commandBuffer, indexCount, 1, 0, 0, 0);
         vkCmdEndRenderPass(commandBuffer);
         check(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer");
+    }
+
+    /** The rotating model-view-projection matrix as 64 column-major bytes for the vertex push constant. */
+    private ByteBuffer modelViewProjection(MemoryStack stack) {
+        float aspect = (float) extentWidth / extentHeight;
+        float angle = (float) glfwGetTime() * 0.6f + 0.6f;   // spin; base offset so a one-frame shot isn't flat-on
+        Matrix4f mvp = new Matrix4f()
+                .perspective((float) Math.toRadians(45.0), aspect, 0.1f, 20.0f, true)   // Vulkan depth [0,1]
+                .lookAt(0.0f, 2.2f, 5.5f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f)
+                .rotateY(angle)
+                .rotateX(0.35f);
+        ByteBuffer buffer = stack.malloc(MVP_BYTES);
+        mvp.get(buffer);   // column-major floats, matching the shader's ColMajor mat4
+        return buffer;
     }
 
     private void createSyncObjects(MemoryStack stack) {
