@@ -63,7 +63,9 @@ public final class PreviewApp implements AutoCloseable {
     // A recognizable, non-black clear color (cornflower-ish) so the rendered model stands out.
     private static final float[] CLEAR_RGBA = {0.39f, 0.58f, 0.93f, 1.0f};
     private static final int DEPTH_FORMAT = VK_FORMAT_D32_SFLOAT;
-    private static final int MVP_BYTES = 16 * Float.BYTES;   // a mat4 push constant
+    // Push-constant block: mat4 mvp (offset 0), mat4 model (64), vec3 cameraPosition (128) — 144 bytes.
+    private static final int PUSH_BYTES = 64 + 64 + 16;
+    private static final float[] CAMERA_EYE = {0.0f, 2.2f, 5.5f};
 
     private final PreviewOptions options;
 
@@ -554,9 +556,10 @@ public final class PreviewApp implements AutoCloseable {
         if (descriptorSetLayout != VK_NULL_HANDLE) {   // set 0 = the combined image samplers
             layoutInfo.pSetLayouts(stack.longs(descriptorSetLayout));
         }
-        if (options.mvp()) {   // a single mat4 (64 bytes) at offset 0, read by the vertex stage
+        if (options.mvp()) {   // mvp + model + camera, read by the vertex and fragment stages
             layoutInfo.pPushConstantRanges(VkPushConstantRange.calloc(1, stack)
-                    .stageFlags(VK_SHADER_STAGE_VERTEX_BIT).offset(0).size(MVP_BYTES));
+                    .stageFlags(VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
+                    .offset(0).size(PUSH_BYTES));
         }
         LongBuffer pLayout = stack.mallocLong(1);
         check(vkCreatePipelineLayout(device, layoutInfo, null, pLayout), "vkCreatePipelineLayout");
@@ -1057,8 +1060,8 @@ public final class PreviewApp implements AutoCloseable {
                     stack.longs(descriptorSet), null);
         }
         if (options.mvp()) {
-            vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0,
-                    modelViewProjection(stack));
+            vkCmdPushConstants(commandBuffer, pipelineLayout,
+                    VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, pushConstantData(stack));
         }
         vkCmdBindVertexBuffers(commandBuffer, 0, stack.longs(vertexBuffer), stack.longs(0));
         vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT32);
@@ -1067,17 +1070,20 @@ public final class PreviewApp implements AutoCloseable {
         check(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer");
     }
 
-    /** The rotating model-view-projection matrix as 64 column-major bytes for the vertex push constant. */
-    private ByteBuffer modelViewProjection(MemoryStack stack) {
+    /** The per-frame push-constant block: {@code mvp} (0), {@code model} (64), {@code cameraPosition} (128). */
+    private ByteBuffer pushConstantData(MemoryStack stack) {
         float aspect = (float) extentWidth / extentHeight;
         float angle = (float) glfwGetTime() * 0.6f + 0.6f;   // spin; base offset so a one-frame shot isn't flat-on
-        Matrix4f mvp = new Matrix4f()
+        Matrix4f model = new Matrix4f().rotateY(angle).rotateX(0.35f);
+        Matrix4f viewProjection = new Matrix4f()
                 .perspective((float) Math.toRadians(45.0), aspect, 0.1f, 20.0f, true)   // Vulkan depth [0,1]
-                .lookAt(0.0f, 2.2f, 5.5f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f)
-                .rotateY(angle)
-                .rotateX(0.35f);
-        ByteBuffer buffer = stack.malloc(MVP_BYTES);
-        mvp.get(buffer);   // column-major floats, matching the shader's ColMajor mat4
+                .lookAt(CAMERA_EYE[0], CAMERA_EYE[1], CAMERA_EYE[2], 0, 0, 0, 0, 1, 0);
+        Matrix4f mvp = new Matrix4f(viewProjection).mul(model);
+
+        ByteBuffer buffer = stack.malloc(PUSH_BYTES);
+        mvp.get(0, buffer);                              // column-major, matching the shader's ColMajor mat4
+        model.get(64, buffer);
+        buffer.putFloat(128, CAMERA_EYE[0]).putFloat(132, CAMERA_EYE[1]).putFloat(136, CAMERA_EYE[2]);
         return buffer;
     }
 

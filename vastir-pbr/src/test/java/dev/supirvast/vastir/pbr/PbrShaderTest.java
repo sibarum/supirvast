@@ -62,6 +62,21 @@ class PbrShaderTest {
     }
 
     @Test
+    void mvpMaterialValidates() {
+        NativeTools tools = new NativeTools();
+        assumeTrue(tools.isAvailable(), "native SPIR-V toolchain not bundled for this platform");
+
+        PbrShader shader = PbrShader.create(
+                        Set.of(Channel.ALBEDO, Channel.ROUGHNESS),
+                        inputs -> Map.of(Channel.ALBEDO, vec3(0.8, 0.2, 0.2), Channel.ROUGHNESS, f(0.4)))
+                .withMvp();
+        GraphicsPipelineSpec spec = shader.spec();
+
+        assertTrue(tools.validate(spec.vertexSpirv()).valid(), "MVP vertex shader invalid");
+        assertTrue(tools.validate(spec.fragmentSpirv()).valid(), "MVP fragment shader invalid");
+    }
+
+    @Test
     void allDefaultsStillProduceAValidShader() {
         NativeTools tools = new NativeTools();
         assumeTrue(tools.isAvailable(), "native SPIR-V toolchain not bundled for this platform");

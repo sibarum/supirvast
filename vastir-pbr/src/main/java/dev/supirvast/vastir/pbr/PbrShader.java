@@ -8,6 +8,7 @@ import dev.supirvast.vastir.core.Expr.MathCall;
 import dev.supirvast.vastir.core.Function;
 import dev.supirvast.vastir.core.InterfaceVar;
 import dev.supirvast.vastir.core.LocalVar;
+import dev.supirvast.vastir.core.PushConstants;
 import dev.supirvast.vastir.core.Region;
 import dev.supirvast.vastir.core.ShaderStage;
 import dev.supirvast.vastir.core.Statement;
@@ -56,14 +57,26 @@ public final class PbrShader {
     private static final double EPSILON = 1.0e-4;
     private static final double INV_GAMMA = 1.0 / 2.2;
 
+    /**
+     * The push-constant block used in MVP mode: the model-view-projection matrix (for {@code gl_Position}), the
+     * model matrix (for world-space position/normal), and the world-space camera position (for the view vector).
+     * The previewer's {@code --mvp} fills these per frame.
+     */
+    private static final PushConstants MVP_BLOCK = new PushConstants(List.of(
+            new PushConstants.Member("mvp", Type.mat4()),
+            new PushConstants.Member("model", Type.mat4()),
+            new PushConstants.Member("cameraPosition", new Type.Vector(Type.float32(), 3))));
+
     private final Set<Channel> channels;
     private final SurfaceFunction surface;
     private final Integer environmentBinding;   // null = flat ambient; else IBL from a cubemap at this binding
+    private final boolean mvp;                  // true = transform by a push-constant MVP, light in world space
 
-    private PbrShader(Set<Channel> channels, SurfaceFunction surface, Integer environmentBinding) {
+    private PbrShader(Set<Channel> channels, SurfaceFunction surface, Integer environmentBinding, boolean mvp) {
         this.channels = channels;
         this.surface = surface;
         this.environmentBinding = environmentBinding;
+        this.mvp = mvp;
     }
 
     /**
@@ -72,7 +85,7 @@ public final class PbrShader {
      * channels left out of {@code channels} use defaults. Lit by one directional light plus a small flat ambient.
      */
     public static PbrShader create(Set<Channel> channels, SurfaceFunction surface) {
-        return new PbrShader(normalize(channels), surface, null);
+        return new PbrShader(normalize(channels), surface, null, false);
     }
 
     /**
@@ -82,7 +95,21 @@ public final class PbrShader {
      */
     public static PbrShader createWithEnvironment(Set<Channel> channels, SurfaceFunction surface,
             int environmentBinding) {
-        return new PbrShader(normalize(channels), surface, environmentBinding);
+        return create(channels, surface).withEnvironment(environmentBinding);
+    }
+
+    /** A copy of this material with image-based lighting from a cubemap at {@code environmentBinding}. */
+    public PbrShader withEnvironment(int environmentBinding) {
+        return new PbrShader(channels, surface, environmentBinding, mvp);
+    }
+
+    /**
+     * A copy of this material that transforms geometry by a push-constant model-view-projection matrix and
+     * lights in world space (a fixed light stays put while the model moves). The previewer supplies the matrices
+     * and camera position via {@code --mvp}.
+     */
+    public PbrShader withMvp() {
+        return new PbrShader(channels, surface, environmentBinding, true);
     }
 
     private static Set<Channel> normalize(Set<Channel> channels) {
@@ -102,7 +129,7 @@ public final class PbrShader {
                 .toByteArray();
     }
 
-    /** {@code gl_Position = vec4(position, 1); pass the normal, position, and uv through as varyings.} */
+    /** Emits {@code gl_Position} and passes world-space normal/position + uv as varyings. */
     public Function vertexFunction() {
         InterfaceVar position = InterfaceVar.input("position", 0, VEC3);
         InterfaceVar normal = InterfaceVar.input("normal", 1, VEC3);
@@ -111,11 +138,28 @@ public final class PbrShader {
         InterfaceVar worldPosition = InterfaceVar.output("vWorldPosition", 1, VEC3);
         InterfaceVar varyingUv = InterfaceVar.output("vUv", 2, VEC2);
 
+        Expr localPos = new Expr.InterfaceRead(position);
+        Expr localNormal = new Expr.InterfaceRead(normal);
+        Expr clip;
+        Expr worldPos;
+        Expr worldNrm;
+        if (mvp) {
+            Expr mvpMatrix = MVP_BLOCK.read(0);
+            Expr modelMatrix = MVP_BLOCK.read(1);
+            clip = new Expr.MatrixTimesVector(mvpMatrix, vec4(localPos, f(1)));
+            // World position/normal via the model matrix (normal as a w=0 direction so translation is ignored).
+            worldPos = Shade.xyz(new Expr.MatrixTimesVector(modelMatrix, vec4(localPos, f(1))));
+            worldNrm = MathCall.normalize(Shade.xyz(new Expr.MatrixTimesVector(modelMatrix, vec4(localNormal, f(0)))));
+        } else {
+            clip = vec4(localPos, f(1));   // geometry already authored in clip space
+            worldPos = localPos;
+            worldNrm = localNormal;
+        }
+
         Region body = Region.of(
-                new Statement.BuiltinWrite(Builtin.POSITION,
-                        vec4(new Expr.InterfaceRead(position), f(1))),
-                new Statement.InterfaceWrite(worldNormal, new Expr.InterfaceRead(normal)),
-                new Statement.InterfaceWrite(worldPosition, new Expr.InterfaceRead(position)),
+                new Statement.BuiltinWrite(Builtin.POSITION, clip),
+                new Statement.InterfaceWrite(worldNormal, worldNrm),
+                new Statement.InterfaceWrite(worldPosition, worldPos),
                 new Statement.InterfaceWrite(varyingUv, new Expr.InterfaceRead(uv)),
                 new Statement.ReturnVoid());
         return new Function("main", new Type.FunctionType(Type.VOID, List.of()), body);
@@ -143,7 +187,9 @@ public final class PbrShader {
         Expr opacity = b.let("opacity", resolved(provided, Channel.OPACITY, inputs));
         Expr shadingNormal = resolved(provided, Channel.NORMAL, inputs);
 
-        Expr color = cookTorrance(b, albedo, metallic, roughness, ao, emissive, shadingNormal, inputs);
+        Expr cameraPosition = mvp ? b.let("cameraPos", MVP_BLOCK.read(2)) : null;
+        Expr color = cookTorrance(b, albedo, metallic, roughness, ao, emissive, shadingNormal, inputs,
+                cameraPosition);
 
         b.statements.add(new Statement.InterfaceWrite(fragColor, vec4(color, opacity)));
         b.statements.add(new Statement.ReturnVoid());
@@ -152,12 +198,20 @@ public final class PbrShader {
 
     /** The metallic-roughness microfacet BRDF: GGX distribution, Smith geometry, Schlick Fresnel. */
     private Expr cookTorrance(Body b, Expr albedo, Expr metallic, Expr roughness, Expr ao, Expr emissive,
-            Expr shadingNormal, SurfaceInputs inputs) {
+            Expr shadingNormal, SurfaceInputs inputs, Expr cameraPosition) {
         Expr n = b.let("N", MathCall.normalize(shadingNormal));
-        // The previewer clears depth to 1 with LESS and no projection, so the nearer (smaller-z) hemisphere is
-        // visible — i.e. the camera sits on the -Z side. Place the view and light there to light the front.
-        Expr v = b.let("V", MathCall.normalize(sub(vec3(0, 0, -1.0), inputs.worldPosition())));
-        Expr l = b.let("L", MathCall.normalize(vec3(0.35, 0.45, -0.9)));   // up-right, mostly toward the camera
+        Expr v;
+        Expr l;
+        if (cameraPosition != null) {
+            // MVP mode: lighting in world space — a fixed light/camera while the model moves.
+            v = b.let("V", MathCall.normalize(sub(cameraPosition, inputs.worldPosition())));
+            l = b.let("L", MathCall.normalize(vec3(0.4, 0.7, 0.6)));
+        } else {
+            // Static mode: the previewer clears depth to 1 / LESS with no projection, so the visible hemisphere
+            // faces -Z; place the view and light there to light the front.
+            v = b.let("V", MathCall.normalize(sub(vec3(0, 0, -1.0), inputs.worldPosition())));
+            l = b.let("L", MathCall.normalize(vec3(0.35, 0.45, -0.9)));
+        }
         Expr h = b.let("H", MathCall.normalize(add(v, l)));
 
         Expr nDotL = b.let("NdotL", MathCall.max(MathCall.dot(n, l), f(0)));

@@ -48,11 +48,17 @@ public final class PbrSampleAssets {
                 }
                 Files.write(outDir.resolve(material.getKey() + ".frag.spv"), spec.fragmentSpirv());
             }
+            // MVP demo: a textured PBR material that transforms by a push-constant MVP and lights in world
+            // space, plus a model-space sphere. Render with --mvp --texture 0=<checker>.
+            GraphicsPipelineSpec mvpSpec = textured().withMvp().spec();
+            Files.write(outDir.resolve("pbr-mvp.vert.spv"), mvpSpec.vertexSpirv());
+            Files.write(outDir.resolve("textured-mvp.frag.spv"), mvpSpec.fragmentSpirv());
+            Files.writeString(outDir.resolve("sphere-model.obj"), sphereObj(32, 48, 1.0f, 0.0f));
         } catch (IOException e) {
             throw new UncheckedIOException("failed to write PBR sample assets to " + outDir, e);
         }
-        System.out.println("[pbr-sample] wrote sphere.obj, pbr.vert.spv, and "
-                + materials().keySet() + " fragment shaders to " + outDir);
+        System.out.println("[pbr-sample] wrote sphere.obj, sphere-model.obj, pbr.vert.spv, pbr-mvp.{vert,frag}, "
+                + "and " + materials().keySet() + " fragment shaders to " + outDir);
     }
 
     /** The demo materials, spanning roughness and metalness. */
