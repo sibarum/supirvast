@@ -10,9 +10,16 @@ drawn. The compute path *does* run on the GPU (the CPU==GPU differential), but g
 closes that gap with something visual you can screenshot.
 
 ```
-vastir-preview --vert myshader.vert.spv --frag myshader.frag.spv --model cube.obj
-vastir-preview --vert v.spv --frag f.spv --model cube.obj --screenshot out.png   # one frame, write PNG, exit
+vastir-preview --vert v.spv --frag f.spv --model cube.obj
+vastir-preview --vert v.spv --frag f.spv --model cube.ply --screenshot out.png      # one frame → PNG, exit
+vastir-preview --vert v.spv --frag f.spv --model sphere.obj --texture 0=albedo.png  # bind a 2D texture
+vastir-preview --vert v.spv --frag f.spv --model sphere.obj --cubemap 0=env --mvp   # cubemap + rotating MVP
 ```
+
+Models: **OBJ** (`v`/`vn`/`vt`/`f`) and **PLY** (the general element/property model — ascii + binary little/big
+endian; every named channel is parsed, position/normal/uv are drawn). `--texture`/`--cubemap` bind combined
+image samplers (a cubemap's faces are `<prefix>_px/_nx/_py/_ny/_pz/_nz.png`); `--mvp` pushes a rotating
+model-view-projection matrix (+ model matrix + camera position) for shaders that read it.
 
 ## Where this fits
 
@@ -25,32 +32,36 @@ core IR ──CoreToSpirv──▶ .spv files ──┐
 The previewer consumes **files**, not in-process objects, matching the workflow "test a shader I've written on
 live hardware." Wiring `core` lowering directly into the previewer (skip the files) is a trivial later step.
 
-## The vertex contract (v1)
+## The vertex contract
 
-The PoC fixes one vertex layout — encoded as a typed `GraphicsPipelineSpec` (in `vastir-tools`, alongside
+The vertex layout is fixed and encoded as a typed `GraphicsPipelineSpec` (in `vastir-tools`, alongside
 `KernelSpec`) so it is self-describing rather than a magic convention:
 
 | location | attribute | type   |
 |----------|-----------|--------|
 | 0        | position  | `vec3` |
 | 1        | normal    | `vec3` |
+| 2        | uv        | `vec2` |
 
 A SupirVast author writes their vertex shader's `InterfaceVar.input(name, location, type)` against this layout;
-the previewer builds the `VkPipelineVertexInputState` from the same spec. No serialization format yet — the CLI
-passes raw `.spv` and the spec *is* the v1 contract.
+the previewer builds the `VkPipelineVertexInputState` from the same spec. UV is always present (zero when a
+model lacks it), so a shader that doesn't read it simply ignores location 2. The CLI passes raw `.spv` and the
+spec *is* the contract — no serialization format.
 
-## Non-goals (the "expand from there")
+## Supported now / non-goals
+
+Supported: OBJ + PLY models · 2D textures + cubemaps (combined image samplers) · a rotating MVP push constant
+(`--mvp`) · PNG screenshots. PBR materials and a Cook-Torrance lighting model live in the sibling `vastir-pbr`
+module (which generates the `.spv` this previewer renders).
+
+Non-goals / not yet:
 
 - No headless render differential / CPU rasterizer reference (out of scope by design).
-- No ShaderLab DSL, materials, properties, multi-pass, or render-state authoring — `GraphicsPipelineSpec`
-  stays a minimal typed record.
-- No runtime MVP transform / camera / auto-rotation yet (needs `Matrix` + push constants in the `core` IR;
-  see step 4). v1 renders statically with the model pre-placed in clip space.
-- No textures/samplers, no UBOs, no built-in lighting model (the fragment shader does whatever the author
-  wrote).
-- Model formats: OBJ and PLY (ascii + binary, little/big endian). PLY's full named-channel model is parsed
-  and exposed, but only position+normal are drawn (colors/UVs/custom channels are read, not yet rendered). No
-  glTF/FBX, no scene graph.
+- No render-state authoring (blend/cull/multi-pass) — `GraphicsPipelineSpec` stays a minimal typed record;
+  cull is `NONE` and depth-test `LESS`.
+- No UBOs (push constants only), no scene graph, no camera controls (the `--mvp` camera is fixed, model spins).
+- PLY's full named-channel model is parsed and exposed, but only position/normal/uv are drawn (other channels
+  are read, not rendered). No glTF/FBX.
 - Linux/macOS (Windows-only natives, matching `vastir-tools`).
 
 ## Build / run

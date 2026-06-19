@@ -99,6 +99,36 @@ highest-value next proof; **P1** deepens the language; **P2** broadens targets; 
       like `--ssa-rewrite`). Proven by `SpirvOptPhiTest` (mem2reg → `OpPhi`, valid + behavior-preserving).
 - [ ] Optional native textual backends (`CoreToGlsl`, …) if we ever want to bypass `spirv-cross`
 
+## Graphics & PBR rendering — DONE (2026-06-18/19)
+
+> A full graphics path: author shaders in `core`, render real 3D on the GPU, and a ShaderLab-style PBR
+> authoring layer. Two new modules: `vastir-preview` (windowed Vulkan previewer) and `vastir-pbr` (PBR).
+
+- [x] **`vastir-preview`** — windowed Vulkan shader previewer (GLFW + swapchain + depth): loads a vertex+
+      fragment SPIR-V pair + a model from the CLI and renders it; `--screenshot` writes a PNG (`lwjgl-stb`).
+      Verified by rendering on the RTX 2070. `GraphicsPipelineSpec` (vastir-tools) is the typed shader↔pipeline
+      contract (vertex layout position@0 / normal@1 / uv@2).
+- [x] **Vertex attributes** — vertex-stage `InterfaceVar.input` lowers to a `Location`-decorated `Input`
+      (no IR change needed); models feed them via the vertex buffer.
+- [x] **Model loaders** — OBJ (`v`/`vn`/`vt`/`f`) and PLY (general element/property model, ascii + binary
+      little/big endian; named channels parsed/exposed) → one interleaved `Mesh`; loader dispatch by extension.
+- [x] **Math intrinsics** — `Expr.MathCall` (`OpDot` + the full GLSL.std.450 float library: normalize, pow,
+      sqrt, reflect, clamp, mix, trig, hyperbolic, exp/log, rounding, fma, distance, refract, …).
+- [x] **Textures & samplers** — `core` `Texture` (2D + cube) + `Expr.SampleTexture` → `OpImageSample…`;
+      previewer loads PNGs into images/samplers + a combined-image-sampler descriptor set (`--texture`,
+      `--cubemap`); UV vertex attribute + UVs in the loaders.
+- [x] **Matrices + push constants** — `Type.Matrix`/`mat4`, `PushConstants` block, `Expr.MatrixTimesVector`
+      (`OpMatrixTimesVector`); previewer `--mvp` pushes a rotating model-view-projection (+ model + camera).
+- [x] **`vastir-pbr`** — ShaderLab-style PBR authoring: pick `Channel`s (albedo/metallic/roughness/normal/
+      AO/emissive/opacity) + a surface function → a generated **Cook-Torrance** vertex+fragment pair
+      (`GraphicsPipelineSpec`). `PbrShader.create(...).withEnvironment(binding).withMvp()` composes textured
+      albedo, image-based lighting (cubemap reflections), and world-space lighting under an MVP transform.
+      Verified: lit/rough/metal spheres, a textured PBR sphere, an IBL metal reflecting an environment, and a
+      checker-textured PBR sphere transformed by MVP — all on the RTX 2070.
+
+> Deferred (noted): full IBL (prefiltered specular mips + irradiance + BRDF LUT); light/camera as uniforms
+> (push constants now exist, so it's small); a normal matrix for non-uniform scale; multiple lights.
+
 ## Orchestration & front-ends — supir-vast as the highest-level reusable GPU/Truffle tool
 
 > Direction: make supir-vast a Pontif-free, reusable orchestration layer that any Truffle language can target;
@@ -166,6 +196,7 @@ highest-value next proof; **P1** deepens the language; **P2** broadens targets; 
 
 ## Known scope limits (tracked, intentional)
 
-32-bit scalars only · memory-based locals (no `OpPhi`) · i32 storage buffers only (no other element types) ·
-local size fixed at 1 (dispatch via workgroup count) · no function calls · no vertex/fragment I/O ·
-early-return only at top level · Windows-only natives.
+Memory-based locals (no `OpPhi`, `spirv-opt --ssa-rewrite` away) · compute kernels: i32/i64/f32/f64 storage
+columns, local size 1 (dispatch via workgroup count) · graphics lighting authored model-space unless `--mvp`
+(no normal matrix → uniform scale only) · simplified IBL (base-level cubemap, no prefiltered mips/irradiance
+convolution/BRDF LUT) · light + camera still hardcoded in shaders (not yet uniforms) · Windows-only natives.
