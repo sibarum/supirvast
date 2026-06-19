@@ -133,8 +133,10 @@ public final class PbrShader {
     private Expr cookTorrance(Body b, Expr albedo, Expr metallic, Expr roughness, Expr ao, Expr emissive,
             Expr shadingNormal, SurfaceInputs inputs) {
         Expr n = b.let("N", MathCall.normalize(shadingNormal));
-        Expr v = b.let("V", MathCall.normalize(sub(vec3(0, 0, 1.5), inputs.worldPosition())));   // viewer in front
-        Expr l = b.let("L", MathCall.normalize(vec3(0.4, 0.7, 0.6)));                             // directional light
+        // The previewer clears depth to 1 with LESS and no projection, so the nearer (smaller-z) hemisphere is
+        // visible — i.e. the camera sits on the -Z side. Place the view and light there to light the front.
+        Expr v = b.let("V", MathCall.normalize(sub(vec3(0, 0, -1.0), inputs.worldPosition())));
+        Expr l = b.let("L", MathCall.normalize(vec3(0.35, 0.45, -0.9)));   // up-right, mostly toward the camera
         Expr h = b.let("H", MathCall.normalize(add(v, l)));
 
         Expr nDotL = b.let("NdotL", MathCall.max(MathCall.dot(n, l), f(0)));
@@ -171,9 +173,9 @@ public final class PbrShader {
         Expr diffuse = b.let("diffuse", divScalar(mul(kd, albedo), f(PI)));
 
         // Outgoing radiance from the single light, plus ambient and emissive.
-        Expr lightColor = vec3(3, 3, 3);
+        Expr lightColor = vec3(4, 4, 4);
         Expr lo = b.let("Lo", scale(mul(add(diffuse, specular), lightColor), nDotL));
-        Expr ambient = b.let("ambient", scale(scale(albedo, f(0.03)), ao));
+        Expr ambient = b.let("ambient", scale(scale(albedo, f(0.05)), ao));
         Expr color = b.let("color", add(add(ambient, lo), emissive));
 
         // Reinhard tone-map then gamma-encode for display.

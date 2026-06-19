@@ -492,8 +492,11 @@ public final class PreviewApp implements AutoCloseable {
                         .sType(VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO)
                         .topology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
 
+        // Flip Y (origin at bottom, negative height) so model-space +Y is screen-up — Vulkan clip space is
+        // Y-down by default, which would otherwise render everything (and its lighting) upside down. Core since
+        // Vulkan 1.1; we run 1.3.
         VkViewport.Buffer viewport = VkViewport.calloc(1, stack)
-                .x(0).y(0).width(extentWidth).height(extentHeight).minDepth(0).maxDepth(1);
+                .x(0).y(extentHeight).width(extentWidth).height(-extentHeight).minDepth(0).maxDepth(1);
         VkRect2D.Buffer scissor = VkRect2D.calloc(1, stack);
         scissor.get(0).offset().set(0, 0);
         scissor.get(0).extent().width(extentWidth).height(extentHeight);
