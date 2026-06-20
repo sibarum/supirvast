@@ -23,9 +23,9 @@
         OpenGL 3.3 core). The render path is Supir → core (vastir) → SPIR-V (CoreToSpirv) → GLSL (spirv-cross,
         bundled in vastir-tools) → an OpenGL program, since GL 3.3 can't ingest SPIR-V directly.
 
-        Phased: (1) the GUI shell + the live edit→compile→render loop with GLSL in the editor, proving the
-        dasumGUIshi/OpenGL integration; (2) swap the editor input to the Supir S-expression language once the
-        `supir` parser exists, completing Supir→Vastir→SPIR-V→OpenGL.
+        Phased: (1) the GUI shell + the live edit→compile→render loop, proving the dasumGUIshi/OpenGL
+        integration; (2) the editor input is Supir (the textual form of the core IR), completing
+        Supir→Vastir→SPIR-V→OpenGL.
     </description>
 
     <dependencies>
@@ -46,6 +46,15 @@
             <version>1.0-SNAPSHOT</version>
             <scope>runtime</scope>
         </dependency>
+        <!-- Native file-dialog backend (nfd.dll) for Export…'s folder picker. The Nfd Java binding ships in
+             dasum-natives (a compile-time transitive dep); this carries the native library it loads at run time
+             (analogous to dasum-glfw for GLFW), so it's runtime scope. -->
+        <dependency>
+            <groupId>sibarum.dasum.gui</groupId>
+            <artifactId>dasum-nfd</artifactId>
+            <version>1.0-SNAPSHOT</version>
+            <scope>runtime</scope>
+        </dependency>
 
         <!-- Pure-Java matrix/vector math for the preview's MVP transform (no natives). -->
         <dependency>
@@ -57,6 +66,13 @@
         <dependency>
             <groupId>dev.supirvast</groupId>
             <artifactId>vastir-tools</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
+        <!-- Phase 2: the editor's Supir source is parsed to core IR with the supir front end. -->
+        <dependency>
+            <groupId>dev.supirvast</groupId>
+            <artifactId>supir</artifactId>
             <version>${project.version}</version>
         </dependency>
     </dependencies>

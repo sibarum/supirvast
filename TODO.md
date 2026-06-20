@@ -184,13 +184,29 @@ highest-value next proof; **P1** deepens the language; **P2** broadens targets; 
 - [ ] Property/fuzz tests — random `core` programs → `spirv-val` + CPU==GPU agreement
 - [ ] Explicit SSA mid-level IR (the MLIR-style split) — only if/when a concrete need appears, not speculatively
 
-## Supir — S-expression reference language (after the current roadmap)
+## Supir — textual form of the core IR (after the current roadmap)
 
-- [ ] `supir` — a new module holding a thin S-expression surface syntax for SupirVast. Ideally the grammar is
-      **generated automatically from the core AST** (the `Expr`/`Statement`/type records), so the language *is*
-      the AST with no semantic gap. Simple parser, direct 1-to-1 lowering to `core` IR — a reference front end,
-      not an optimizing compiler. Sequenced **after** the current roadmap (textures/samplers, IBL, MVP +
-      uniforms).
+- [x] `supir` — a new module holding the textual form of the `core` IR: a **flat, high-level assembly**
+      (one op per line, every intermediate named, structured `if`/`loop`, no nested expression trees) chosen as
+      a human-readable IR substitute / interchange format (the `.ll` / `spirv-dis`+`spirv-as` role).
+      **Two-way**: `Supir.parseModule(String)` (text → `core`) and `Supir.print(CoreModule)` (`core` → text),
+      with `line:col` diagnostics. Faithful to lowered semantics, not the AST tree — printing normalizes
+      (subexpressions → named temps, canonical `p0`/`t0` names), so `print` is a normal form
+      (`print(parse(print(m))) == print(m)`, verified by `RoundTripTest`). Grammar in `supir/README.md`.
+      The infix "modernized shader language" idea belongs at a higher authoring layer that lowers *to* this IR.
+- [x] Wire `supir` into supir-studio (Phase 2): editor (Supir) → `Supir.parseModule` → `core` → `CoreToSpirv`
+      → spirv-val → spirv-cross GLSL 330 → `ShaderUtil.buildProgram` → render (`SupirShaderCompiler`). Added a
+      GLSL version target to `NativeTools.crossCompile` (`--version 330 --no-es --separate-shader-objects`) so
+      varyings carry explicit locations on a 3.3 context. Errors surface in the status bar; last good program
+      kept on failure.
+- [x] Both stages in Supir: a "Switch stage" toggle edits the vertex or fragment Supir in one editor; Compile
+      builds and links both. The vertex's MVP push constant becomes an opaquely-named `uniform` struct; since
+      the dasum GL binding can't enumerate uniforms, `SupirShaderCompiler` recovers the matrix uniform name from
+      the generated GLSL and the renderer sets it each frame. The two Supir stages link by varying location.
+- [x] Export…: writes both stages to a native-dialog-picked folder (NFD from `dasum-natives`) as
+      `shader.{vert,frag}.{spv,spvasm,glsl,hlsl,metal}` — SPIR-V binary + assembly (`spirv-dis`) +
+      GLSL/HLSL/Metal (`spirv-cross`). OpenCL C isn't a spirv-cross target; the `.spv` feeds OpenCL 2.1+
+      runtimes. (`SupirShaderCompiler.exportStage` + `ShaderExport`.)
 
 ---
 

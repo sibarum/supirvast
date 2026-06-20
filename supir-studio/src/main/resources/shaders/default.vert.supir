@@ -1,0 +1,30 @@
+; Default vertex shader, written in Supir — the textual form of the core IR.
+; It transforms the model by the per-frame MVP matrix (a push constant set by the
+; orbit camera) and forwards world-space position, normal, and uv to the fragment
+; stage. The studio's model matrix is identity (the camera orbits a still model),
+; so world position and normal are just the incoming attributes.
+;
+; The varyings' locations are the contract the fragment stage binds against.
+
+vertex main {
+  in aPosition: vec3 @loc 0
+  in aNormal: vec3 @loc 1
+  in aUv: vec2 @loc 2
+  out vWorldPos: vec3 @loc 0
+  out vWorldNormal: vec3 @loc 1
+  out vUv: vec2 @loc 2
+  push mvp: mat4
+
+  ; gl_Position = mvp * vec4(aPosition, 1.0)
+  px = extract aPosition, 0
+  py = extract aPosition, 1
+  pz = extract aPosition, 2
+  p4 = vec4 px, py, pz, 1.0
+  clip = mtimes mvp, p4
+  Position = clip
+
+  vWorldPos = aPosition
+  vWorldNormal = aNormal
+  vUv = aUv
+  ret
+}

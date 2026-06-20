@@ -1,0 +1,34 @@
+; Default fragment shader, written in Supir — the textual form of the core IR.
+; Edit it and press Compile: the studio parses it to core IR, lowers to SPIR-V,
+; cross-compiles to GLSL 330, and links it into the live program.
+;
+; Supir is a flat assembly: one op per line, every intermediate named, operands
+; are atoms (no nested expressions). `vWorldNormal` is the world-space normal
+; varying from the fixed vertex stage, bound here by location.
+
+fragment main {
+  in vWorldNormal: vec3 @loc 1
+  out fragColor: vec4 @loc 0
+
+  ; lit normal-as-colour shading: base = 0.5 + 0.5*n, scaled by ambient + diffuse
+  n = normalize vWorldNormal
+
+  ldir = vec3 0.4, 0.8, 0.6
+  light = normalize ldir
+  ndotl = dot n, light
+  diffuse = max ndotl, 0.0
+  lit = add diffuse, 0.25            ; + ambient
+
+  nx = extract n, 0
+  ny = extract n, 1
+  nz = extract n, 2
+  r = fma nx, 0.5, 0.5               ; 0.5 + 0.5*n, per component
+  g = fma ny, 0.5, 0.5
+  b = fma nz, 0.5, 0.5
+
+  cr = mul r, lit
+  cg = mul g, lit
+  cb = mul b, lit
+  fragColor = vec4 cr, cg, cb, 1.0
+  ret
+}

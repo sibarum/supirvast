@@ -129,11 +129,29 @@ public final class NativeTools {
 
     /** Cross-compiles a SPIR-V module to the given high-level language with {@code spirv-cross}. */
     public String crossCompile(byte[] spirv, ShaderLanguage language) {
+        return crossCompile(spirv, language, 0);
+    }
+
+    /**
+     * Cross-compiles a SPIR-V module to the given high-level language with {@code spirv-cross}. For
+     * {@link ShaderLanguage#GLSL}, a positive {@code glslVersion} targets that desktop {@code #version}
+     * (e.g. {@code 330} for OpenGL 3.3, which can't ingest SPIR-V directly); {@code --no-es} forces the
+     * desktop profile. A non-positive version, or any non-GLSL target, uses spirv-cross's default.
+     */
+    public String crossCompile(byte[] spirv, ShaderLanguage language, int glslVersion) {
         Path module = writeTempModule(spirv);
         try {
             List<String> command = new ArrayList<>(List.of(toolPath("spirv-cross").toString(), module.toString()));
             switch (language) {
-                case GLSL -> { /* default output */ }
+                case GLSL -> {
+                    if (glslVersion > 0) {
+                        // --separate-shader-objects emits explicit location qualifiers on stage I/O
+                        // (via GL_ARB_separate_shader_objects), so interstage varyings match by location
+                        // even at #version 330, where layout(location=) on varyings isn't core.
+                        command.addAll(List.of("--version", Integer.toString(glslVersion), "--no-es",
+                                "--separate-shader-objects"));
+                    }
+                }
                 // Shader Model 5.0 (DX11) is the baseline for modern HLSL: it supports compute/UAVs and
                 // system-value semantics like SV_VertexID, which the default SM 3.0 rejects.
                 case HLSL -> command.addAll(List.of("--hlsl", "--shader-model", "50"));

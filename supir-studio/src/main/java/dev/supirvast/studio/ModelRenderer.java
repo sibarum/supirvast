@@ -48,7 +48,6 @@ import static sibarum.dasum.gui.natives.gl.Gl.GL_UNSIGNED_INT;
 public final class ModelRenderer implements AutoCloseable {
 
     private final Geometry geometry;
-    private final String vertexSource;
 
     private boolean glInitialised = false;
     private int vao;
@@ -57,11 +56,14 @@ public final class ModelRenderer implements AutoCloseable {
 
     /** The live program; -1 until the first successful build. */
     private int program = -1;
-    private int uModelLoc = -1;
+    /** Location of the MVP matrix uniform in {@link #program}, or -1 if absent/not yet built. */
     private int uMvpLoc = -1;
 
-    /** Fragment source backing {@link #program}; the last source that compiled. */
+    /** GLSL sources backing {@link #program} — the last pair that compiled. Both stages are swappable. */
+    private String activeVertexSource;
     private String activeFragmentSource;
+    /** GL name of the MVP uniform in {@link #activeVertexSource} (spirv-cross names it opaquely). */
+    private String mvpUniformName;
 
     private final Matrix4f model = new Matrix4f();
     private final Matrix4f view = new Matrix4f();
@@ -87,13 +89,16 @@ public final class ModelRenderer implements AutoCloseable {
 
     /**
      * @param geometry         the model to draw (interleaved pos/normal/uv)
-     * @param vertexSource     the fixed vertex-shader GLSL; never swapped
+     * @param initialVertex    the vertex-shader GLSL to build the first program from
      * @param initialFragment  the fragment GLSL to build the first program from
+     * @param mvpUniformName   GL name of the MVP matrix uniform in {@code initialVertex} (set each frame)
      */
-    public ModelRenderer(Geometry geometry, String vertexSource, String initialFragment) {
+    public ModelRenderer(Geometry geometry, String initialVertex, String initialFragment,
+                         String mvpUniformName) {
         this.geometry = geometry;
-        this.vertexSource = vertexSource;
+        this.activeVertexSource = initialVertex;
         this.activeFragmentSource = initialFragment;
+        this.mvpUniformName = mvpUniformName;
     }
 
     /** Adapter to the framework's custom-renderer hook. */
@@ -139,29 +144,34 @@ public final class ModelRenderer implements AutoCloseable {
     }
 
     /**
-     * Recompile the program from {@code fragmentSource} + the fixed vertex
-     * shader and, on success, swap it in as the live program (deleting the old
-     * one). On failure the live program is left untouched.
+     * Recompile the program from the given vertex + fragment GLSL and, on
+     * success, swap it in as the live program (deleting the old one). On failure
+     * the live program is left untouched. {@code mvpUniformName} is the GL name
+     * of the MVP matrix uniform in {@code vertexGlsl} (set each frame).
      *
      * @return a {@link CompileResult} carrying success/failure and the log
      */
-    public CompileResult recompile(String fragmentSource) {
+    public CompileResult recompile(String vertexGlsl, String fragmentGlsl, String mvpUniformName) {
         if (!glInitialised) {
             // Defer: the program is (re)built lazily inside the first render
             // pass, once a GL context + Gl.load() are guaranteed. Stash the
-            // requested source so that first build uses it.
-            this.activeFragmentSource = fragmentSource;
+            // requested sources so that first build uses them.
+            this.activeVertexSource = vertexGlsl;
+            this.activeFragmentSource = fragmentGlsl;
+            this.mvpUniformName = mvpUniformName;
             return CompileResult.ok("Queued; compiles on first frame.");
         }
         int newProgram;
         try {
-            newProgram = ShaderUtil.buildProgram(vertexSource, fragmentSource);
+            newProgram = ShaderUtil.buildProgram(vertexGlsl, fragmentGlsl);
         } catch (RuntimeException e) {
             return CompileResult.failure(messageOf(e));
         }
         if (program != -1) Gl.glDeleteProgram(program);
         program = newProgram;
-        activeFragmentSource = fragmentSource;
+        activeVertexSource = vertexGlsl;
+        activeFragmentSource = fragmentGlsl;
+        this.mvpUniformName = mvpUniformName;
         cacheUniformLocations();
         return CompileResult.ok("Compiled OK.");
     }
@@ -174,7 +184,6 @@ public final class ModelRenderer implements AutoCloseable {
             updateMatrices(rect);
 
             Gl.glUseProgram(program);
-            if (uModelLoc >= 0) Gl.glUniformMatrix4fv(uModelLoc, false, model.get(matrixScratch));
             if (uMvpLoc >= 0) Gl.glUniformMatrix4fv(uMvpLoc, false, mvp.get(matrixScratch));
 
             Gl.glBindVertexArray(vao);
@@ -236,7 +245,7 @@ public final class ModelRenderer implements AutoCloseable {
         // surfaced the same way edits are — but the bundled default must
         // compile, so a failure means a packaging bug.
         try {
-            program = ShaderUtil.buildProgram(vertexSource, activeFragmentSource);
+            program = ShaderUtil.buildProgram(activeVertexSource, activeFragmentSource);
             cacheUniformLocations();
         } catch (RuntimeException e) {
             System.err.println("Initial shader build failed: " + messageOf(e));
@@ -244,8 +253,8 @@ public final class ModelRenderer implements AutoCloseable {
     }
 
     private void cacheUniformLocations() {
-        uModelLoc = Gl.glGetUniformLocation(program, "uModel");
-        uMvpLoc = Gl.glGetUniformLocation(program, "uMvp");
+        uMvpLoc = (mvpUniformName == null || mvpUniformName.isBlank())
+                ? -1 : Gl.glGetUniformLocation(program, mvpUniformName);
     }
 
     private static String messageOf(RuntimeException e) {
