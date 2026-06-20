@@ -30,6 +30,8 @@
         <module>vastir-preview</module>
         <!-- PBR surface-shader authoring: pick channels + a surface function, generate a lit shader pair. -->
         <module>vastir-pbr</module>
+        <!-- Supir: the textual form of the core IR (flat assembly), parsed/printed two-way. Depends on vastir. -->
+        <module>supir</module>
         <!-- Live shader-playground GUI (dasumGUIshi/OpenGL): edit a shader, compile, preview a model. -->
         <module>supir-studio</module>
     </modules>
@@ -67,6 +69,13 @@
             <dependency>
                 <groupId>dev.supirvast</groupId>
                 <artifactId>vastir</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+
+            <!-- Reactor-internal dependency: the Supir front end (and, later, supir-studio) consumes supir. -->
+            <dependency>
+                <groupId>dev.supirvast</groupId>
+                <artifactId>supir</artifactId>
                 <version>${project.version}</version>
             </dependency>
 

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>dev.supirvast</groupId>
+        <artifactId>supir-vast</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>supir</artifactId>
+
+    <name>Supir-Vast :: supir</name>
+    <description>
+        The Supir surface language: a small S-expression front end whose forms map 1:1 to the core IR. A simple
+        hand-written lexer/reader and a direct lowering to a CoreModule — a reference front end, not an
+        optimizing compiler. Depends only on vastir; testable headlessly with no native toolchain.
+    </description>
+
+    <!-- Only the core IR is needed to produce a CoreModule. Inherits the JUnit test stack from the parent. -->
+    <dependencies>
+        <dependency>
+            <groupId>dev.supirvast</groupId>
+            <artifactId>vastir</artifactId>
+        </dependency>
+    </dependencies>
+</project>
