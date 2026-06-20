@@ -13,9 +13,9 @@ import sibarum.dasum.gui.core.input.FocusState;
 import sibarum.dasum.gui.core.input.Handlers;
 import sibarum.dasum.gui.core.input.HoverState;
 import sibarum.dasum.gui.core.input.InputState;
-import sibarum.dasum.gui.core.input.ScrollStates;
 import sibarum.dasum.gui.core.input.TextInputController;
 import sibarum.dasum.gui.core.input.TextStates;
+import sibarum.dasum.gui.core.input.wheel.WheelRouter;
 import sibarum.dasum.gui.core.layout.HitTest;
 import sibarum.dasum.gui.core.layout.LatestLayout;
 import sibarum.dasum.gui.core.layout.Layout;
@@ -77,8 +77,12 @@ public final class Studio {
     private static final Color EDITOR_FG     = new Color(0.85f, 0.90f, 0.85f, 1f);
     private static final Color STATUS_FG     = new Color(0.70f, 0.78f, 0.88f, 1f);
 
-    /** Pixels scrolled per wheel detent for page/editor scroll (matches the demo). */
-    private static final float WHEEL_PIXELS_PER_STEP = 40f;
+    /**
+     * Priority for the viewport-zoom wheel handler, above the router's
+     * built-in DataTable handler ({@link WheelRouter#PRIORITY_DATATABLE}) —
+     * matching the value dasum-vis's SceneViewController uses.
+     */
+    private static final int WHEEL_PRIORITY = 100;
 
     /** Press target for click dispatch; cleared on release (mirrors the demo). */
     private static Component pressTarget = null;
@@ -257,11 +261,14 @@ public final class Studio {
 
     /**
      * Whether the point {@code (x, y)} falls inside the scene viewport's latest
-     * laid-out rect. dasum-core has no per-leaf drag/scroll handler registry —
+     * laid-out rect. dasum-core has no per-leaf <em>drag</em> handler registry —
      * {@link Handlers} only carries click/focus/blur — so the studio hit-tests
-     * the raw GLFW callbacks against the SceneView's rect itself (the same
-     * approach dasum-vis's {@code SceneViewController} takes, minus its
-     * SceneStates camera model which this renderer doesn't use).
+     * the raw GLFW cursor/button callbacks against the SceneView's rect itself
+     * for orbiting. Wheel zoom no longer hit-tests a raw callback: it rides the
+     * framework {@link WheelRouter} and reuses this same rect test to decide
+     * whether to claim the wheel. Same approach as dasum-vis's
+     * {@code SceneViewController}, minus its SceneStates camera model (this
+     * renderer doesn't use it) and its focus-gating (this app zooms on hover).
      */
     private static boolean overScene(Ui ui, double x, double y) {
         LayoutResult lr = LatestLayout.result();
@@ -277,11 +284,12 @@ public final class Studio {
      * node-editor / table / overlay / tooltip controllers from the demo are
      * intentionally omitted — this app has none of those widgets.
      *
-     * <p>Camera input is hit-tested against the SceneView rect directly:
-     * left-drag that starts over the viewport orbits the camera, and the
-     * scroll wheel zooms while the cursor is over it. Each only redraws (via
-     * {@link Invalidator#invalidate}) when the camera actually changed, so the
-     * idle viewport stays idle.
+     * <p>Camera input is hit-tested against the SceneView rect: left-drag that
+     * starts over the viewport orbits the camera (raw GLFW cursor/button
+     * callbacks), and a {@link WheelRouter} handler zooms while the cursor is
+     * over it — declining otherwise so the router scrolls the editor. Each only
+     * redraws (via {@link Invalidator#invalidate}) when the camera actually
+     * changed, so the idle viewport stays idle.
      */
     private static void wireInput(Window window, Ui ui, ModelRenderer renderer) {
         GlfwCallbacks.setKeyListener((win, key, scancode, action, mods) -> {
@@ -337,43 +345,22 @@ public final class Studio {
             TextInputController.onCursorMove(hit, x, y);
         });
 
-        GlfwCallbacks.setScrollListener((win, xOff, yOff) -> {
-            // Scroll over the viewport zooms the camera. Hit-tested to the
-            // rect so the wheel only zooms when the cursor is actually over
-            // the scene; redraw only when the distance changed (clamp no-op).
-            // The wheel is then CONSUMED — over the viewport it's a zoom, not
-            // a page scroll.
-            if (overScene(ui, InputState.mouseX(), InputState.mouseY())) {
-                if (renderer.zoom(yOff)) {
-                    Invalidator.invalidate();
-                }
-                return;
+        // Camera zoom rides on the framework's WheelRouter instead of owning
+        // the GLFW scroll callback. Window.create installs the router (it owns
+        // the single scroll listener and routes the wheel to scroll containers
+        // — the editor's Component.Scroll included — automatically), so this
+        // app only *adds* a handler for its viewport zoom. Over the scene the
+        // handler consumes the wheel (returns true) and dollies the camera;
+        // anywhere else it declines (returns false) and the router's built-in
+        // terminal step scrolls the editor. No more clobbering dasum's own
+        // scroll dispatch by replacing the listener.
+        WheelRouter.addHandler(WHEEL_PRIORITY, e -> {
+            if (!overScene(ui, e.mouseXPx(), e.mouseYPx())) return false;
+            // Redraw only when the distance actually changed (clamp no-op).
+            if (renderer.zoom(e.rawYOff())) {
+                Invalidator.invalidate();
             }
-
-            // Anywhere else the wheel delegates to the framework's normal
-            // scroll routing, exactly like dasum-mvp-demo's App: walk the
-            // scroll chain innermost→outermost and let the first container
-            // that actually moves consume the wheel. This is what scrolls the
-            // editor (it's wrapped in a Component.Scroll). Without this the
-            // earlier zoom-only listener clobbered the framework's dispatch
-            // and every scrollable component — the editor included — got
-            // nothing.
-            LayoutResult lr = LatestLayout.result();
-            Component root = LatestLayout.root();
-            if (lr == null || root == null) return;
-            float mx = (float) InputState.mouseX();
-            float my = (float) InputState.mouseY();
-            // Vertical wheel scrolls vertically; the horizontal axis is left
-            // at zero (no shift-to-pan in this app). Sign matches the demo:
-            // wheel-up (+yOff) scrolls content up toward its start.
-            float dy = -(float) yOff * WHEEL_PIXELS_PER_STEP;
-            float dx = -(float) xOff * WHEEL_PIXELS_PER_STEP;
-            for (Component.Scroll s : HitTest.findScrollChain(root, lr, mx, my)) {
-                if (ScrollStates.of(s).scrollByPx(dx, dy)) {
-                    Invalidator.invalidate();
-                    break;
-                }
-            }
+            return true;
         });
 
         GlfwCallbacks.setMouseButtonListener((win, button, action, mods) -> {
