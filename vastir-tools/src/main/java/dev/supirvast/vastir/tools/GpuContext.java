@@ -19,6 +19,7 @@ import org.lwjgl.vulkan.VkDescriptorSetLayoutCreateInfo;
 import org.lwjgl.vulkan.VkDevice;
 import org.lwjgl.vulkan.VkDeviceCreateInfo;
 import org.lwjgl.vulkan.VkDeviceQueueCreateInfo;
+import org.lwjgl.vulkan.VkFenceCreateInfo;
 import org.lwjgl.vulkan.VkInstance;
 import org.lwjgl.vulkan.VkInstanceCreateInfo;
 import org.lwjgl.vulkan.VkMemoryAllocateInfo;
@@ -55,25 +56,40 @@ import static org.lwjgl.vulkan.VK13.*;
  * <p>Headless compute only; requires Vulkan 1.3 (to consume SPIR-V 1.6). Per-dispatch storage buffers are
  * still allocated and freed each call (persistent/ring buffers are a later, streaming-oriented step); the win
  * here is eliminating instance/device/pipeline rebuild, which dominates the cost.
+ *
+ * <p><b>Concurrency.</b> {@link #dispatch} is synchronous (submit then wait). For overlapping work,
+ * {@link #submitAsync} records + submits a dispatch against a fence <em>without</em> blocking and returns a
+ * {@link Submission}; {@link #await} then blocks on that fence and reads the results back. Several
+ * submissions can be in flight at once, distributed round-robin over the device's compute queues, so their
+ * device execution (and host readback) overlaps. Recording is <em>not</em> internally synchronized: like
+ * the rest of this context, {@code submitAsync}/{@code await} must be called from the owning thread (one
+ * command pool, serialized recording); the overlap that buys you is on the <em>device</em>, across queues.
+ * A given kernel has a single descriptor set, so it may have only <em>one</em> submission in flight at a
+ * time — {@code submitAsync} throws if a second targets an already-pending kernel (distinct kernels run
+ * concurrently freely). That is exactly enough for "launch N different kernels, then await all N".
  */
 public final class GpuContext implements AutoCloseable {
 
     private static final int RESULT_BYTES = Integer.BYTES;
 
+    /** Compute queues to request from the chosen family (capped by what it offers). More ⇒ more overlap. */
+    private static final int MAX_QUEUES = 4;
+
     private final VkInstance instance;
     private final VkPhysicalDevice physical;
     private final VkDevice device;
-    private final VkQueue queue;
+    private final VkQueue[] queues;
+    private int nextQueue;              // round-robin cursor; owning-thread only, no sync needed
     private final int queueFamily;
     private final long commandPool;
     private final Set<Capability> capabilities;
 
-    private GpuContext(VkInstance instance, VkPhysicalDevice physical, VkDevice device, VkQueue queue,
+    private GpuContext(VkInstance instance, VkPhysicalDevice physical, VkDevice device, VkQueue[] queues,
             int queueFamily, long commandPool, Set<Capability> capabilities) {
         this.instance = instance;
         this.physical = physical;
         this.device = device;
-        this.queue = queue;
+        this.queues = queues;
         this.queueFamily = queueFamily;
         this.commandPool = commandPool;
         this.capabilities = capabilities;
@@ -108,11 +124,12 @@ public final class GpuContext implements AutoCloseable {
                 throw new IllegalStateException("no Vulkan compute device available");
             }
             int queueFamily = computeQueueFamily(physical, stack);
+            int queueCount = Math.min(MAX_QUEUES, familyQueueCount(physical, queueFamily, stack));
             Supported supported = querySupported(physical, stack);
-            VkDevice device = createDevice(physical, queueFamily, supported, stack);
-            VkQueue queue = deviceQueue(device, queueFamily, stack);
+            VkDevice device = createDevice(physical, queueFamily, queueCount, supported, stack);
+            VkQueue[] queues = deviceQueues(device, queueFamily, queueCount, stack);
             long commandPool = createCommandPool(device, queueFamily, stack);
-            return new GpuContext(instance, physical, device, queue, queueFamily, commandPool,
+            return new GpuContext(instance, physical, device, queues, queueFamily, commandPool,
                     capabilitySet(supported));
         }
     }
@@ -141,38 +158,87 @@ public final class GpuContext implements AutoCloseable {
      * Storage buffers are allocated and freed within the call; the pipeline is reused.
      */
     public int[][] dispatch(ResidentKernel kernel, int[][] buffers, int groupCountX) {
+        return await(submitAsync(kernel, buffers, groupCountX));
+    }
+
+    /**
+     * Records and submits a dispatch against a fence <em>without</em> waiting, returning a
+     * {@link Submission} for {@link #await}. Several submissions can be outstanding at once — distributed
+     * round-robin over the compute queues — so their device execution and host readback overlap. Must be
+     * called on the owning thread (recording is not internally synchronized). Throws if {@code kernel}
+     * already has a submission in flight: its single descriptor set cannot back two concurrent dispatches
+     * (distinct kernels are free to run concurrently).
+     */
+    public Submission submitAsync(ResidentKernel kernel, int[][] buffers, int groupCountX) {
         if (buffers.length != kernel.bindingCount) {
             throw new IllegalArgumentException("kernel expects " + kernel.bindingCount + " buffers, got "
                     + buffers.length);
         }
+        if (kernel.inFlight) {
+            throw new IllegalStateException("this kernel already has a submission in flight; its single "
+                    + "descriptor set cannot back two concurrent dispatches — await the first, or dispatch a "
+                    + "distinct kernel");
+        }
+        int n = buffers.length;
+        long[] bufferHandles = new long[n];
+        long[] memoryHandles = new long[n];
+        int[] lengths = new int[n];
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            int n = buffers.length;
-            long[] bufferHandles = new long[n];
-            long[] memoryHandles = new long[n];
             for (int i = 0; i < n; i++) {
                 long size = Math.max(RESULT_BYTES, (long) buffers[i].length * Integer.BYTES);
                 bufferHandles[i] = createBuffer(device, size, stack);
                 memoryHandles[i] = allocateAndBind(physical, device, bufferHandles[i], stack);
                 writeInts(device, memoryHandles[i], buffers[i]);
+                lengths[i] = buffers[i].length;
             }
             bindBuffers(device, kernel.descriptorSet, bufferHandles, stack);
 
             VkCommandBuffer cmd = recordDispatch(device, commandPool, kernel.pipeline, kernel.pipelineLayout,
                     kernel.descriptorSet, groupCountX, stack);
-            submitAndWait(queue, cmd, stack);
-
-            int[][] results = new int[n][];
-            for (int i = 0; i < n; i++) {
-                results[i] = readInts(device, memoryHandles[i], buffers[i].length);
-            }
-
-            vkFreeCommandBuffers(device, commandPool, cmd);
-            for (int i = 0; i < n; i++) {
-                vkFreeMemory(device, memoryHandles[i], null);
-                vkDestroyBuffer(device, bufferHandles[i], null);
-            }
-            return results;
+            long fence = createFence(device, stack);
+            VkSubmitInfo submit = VkSubmitInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
+                    .pCommandBuffers(stack.pointers(cmd));
+            check(vkQueueSubmit(nextQueue(), submit, fence), "vkQueueSubmit");
+            kernel.inFlight = true;
+            return new Submission(kernel, cmd, fence, bufferHandles, memoryHandles, lengths);
         }
+    }
+
+    /**
+     * Blocks on {@code submission}'s fence, reads back its output buffers, and frees its per-dispatch
+     * resources (fence, command buffer, storage buffers and memory). Owning-thread only; each submission
+     * is awaited exactly once.
+     */
+    public int[][] await(Submission submission) {
+        if (submission.awaited) {
+            throw new IllegalStateException("submission already awaited");
+        }
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            check(vkWaitForFences(device, stack.longs(submission.fence), true, Long.MAX_VALUE),
+                    "vkWaitForFences");
+        }
+        int n = submission.bufferHandles.length;
+        int[][] results = new int[n][];
+        for (int i = 0; i < n; i++) {
+            results[i] = readInts(device, submission.memoryHandles[i], submission.bufferLengths[i]);
+        }
+        vkDestroyFence(device, submission.fence, null);
+        vkFreeCommandBuffers(device, commandPool, submission.cmd);
+        for (int i = 0; i < n; i++) {
+            vkFreeMemory(device, submission.memoryHandles[i], null);
+            vkDestroyBuffer(device, submission.bufferHandles[i], null);
+        }
+        submission.kernel.inFlight = false;
+        submission.awaited = true;
+        return results;
+    }
+
+    /** Round-robins the compute queues so consecutive submissions can execute on different queues. */
+    private VkQueue nextQueue() {
+        VkQueue q = queues[nextQueue];
+        nextQueue = (nextQueue + 1) % queues.length;
+        return q;
     }
 
     @Override
@@ -192,6 +258,8 @@ public final class GpuContext implements AutoCloseable {
         private final long descriptorPool;
         private final long descriptorSet;
         private final int bindingCount;
+        /** True between {@code submitAsync} and its {@code await} — the one descriptor set is claimed. */
+        private boolean inFlight;
 
         ResidentKernel(VkDevice device, long shaderModule, long setLayout, long pipelineLayout, long pipeline,
                 long descriptorPool, long descriptorSet, int bindingCount) {
@@ -255,6 +323,15 @@ public final class GpuContext implements AutoCloseable {
         return family;
     }
 
+    /** How many queues the given family offers (≥ 1) — the ceiling on how much dispatch overlap we can get. */
+    private static int familyQueueCount(VkPhysicalDevice device, int family, MemoryStack stack) {
+        IntBuffer count = stack.mallocInt(1);
+        vkGetPhysicalDeviceQueueFamilyProperties(device, count, null);
+        VkQueueFamilyProperties.Buffer families = VkQueueFamilyProperties.malloc(count.get(0), stack);
+        vkGetPhysicalDeviceQueueFamilyProperties(device, count, families);
+        return families.get(family).queueCount();
+    }
+
     private static int findComputeQueueFamily(VkPhysicalDevice device, MemoryStack stack) {
         IntBuffer count = stack.mallocInt(1);
         vkGetPhysicalDeviceQueueFamilyProperties(device, count, null);
@@ -268,12 +345,16 @@ public final class GpuContext implements AutoCloseable {
         return -1;
     }
 
-    private static VkDevice createDevice(VkPhysicalDevice physical, int queueFamily, Supported supported,
-            MemoryStack stack) {
+    private static VkDevice createDevice(VkPhysicalDevice physical, int queueFamily, int queueCount,
+            Supported supported, MemoryStack stack) {
+        float[] priorities = new float[queueCount];
+        java.util.Arrays.fill(priorities, 1.0f);
+        // pQueuePriorities(FloatBuffer) also sets queueCount to the buffer's remaining — so this requests
+        // `queueCount` queues from the family (round-robined by submitAsync for overlap).
         VkDeviceQueueCreateInfo.Buffer queues = VkDeviceQueueCreateInfo.calloc(1, stack)
                 .sType(VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO)
                 .queueFamilyIndex(queueFamily)
-                .pQueuePriorities(stack.floats(1.0f));
+                .pQueuePriorities(stack.floats(priorities));
         // Enable exactly the supported features we may emit capabilities for (so emitting OpCapability Int64
         // etc. is actually licensed). Uses the Features2 pNext chain; pEnabledFeatures must then be null.
         VkPhysicalDeviceVulkan12Features features12 = VkPhysicalDeviceVulkan12Features.calloc(stack)
@@ -322,10 +403,14 @@ public final class GpuContext implements AutoCloseable {
         return Set.copyOf(caps);
     }
 
-    private static VkQueue deviceQueue(VkDevice device, int queueFamily, MemoryStack stack) {
+    private static VkQueue[] deviceQueues(VkDevice device, int queueFamily, int queueCount, MemoryStack stack) {
+        VkQueue[] queues = new VkQueue[queueCount];
         PointerBuffer pQueue = stack.mallocPointer(1);
-        vkGetDeviceQueue(device, queueFamily, 0, pQueue);
-        return new VkQueue(pQueue.get(0), device);
+        for (int i = 0; i < queueCount; i++) {
+            vkGetDeviceQueue(device, queueFamily, i, pQueue);
+            queues[i] = new VkQueue(pQueue.get(0), device);
+        }
+        return queues;
     }
 
     private static long createBuffer(VkDevice device, long sizeBytes, MemoryStack stack) {
@@ -522,12 +607,11 @@ public final class GpuContext implements AutoCloseable {
         return cmd;
     }
 
-    private static void submitAndWait(VkQueue queue, VkCommandBuffer cmd, MemoryStack stack) {
-        VkSubmitInfo submit = VkSubmitInfo.calloc(stack)
-                .sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
-                .pCommandBuffers(stack.pointers(cmd));
-        check(vkQueueSubmit(queue, submit, VK_NULL_HANDLE), "vkQueueSubmit");
-        check(vkQueueWaitIdle(queue), "vkQueueWaitIdle");
+    private static long createFence(VkDevice device, MemoryStack stack) {
+        VkFenceCreateInfo info = VkFenceCreateInfo.calloc(stack).sType(VK_STRUCTURE_TYPE_FENCE_CREATE_INFO);
+        LongBuffer pFence = stack.mallocLong(1);
+        check(vkCreateFence(device, info, null, pFence), "vkCreateFence");
+        return pFence.get(0);
     }
 
     private static void check(int result, String operation) {

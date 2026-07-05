@@ -182,6 +182,20 @@ public final class Accelerator implements AutoCloseable {
         return context().dispatch(pipeline, columns, n);
     }
 
+    /** Submits {@code handle}'s preloaded pipeline without waiting; called by {@link KernelHandle#submitAsync}. */
+    Submission submitGpu(KernelHandle handle, int[][] columns, int n) {
+        GpuContext.ResidentKernel pipeline = pipelines.get(handle);
+        if (pipeline == null) {
+            throw new IllegalStateException("no GPU pipeline for this kernel (not preloaded)");
+        }
+        return context().submitAsync(pipeline, columns, n);
+    }
+
+    /** Awaits a {@link #submitGpu} submission and reads its results; called by {@link KernelHandle#await}. */
+    int[][] awaitGpu(Submission submission) {
+        return context().await(submission);
+    }
+
     boolean hasPipeline(KernelHandle handle) {
         return pipelines.containsKey(handle);
     }

@@ -65,6 +65,35 @@ public final class KernelHandle implements Registration, AutoCloseable {
     }
 
     /**
+     * Submits this kernel over {@code n} invocations <em>without waiting</em>, returning a {@link Submission}
+     * to {@link #await}. This is the concurrency path: submit several distinct kernels, then await them all,
+     * and their device execution overlaps (round-robined across the device's compute queues). Unlike
+     * {@link #run} it is <b>GPU-only</b> — it throws when no resident pipeline backs this handle, since the
+     * CPU fallback is synchronous; use {@link #run} for the backend-portable path, and check
+     * {@link #preferredBackend()} first if unsure.
+     *
+     * <p>Owning-thread only, and a given handle may have only one submission in flight at a time (its single
+     * descriptor set) — a second {@code submitAsync} before {@link #await} throws. Distinct handles run
+     * concurrently freely. Does not mutate the caller's arrays.
+     */
+    public Submission submitAsync(int[][] columns, int n) {
+        validate(columns, n);
+        if (!onGpu()) {
+            throw new IllegalStateException("submitAsync is GPU-only (no resident pipeline for this kernel); "
+                    + "use run() for the backend-portable path");
+        }
+        return accelerator.submitGpu(this, columns, n);
+    }
+
+    /**
+     * Blocks until {@code submission} (from this handle's {@link #submitAsync}) completes and returns its
+     * fresh output columns, freeing the dispatch's device resources. Each submission is awaited exactly once.
+     */
+    public int[][] await(Submission submission) {
+        return accelerator.awaitGpu(submission);
+    }
+
+    /**
      * Releases this kernel's resident GPU pipeline, reclaiming its device resources without affecting the
      * accelerator's context or any other kernel — {@link Accelerator#release(KernelHandle)} for one
      * handle. Idempotent (a no-op once released or for a CPU-only handle). After close the kernel is

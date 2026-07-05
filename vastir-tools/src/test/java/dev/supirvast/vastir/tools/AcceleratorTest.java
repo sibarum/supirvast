@@ -18,7 +18,9 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeFalse;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
@@ -151,6 +153,53 @@ class AcceleratorTest {
             // Re-registering restores a resident GPU pipeline where a device is present.
             KernelHandle again = accelerator.register(vectorAddSpec()).orElseThrow();
             assertEquals(onGpu, accelerator.hasPipeline(again), "re-register rebuilds the pipeline on a GPU");
+        }
+    }
+
+    @Test
+    void submitAsyncRunsTwoKernelsConcurrentlyAndAwaitsBoth() {
+        int n = 8;
+        int[] a = {0, 1, 2, 3, 4, 5, 6, 7};
+        int[] b = {10, 20, 30, 40, 50, 60, 70, 80};
+        int[] sum = new int[n];
+        int[] doubled = new int[n];
+        for (int i = 0; i < n; i++) {
+            sum[i] = a[i] + b[i];
+            doubled[i] = a[i] * 2;
+        }
+
+        try (Accelerator accelerator = new Accelerator()) {
+            assumeTrue(accelerator.capabilities().gpuAvailable(), "submitAsync is the GPU concurrency path");
+            KernelHandle add = accelerator.register(vectorAddSpec()).orElseThrow();
+            KernelHandle twice = accelerator.register(doubleSpec()).orElseThrow();
+
+            // Launch both without blocking — they are now in flight together, on (round-robined) queues.
+            Submission addRun = add.submitAsync(new int[][] {new int[n], a.clone(), b.clone()}, n);
+            Submission twiceRun = twice.submitAsync(new int[][] {new int[n], a.clone()}, n);
+
+            // A handle may not have two submissions in flight (single descriptor set) — fail loud, not corrupt.
+            assertThrows(IllegalStateException.class,
+                    () -> add.submitAsync(new int[][] {new int[n], a.clone(), b.clone()}, n),
+                    "a second in-flight submission of the same kernel must be rejected");
+
+            // Await both; results are correct regardless of completion order.
+            assertArrayEquals(sum, add.await(addRun)[0], "concurrent vector-add");
+            assertArrayEquals(doubled, twice.await(twiceRun)[0], "concurrent double");
+
+            // Once awaited, the kernel is free to be submitted again (in flight cleared).
+            assertArrayEquals(sum, add.await(add.submitAsync(new int[][] {new int[n], a.clone(), b.clone()}, n))[0],
+                    "the handle is reusable after its prior submission was awaited");
+        }
+    }
+
+    @Test
+    void submitAsyncIsRejectedWithoutAGpu() {
+        try (Accelerator accelerator = new Accelerator()) {
+            assumeFalse(accelerator.capabilities().gpuAvailable(), "this checks the no-GPU guard");
+            KernelHandle add = accelerator.register(vectorAddSpec()).orElseThrow();
+            assertThrows(IllegalStateException.class,
+                    () -> add.submitAsync(new int[][] {new int[8], new int[8], new int[8]}, 8),
+                    "submitAsync must refuse the CPU-only path and point at run()");
         }
     }
 
