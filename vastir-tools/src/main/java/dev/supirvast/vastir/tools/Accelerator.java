@@ -150,6 +150,27 @@ public final class Accelerator implements AutoCloseable {
         }
     }
 
+    /**
+     * Releases the resident GPU pipeline for a single {@code handle} — its shader module, pipeline,
+     * layouts and descriptor pool — reclaiming that device memory without tearing down the context or
+     * any other kernel. Returns whether a pipeline was actually held ({@code false} for a CPU-only
+     * handle, or one already released). After release the handle is <em>degraded, not dead</em>:
+     * {@link KernelHandle#run} still works, falling back to the proven-equivalent CPU path; call
+     * {@link #register} again to get a resident GPU pipeline back.
+     *
+     * <p>Like {@link #register} and {@link KernelHandle#run}, this touches the context's native state
+     * and must be called on the accelerator's owning thread, and not while a run of {@code handle} is in
+     * flight (the pipeline it is executing would be destroyed underneath it).
+     */
+    public boolean release(KernelHandle handle) {
+        GpuContext.ResidentKernel pipeline = pipelines.remove(handle);
+        if (pipeline == null) {
+            return false;
+        }
+        pipeline.close();
+        return true;
+    }
+
     // --- internals -------------------------------------------------------------------------------------
 
     /** Dispatches {@code handle}'s preloaded pipeline against the columns; called by {@link KernelHandle}. */

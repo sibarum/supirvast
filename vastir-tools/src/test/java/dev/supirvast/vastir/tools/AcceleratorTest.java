@@ -123,6 +123,38 @@ class AcceleratorTest {
     }
 
     @Test
+    void releaseFreesOnePipelineButLeavesTheKernelRunnableOnCpu() {
+        int n = 8;
+        int[] a = {0, 1, 2, 3, 4, 5, 6, 7};
+        int[] b = {10, 20, 30, 40, 50, 60, 70, 80};
+        int[] sum = new int[n];
+        for (int i = 0; i < n; i++) {
+            sum[i] = a[i] + b[i];
+        }
+
+        try (Accelerator accelerator = new Accelerator()) {
+            KernelHandle add = accelerator.register(vectorAddSpec()).orElseThrow();
+            boolean onGpu = accelerator.capabilities().gpuAvailable();
+            assertEquals(onGpu, accelerator.hasPipeline(add), "a resident pipeline exists iff a GPU preloaded it");
+
+            // Per-handle release reclaims just this kernel's pipeline — true only when one was held.
+            assertEquals(onGpu, accelerator.release(add), "release frees a pipeline only when one was held");
+            assertFalse(accelerator.hasPipeline(add), "after release no resident pipeline remains for this handle");
+            assertFalse(accelerator.release(add), "release is idempotent — nothing left to free");
+            add.close();  // the handle-side alias is also a safe no-op once released
+
+            // Degraded, not dead: a released kernel still computes, via the proven-equivalent CPU path.
+            assertEquals(KernelHandle.Backend.CPU, add.preferredBackend(), "no pipeline ⇒ run falls back to CPU");
+            assertArrayEquals(sum, add.run(new int[][] {new int[n], a.clone(), b.clone()}, n)[0],
+                    "a released kernel still runs correctly on the CPU fallback");
+
+            // Re-registering restores a resident GPU pipeline where a device is present.
+            KernelHandle again = accelerator.register(vectorAddSpec()).orElseThrow();
+            assertEquals(onGpu, accelerator.hasPipeline(again), "re-register rebuilds the pipeline on a GPU");
+        }
+    }
+
+    @Test
     void runsFloatColumnsThroughTheFacade() {
         Type.Float f32 = Type.float32();
         Buffer out = new Buffer("out", 0, f32);

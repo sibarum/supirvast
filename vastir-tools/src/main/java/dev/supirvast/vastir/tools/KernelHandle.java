@@ -15,7 +15,7 @@ import java.util.List;
  * <p>Data is struct-of-arrays: {@code columns[i]} is the buffer bound at binding {@code i} (its
  * {@link KernelColumn}), holding one i32 per invocation. {@link #run} never mutates the caller's arrays.
  */
-public final class KernelHandle implements Registration {
+public final class KernelHandle implements Registration, AutoCloseable {
 
     /** Which backend executed a run. The two are proven equivalent, so the choice never changes results. */
     public enum Backend { GPU, CPU }
@@ -62,6 +62,18 @@ public final class KernelHandle implements Registration {
     /** The backend {@link #run} would choose right now (GPU if a pipeline was preloaded for it, else CPU). */
     public Backend preferredBackend() {
         return onGpu() ? Backend.GPU : Backend.CPU;
+    }
+
+    /**
+     * Releases this kernel's resident GPU pipeline, reclaiming its device resources without affecting the
+     * accelerator's context or any other kernel — {@link Accelerator#release(KernelHandle)} for one
+     * handle. Idempotent (a no-op once released or for a CPU-only handle). After close the kernel is
+     * degraded, not dead: {@link #run} still works via the equivalent CPU path. Must be called on the
+     * accelerator's owning thread and not while a run of this kernel is in flight.
+     */
+    @Override
+    public void close() {
+        accelerator.release(this);
     }
 
     /** GPU only when a device is present <em>and</em> this kernel's pipeline was preloaded (caps fit). */
