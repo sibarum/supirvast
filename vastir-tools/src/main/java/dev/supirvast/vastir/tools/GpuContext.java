@@ -145,10 +145,10 @@ public final class GpuContext implements AutoCloseable {
             long setLayout = createSetLayout(device, bindingCount, stack);
             long pipelineLayout = createPipelineLayout(device, setLayout, stack);
             long pipeline = createComputePipeline(device, pipelineLayout, shaderModule, entryPoint, stack);
-            long descriptorPool = createDescriptorPool(device, bindingCount, stack);
-            long descriptorSet = allocateDescriptorSet(device, descriptorPool, setLayout, stack);
-            return new ResidentKernel(device, shaderModule, setLayout, pipelineLayout, pipeline,
-                    descriptorPool, descriptorSet, bindingCount);
+            // The pipeline/layouts are immutable and safe to share across concurrent dispatches; the
+            // mutable binding state (the descriptor set) is allocated PER submission instead, so one
+            // pipeline can back several in-flight dispatches at once (see submitAsync).
+            return new ResidentKernel(device, shaderModule, setLayout, pipelineLayout, pipeline, bindingCount);
         }
     }
 
@@ -164,20 +164,14 @@ public final class GpuContext implements AutoCloseable {
     /**
      * Records and submits a dispatch against a fence <em>without</em> waiting, returning a
      * {@link Submission} for {@link #await}. Several submissions can be outstanding at once — distributed
-     * round-robin over the compute queues — so their device execution and host readback overlap. Must be
-     * called on the owning thread (recording is not internally synchronized). Throws if {@code kernel}
-     * already has a submission in flight: its single descriptor set cannot back two concurrent dispatches
-     * (distinct kernels are free to run concurrently).
+     * round-robin over the compute queues — so their device execution and host readback overlap, including
+     * several concurrent dispatches of the <em>same</em> pipeline (each gets its own descriptor set and
+     * buffers). Must be called on the owning thread (recording is not internally synchronized).
      */
     public Submission submitAsync(ResidentKernel kernel, int[][] buffers, int groupCountX) {
         if (buffers.length != kernel.bindingCount) {
             throw new IllegalArgumentException("kernel expects " + kernel.bindingCount + " buffers, got "
                     + buffers.length);
-        }
-        if (kernel.inFlight) {
-            throw new IllegalStateException("this kernel already has a submission in flight; its single "
-                    + "descriptor set cannot back two concurrent dispatches — await the first, or dispatch a "
-                    + "distinct kernel");
         }
         int n = buffers.length;
         long[] bufferHandles = new long[n];
@@ -191,24 +185,27 @@ public final class GpuContext implements AutoCloseable {
                 writeInts(device, memoryHandles[i], buffers[i]);
                 lengths[i] = buffers[i].length;
             }
-            bindBuffers(device, kernel.descriptorSet, bufferHandles, stack);
+            // A fresh descriptor set PER submission (from a per-submission pool) — the mutable binding
+            // state that must be independent for concurrent dispatches. Freed with its pool in await().
+            long descriptorPool = createDescriptorPool(device, kernel.bindingCount, stack);
+            long descriptorSet = allocateDescriptorSet(device, descriptorPool, kernel.setLayout, stack);
+            bindBuffers(device, descriptorSet, bufferHandles, stack);
 
             VkCommandBuffer cmd = recordDispatch(device, commandPool, kernel.pipeline, kernel.pipelineLayout,
-                    kernel.descriptorSet, groupCountX, stack);
+                    descriptorSet, groupCountX, stack);
             long fence = createFence(device, stack);
             VkSubmitInfo submit = VkSubmitInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
                     .pCommandBuffers(stack.pointers(cmd));
             check(vkQueueSubmit(nextQueue(), submit, fence), "vkQueueSubmit");
-            kernel.inFlight = true;
-            return new Submission(kernel, cmd, fence, bufferHandles, memoryHandles, lengths);
+            return new Submission(cmd, fence, descriptorPool, bufferHandles, memoryHandles, lengths);
         }
     }
 
     /**
      * Blocks on {@code submission}'s fence, reads back its output buffers, and frees its per-dispatch
-     * resources (fence, command buffer, storage buffers and memory). Owning-thread only; each submission
-     * is awaited exactly once.
+     * resources (fence, command buffer, descriptor pool, storage buffers and memory). Owning-thread only;
+     * each submission is awaited exactly once.
      */
     public int[][] await(Submission submission) {
         if (submission.awaited) {
@@ -225,11 +222,11 @@ public final class GpuContext implements AutoCloseable {
         }
         vkDestroyFence(device, submission.fence, null);
         vkFreeCommandBuffers(device, commandPool, submission.cmd);
+        vkDestroyDescriptorPool(device, submission.descriptorPool, null);
         for (int i = 0; i < n; i++) {
             vkFreeMemory(device, submission.memoryHandles[i], null);
             vkDestroyBuffer(device, submission.bufferHandles[i], null);
         }
-        submission.kernel.inFlight = false;
         submission.awaited = true;
         return results;
     }
@@ -248,34 +245,32 @@ public final class GpuContext implements AutoCloseable {
         vkDestroyInstance(instance, null);
     }
 
-    /** A preloaded compute pipeline, reusable across dispatches. */
+    /**
+     * A preloaded compute pipeline, reusable across dispatches — and across <em>concurrent</em> ones:
+     * it holds only immutable objects (shader/pipeline/layouts), while each dispatch allocates its own
+     * descriptor set and buffers in {@link #submitAsync}. Only {@link #setLayout} is read there, to
+     * allocate those per-submission sets.
+     */
     public static final class ResidentKernel implements AutoCloseable {
         private final VkDevice device;
         private final long shaderModule;
         private final long setLayout;
         private final long pipelineLayout;
         private final long pipeline;
-        private final long descriptorPool;
-        private final long descriptorSet;
         private final int bindingCount;
-        /** True between {@code submitAsync} and its {@code await} — the one descriptor set is claimed. */
-        private boolean inFlight;
 
         ResidentKernel(VkDevice device, long shaderModule, long setLayout, long pipelineLayout, long pipeline,
-                long descriptorPool, long descriptorSet, int bindingCount) {
+                int bindingCount) {
             this.device = device;
             this.shaderModule = shaderModule;
             this.setLayout = setLayout;
             this.pipelineLayout = pipelineLayout;
             this.pipeline = pipeline;
-            this.descriptorPool = descriptorPool;
-            this.descriptorSet = descriptorSet;
             this.bindingCount = bindingCount;
         }
 
         @Override
         public void close() {
-            vkDestroyDescriptorPool(device, descriptorPool, null);
             vkDestroyPipeline(device, pipeline, null);
             vkDestroyPipelineLayout(device, pipelineLayout, null);
             vkDestroyDescriptorSetLayout(device, setLayout, null);

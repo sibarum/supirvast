@@ -14,19 +14,19 @@ import org.lwjgl.vulkan.VkCommandBuffer;
  */
 public final class Submission {
 
-    final GpuContext.ResidentKernel kernel;
     final VkCommandBuffer cmd;
     final long fence;
+    final long descriptorPool;   // this submission's own pool (+ set) — freed in await
     final long[] bufferHandles;
     final long[] memoryHandles;
     final int[] bufferLengths;
     boolean awaited;
 
-    Submission(GpuContext.ResidentKernel kernel, VkCommandBuffer cmd, long fence, long[] bufferHandles,
+    Submission(VkCommandBuffer cmd, long fence, long descriptorPool, long[] bufferHandles,
             long[] memoryHandles, int[] bufferLengths) {
-        this.kernel = kernel;
         this.cmd = cmd;
         this.fence = fence;
+        this.descriptorPool = descriptorPool;
         this.bufferHandles = bufferHandles;
         this.memoryHandles = memoryHandles;
         this.bufferLengths = bufferLengths;

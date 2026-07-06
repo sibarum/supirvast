@@ -177,18 +177,14 @@ class AcceleratorTest {
             Submission addRun = add.submitAsync(new int[][] {new int[n], a.clone(), b.clone()}, n);
             Submission twiceRun = twice.submitAsync(new int[][] {new int[n], a.clone()}, n);
 
-            // A handle may not have two submissions in flight (single descriptor set) — fail loud, not corrupt.
-            assertThrows(IllegalStateException.class,
-                    () -> add.submitAsync(new int[][] {new int[n], a.clone(), b.clone()}, n),
-                    "a second in-flight submission of the same kernel must be rejected");
+            // The SAME pipeline can also have several dispatches in flight at once — each submission gets
+            // its own descriptor set and buffers, so a second submitAsync on `add` is fine (not corrupt).
+            Submission addRun2 = add.submitAsync(new int[][] {new int[n], b.clone(), a.clone()}, n);
 
-            // Await both; results are correct regardless of completion order.
+            // Await all three; results are correct regardless of completion order.
             assertArrayEquals(sum, add.await(addRun)[0], "concurrent vector-add");
             assertArrayEquals(doubled, twice.await(twiceRun)[0], "concurrent double");
-
-            // Once awaited, the kernel is free to be submitted again (in flight cleared).
-            assertArrayEquals(sum, add.await(add.submitAsync(new int[][] {new int[n], a.clone(), b.clone()}, n))[0],
-                    "the handle is reusable after its prior submission was awaited");
+            assertArrayEquals(sum, add.await(addRun2)[0], "a second concurrent dispatch of the same pipeline");
         }
     }
 
