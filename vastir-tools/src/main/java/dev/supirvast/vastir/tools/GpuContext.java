@@ -1,6 +1,7 @@
 package dev.supirvast.vastir.tools;
 
 import org.lwjgl.PointerBuffer;
+import org.lwjgl.system.Configuration;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.VkApplicationInfo;
@@ -69,6 +70,16 @@ import static org.lwjgl.vulkan.VK13.*;
  * concurrently freely). That is exactly enough for "launch N different kernels, then await all N".
  */
 public final class GpuContext implements AutoCloseable {
+
+    static {
+        // LWJGL's VkInstance constructor eagerly builds its capability set by enumerating each physical
+        // device's extensions onto the calling thread's off-heap MemoryStack. VkExtensionProperties is 260
+        // bytes, so a device exposing ~250+ extensions (common on current GPU drivers) needs >64 KB and
+        // overflows LWJGL's default 64 KB stack with "OutOfMemoryError: Out of stack space." — which surfaces
+        // here as a build failure when the GPU tests run. Raise the per-thread stack well above that. This
+        // runs at class initialization, before any static method below materializes a MemoryStack.
+        Configuration.STACK_SIZE.set(512); // KiB per thread; default is 64
+    }
 
     private static final int RESULT_BYTES = Integer.BYTES;
 
