@@ -86,6 +86,33 @@ public final class Fullscreen {
                 .toByteArray();
     }
 
+    /**
+     * A fullscreen-triangle vertex shader that also emits a {@code vUv} varying at {@link #UV_LOCATION} — the
+     * screen-space coordinate spanning {@code [0,1]} across the visible viewport. Pair it with a fragment stage
+     * that shades by {@code vUv} (a 2D field / SDF); the UV replaces the missing {@code gl_FragCoord} builtin.
+     */
+    public static byte[] triangleVertexWithUvSpirv() {
+        Expr idx = new Expr.BuiltinRead(Builtin.VERTEX_INDEX);
+        Expr two = new Expr.ConstInt(Type.int32(), 2);
+        Expr one = new Expr.ConstInt(Type.int32(), 1);
+        Expr ux = new Expr.Convert(new Expr.Binary(BinaryOp.BIT_AND,
+                new Expr.Binary(BinaryOp.SHIFT_LEFT, idx, one), two), F32);   // 0 or 2
+        Expr uy = new Expr.Convert(new Expr.Binary(BinaryOp.BIT_AND, idx, two), F32);
+        Expr clip = new Expr.VectorConstruct(VEC4, List.of(ndc(ux), ndc(uy),
+                new Expr.ConstFloat(F32, 0.0), new Expr.ConstFloat(F32, 1.0)));
+        // vUv carries the raw {0,2} pair; across the visible viewport it interpolates to [0,1].
+        InterfaceVar vUv = InterfaceVar.output("vUv", UV_LOCATION, VEC2);
+        Expr uv = new Expr.VectorConstruct(VEC2, List.of(ux, uy));
+        Region body = Region.of(
+                new Statement.BuiltinWrite(Builtin.POSITION, clip),
+                new Statement.InterfaceWrite(vUv, uv),
+                new Statement.ReturnVoid());
+        Function main = new Function(ENTRY_POINT, new Type.FunctionType(Type.VOID, List.of()), body);
+        return new CoreToSpirv()
+                .lower(new CoreModule().addEntryPoint(EntryPoint.of(main, ShaderStage.VERTEX)))
+                .toByteArray();
+    }
+
     /** {@code fragColor = vec4(r, g, b, a);} — the simplest fragment stage: a flat constant color. */
     public static byte[] constantColorFragmentSpirv(double r, double g, double b, double a) {
         InterfaceVar fragColor = InterfaceVar.output("fragColor", 0, VEC4);
