@@ -1,5 +1,6 @@
 package dev.supirvast.vastir.preview;
 
+import dev.supirvast.vastir.tools.Fullscreen;
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.Configuration;
 import org.lwjgl.system.MemoryStack;
@@ -446,8 +447,13 @@ public final class WindowedVulkanContext implements AutoCloseable {
                 .sType(VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO)
                 .pAttachments(blendAttachment);
 
+        // A fragment push-constant range for the standard per-frame uniforms (resolution, time). Always
+        // declared — a shader that reads them matches this block; one that ignores them simply doesn't.
         VkPipelineLayoutCreateInfo layoutInfo = VkPipelineLayoutCreateInfo.calloc(stack)
-                .sType(VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO);
+                .sType(VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO)
+                .pPushConstantRanges(VkPushConstantRange.calloc(1, stack)
+                        .stageFlags(VK_SHADER_STAGE_FRAGMENT_BIT)
+                        .offset(0).size(Fullscreen.STANDARD_UNIFORM_BYTES));
         LongBuffer pLayout = stack.mallocLong(1);
         check(vkCreatePipelineLayout(device, layoutInfo, null, pLayout), "vkCreatePipelineLayout");
         pipelineLayout = pLayout.get(0);
@@ -521,9 +527,19 @@ public final class WindowedVulkanContext implements AutoCloseable {
                 .pClearValues(clears);
         vkCmdBeginRenderPass(commandBuffer, rpBegin, VK_SUBPASS_CONTENTS_INLINE);
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
+        vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, standardUniforms(stack));
         vkCmdDraw(commandBuffer, 3, 1, 0, 0);   // fullscreen triangle, no vertex buffer
         vkCmdEndRenderPass(commandBuffer);
         check(vkEndCommandBuffer(commandBuffer), "vkEndCommandBuffer");
+    }
+
+    /** The per-frame uniform block the fragment stage reads: {@code vec2 resolution} (0), {@code float time} (8). */
+    private ByteBuffer standardUniforms(MemoryStack stack) {
+        ByteBuffer buffer = stack.malloc(Fullscreen.STANDARD_UNIFORM_BYTES);
+        buffer.putFloat(0, (float) extentWidth);
+        buffer.putFloat(4, (float) extentHeight);
+        buffer.putFloat(8, (float) glfwGetTime());   // seconds since GLFW init — drives animation
+        return buffer;
     }
 
     private void drawFrame() {
