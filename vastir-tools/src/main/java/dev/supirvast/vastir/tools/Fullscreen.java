@@ -7,6 +7,7 @@ import dev.supirvast.vastir.core.EntryPoint;
 import dev.supirvast.vastir.core.Expr;
 import dev.supirvast.vastir.core.Function;
 import dev.supirvast.vastir.core.InterfaceVar;
+import dev.supirvast.vastir.core.PushConstants;
 import dev.supirvast.vastir.core.Region;
 import dev.supirvast.vastir.core.ShaderStage;
 import dev.supirvast.vastir.core.Statement;
@@ -31,6 +32,8 @@ import java.util.List;
 public final class Fullscreen {
 
     private static final Type.Float F32 = Type.float32();
+    private static final Type.Vector VEC2 = new Type.Vector(F32, 2);
+    private static final Type.Vector VEC3 = new Type.Vector(F32, 3);
     private static final Type.Vector VEC4 = new Type.Vector(F32, 4);
 
     private Fullscreen() {
@@ -38,6 +41,24 @@ public final class Fullscreen {
 
     /** The conventional entry-point name both stages here use. */
     public static final String ENTRY_POINT = "main";
+
+    /** The location the UV varying binds in both stages (vertex output, fragment input). */
+    public static final int UV_LOCATION = 0;
+
+    /** Byte size of {@link #STANDARD_UNIFORMS}: {@code vec2 resolution} (8) + {@code float time} (4). */
+    public static final int STANDARD_UNIFORM_BYTES = 12;
+
+    /**
+     * The standard per-frame uniform block a fullscreen effect reads — ShaderToy-style {@code resolution} (the
+     * framebuffer size in pixels) and {@code time} (seconds). The host pushes it every frame; a shader reads
+     * {@code read(0)}/{@code read(1)} or ignores it. std430 offsets: resolution@0, time@8 (see
+     * {@link #STANDARD_UNIFORM_BYTES}).
+     */
+    public static PushConstants standardUniforms() {
+        return new PushConstants(List.of(
+                new PushConstants.Member("resolution", VEC2),
+                new PushConstants.Member("time", F32)));
+    }
 
     /**
      * A vertex shader that emits a fullscreen triangle from {@code gl_VertexIndex} alone (three vertices, no
