@@ -45,7 +45,7 @@
         <junit.version>5.11.4</junit.version>
         <!-- Vulkan compute dispatch (GPU execution) lives in vastir-tools; the windowed previewer
              (vastir-preview) adds GLFW + stb on top of the same LWJGL line. -->
-        <lwjgl.version>3.3.4</lwjgl.version>
+        <lwjgl.version>3.3.6</lwjgl.version>
         <!-- Pure-Java matrix/vector math for the previewer's MVP transform (no natives). -->
         <joml.version>1.10.7</joml.version>
     </properties>
