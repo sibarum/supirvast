@@ -417,15 +417,15 @@ public final class WindowedVulkanContext implements AutoCloseable {
                 .sType(VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO)
                 .topology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
 
-        VkViewport.Buffer viewport = VkViewport.calloc(1, stack)
-                .x(0).y(0).width(extentWidth).height(extentHeight).minDepth(0).maxDepth(1);
-        VkRect2D.Buffer scissor = VkRect2D.calloc(1, stack);
-        scissor.get(0).offset().set(0, 0);
-        scissor.get(0).extent().width(extentWidth).height(extentHeight);
+        // Viewport + scissor are DYNAMIC: set per-frame from the current extent (recordDraw) so the pipeline
+        // survives a window resize — only the swapchain is recreated, not the pipeline.
         VkPipelineViewportStateCreateInfo viewportState = VkPipelineViewportStateCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO)
-                .pViewports(viewport)
-                .pScissors(scissor);
+                .viewportCount(1)
+                .scissorCount(1);
+        VkPipelineDynamicStateCreateInfo dynamicState = VkPipelineDynamicStateCreateInfo.calloc(stack)
+                .sType(VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO)
+                .pDynamicStates(stack.ints(VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR));
 
         VkPipelineRasterizationStateCreateInfo rasterizer = VkPipelineRasterizationStateCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO)
@@ -467,6 +467,7 @@ public final class WindowedVulkanContext implements AutoCloseable {
                 .pRasterizationState(rasterizer)
                 .pMultisampleState(multisample)
                 .pColorBlendState(colorBlend)
+                .pDynamicState(dynamicState)
                 .layout(pipelineLayout)
                 .renderPass(renderPass)
                 .subpass(0);
@@ -527,6 +528,15 @@ public final class WindowedVulkanContext implements AutoCloseable {
                 .pClearValues(clears);
         vkCmdBeginRenderPass(commandBuffer, rpBegin, VK_SUBPASS_CONTENTS_INLINE);
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
+
+        VkViewport.Buffer viewport = VkViewport.calloc(1, stack)
+                .x(0).y(0).width(extentWidth).height(extentHeight).minDepth(0).maxDepth(1);
+        vkCmdSetViewport(commandBuffer, 0, viewport);
+        VkRect2D.Buffer scissor = VkRect2D.calloc(1, stack);
+        scissor.get(0).offset().set(0, 0);
+        scissor.get(0).extent().width(extentWidth).height(extentHeight);
+        vkCmdSetScissor(commandBuffer, 0, scissor);
+
         vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, standardUniforms(stack));
         vkCmdDraw(commandBuffer, 3, 1, 0, 0);   // fullscreen triangle, no vertex buffer
         vkCmdEndRenderPass(commandBuffer);
@@ -545,13 +555,22 @@ public final class WindowedVulkanContext implements AutoCloseable {
     private void drawFrame() {
         try (MemoryStack stack = stackPush()) {
             check(vkWaitForFences(device, stack.longs(inFlight), true, Long.MAX_VALUE), "vkWaitForFences");
-            check(vkResetFences(device, stack.longs(inFlight)), "vkResetFences");
 
             IntBuffer pImageIndex = stack.mallocInt(1);
-            check(vkAcquireNextImageKHR(device, swapchain, Long.MAX_VALUE, imageAvailable, VK_NULL_HANDLE,
-                    pImageIndex), "vkAcquireNextImageKHR");
+            int acquire = vkAcquireNextImageKHR(device, swapchain, Long.MAX_VALUE, imageAvailable,
+                    VK_NULL_HANDLE, pImageIndex);
+            if (acquire == VK_ERROR_OUT_OF_DATE_KHR) {
+                recreateSwapchain();   // window resized; rebuild and skip this frame
+                return;
+            }
+            if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR) {
+                check(acquire, "vkAcquireNextImageKHR");
+            }
             int imageIndex = pImageIndex.get(0);
 
+            // Reset the fence only now that we're committed to submitting — an early return above must leave it
+            // signaled, or the next frame's wait would deadlock.
+            check(vkResetFences(device, stack.longs(inFlight)), "vkResetFences");
             check(vkResetCommandBuffer(commandBuffer, 0), "vkResetCommandBuffer");
             recordDraw(framebuffers[imageIndex], stack);
 
@@ -570,7 +589,41 @@ public final class WindowedVulkanContext implements AutoCloseable {
                     .swapchainCount(1)
                     .pSwapchains(stack.longs(swapchain))
                     .pImageIndices(stack.ints(imageIndex));
-            check(vkQueuePresentKHR(queue, present), "vkQueuePresentKHR");
+            int result = vkQueuePresentKHR(queue, present);
+            if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+                recreateSwapchain();
+            } else {
+                check(result, "vkQueuePresentKHR");
+            }
+        }
+    }
+
+    /**
+     * Rebuilds the swapchain (and its image views + framebuffers) at the window's current size — after a resize
+     * or when the surface goes out of date. The device, render pass, and pipeline are untouched (viewport and
+     * scissor are dynamic). Blocks while the window is minimized (zero-size framebuffer) until it is restored.
+     */
+    private void recreateSwapchain() {
+        try (MemoryStack stack = stackPush()) {
+            IntBuffer w = stack.mallocInt(1);
+            IntBuffer h = stack.mallocInt(1);
+            glfwGetFramebufferSize(window, w, h);
+            while ((w.get(0) == 0 || h.get(0) == 0) && !glfwWindowShouldClose(window)) {
+                glfwWaitEvents();
+                glfwGetFramebufferSize(window, w, h);
+            }
+        }
+        vkDeviceWaitIdle(device);
+        for (long framebuffer : framebuffers) {
+            vkDestroyFramebuffer(device, framebuffer, null);
+        }
+        for (long view : imageViews) {
+            vkDestroyImageView(device, view, null);
+        }
+        destroyIf(swapchain, h -> vkDestroySwapchainKHR(device, h, null));
+        try (MemoryStack stack = stackPush()) {
+            createSwapchain(stack);     // re-queries the surface for the new extent + fresh images/views
+            createFramebuffers(stack);
         }
     }
 
