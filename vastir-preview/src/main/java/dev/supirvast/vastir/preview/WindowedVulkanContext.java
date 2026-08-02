@@ -100,14 +100,31 @@ public final class WindowedVulkanContext implements AutoCloseable {
      */
     public void run(int maxFrames) {
         int rendered = 0;
-        while (!glfwWindowShouldClose(window)) {
-            glfwPollEvents();
-            drawFrame();
+        while (tick()) {
             rendered++;
             if (maxFrames > 0 && rendered >= maxFrames) {
                 break;
             }
         }
+        drain();
+    }
+
+    /**
+     * Advances the window by one frame — polls its events and draws. Returns {@code false} once the window has
+     * been closed. This is the frame-tick a Conductor drives: the context no longer owns the loop, it is a
+     * cadenced step. Pair a run of {@code tick()}s with a final {@link #drain()}.
+     */
+    public boolean tick() {
+        if (glfwWindowShouldClose(window)) {
+            return false;
+        }
+        glfwPollEvents();
+        drawFrame();
+        return true;
+    }
+
+    /** Waits for all GPU work to finish — call once after the last {@link #tick()}, before {@link #close()}. */
+    public void drain() {
         vkDeviceWaitIdle(device);
     }
 
