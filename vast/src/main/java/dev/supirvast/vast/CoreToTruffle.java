@@ -13,6 +13,7 @@ import dev.supirvast.vastir.core.Buffer;
 import dev.supirvast.vastir.core.Expr;
 import dev.supirvast.vastir.core.Function;
 import dev.supirvast.vastir.core.LocalVar;
+import dev.supirvast.vastir.core.MathFn;
 import dev.supirvast.vastir.core.Region;
 import dev.supirvast.vastir.core.Statement;
 import dev.supirvast.vastir.core.UnaryOp;
@@ -141,8 +142,8 @@ public final class CoreToTruffle {
             case Expr.Param p -> new ParamNode(p.index());
             case Expr.Call c -> new CallNode(ctx.targets(), c.callee(),
                     c.arguments().stream().map(a -> lowerExpr(a, ctx)).toArray(ExprNode[]::new));
-            case Expr.MathCall ignored -> throw new UnsupportedOperationException(
-                    "math intrinsics (dot/normalize/pow/…) are graphics-only — no CPU backend yet");
+            case Expr.MathCall m -> new MathCallNode(m.fn(),
+                    m.args().stream().map(a -> lowerExpr(a, ctx)).toArray(ExprNode[]::new));
             case Expr.SampleTexture ignored -> throw new UnsupportedOperationException(
                     "texture sampling is graphics-only — no CPU backend");
             case Expr.PushConstantRead ignored -> throw new UnsupportedOperationException(
@@ -788,6 +789,187 @@ public final class CoreToTruffle {
                 values[i] = arguments[i].execute(frame);
             }
             return targets.get(callee).call(values);
+        }
+    }
+
+    /**
+     * GLSL.std.450 math intrinsics on the CPU — the counterpart to the SPIR-V {@code OpExtInst} the GPU emits.
+     * Values ride the same carriers as everywhere else ({@code Float}/{@code Double} scalars, {@code float[]}/
+     * {@code double[]} vectors); computation is done in {@code double} and packed back to {@code float} unless a
+     * {@code double} operand is present. Scalars broadcast against vectors elementwise. Geometric ops
+     * (dot/length/distance/normalize/cross/reflect) reduce or map as GLSL defines; unary/binary/ternary ops apply
+     * per component. This makes an SDF authored once in {@code core} evaluable on the CPU (physics) as well as the
+     * GPU (rendering) — the whole point of the dual backend.
+     *
+     * <p>Precision note: transcendentals go through {@code java.lang.Math} in {@code double} then round to the
+     * carrier, so f32 results are close to but not guaranteed bit-identical to the GPU for those ops (the
+     * correctly-rounded arithmetic ops still match). Fine for simulation; exact-match tests should stick to
+     * +,−,× as the differential harness already does.
+     */
+    private static final class MathCallNode extends ExprNode {
+        private final MathFn fn;
+        @Children private final ExprNode[] args;
+
+        MathCallNode(MathFn fn, ExprNode[] args) {
+            this.fn = fn;
+            this.args = args;
+        }
+
+        @Override
+        Object execute(VirtualFrame frame) {
+            Object[] v = new Object[args.length];
+            boolean anyDouble = false;
+            for (int i = 0; i < args.length; i++) {
+                v[i] = args[i].execute(frame);
+                anyDouble |= v[i] instanceof Double || v[i] instanceof double[];
+            }
+            return switch (fn) {
+                case LENGTH -> scalar(Math.sqrt(sumSquares(v[0])), anyDouble);
+                case DISTANCE -> {
+                    double s = 0;
+                    for (int i = 0; i < vectorLength(v[0]); i++) {
+                        double d = comp(v[0], i) - comp(v[1], i);
+                        s += d * d;
+                    }
+                    yield scalar(Math.sqrt(s), anyDouble);
+                }
+                case DOT -> {
+                    double s = 0;
+                    for (int i = 0; i < vectorLength(v[0]); i++) {
+                        s += comp(v[0], i) * comp(v[1], i);
+                    }
+                    yield scalar(s, anyDouble);
+                }
+                case NORMALIZE -> {
+                    int n = vectorLength(v[0]);
+                    double len = Math.sqrt(sumSquares(v[0]));
+                    double[] r = new double[n];
+                    for (int i = 0; i < n; i++) {
+                        r[i] = comp(v[0], i) / len;
+                    }
+                    yield pack(r, anyDouble);
+                }
+                case CROSS -> pack(new double[] {
+                        comp(v[0], 1) * comp(v[1], 2) - comp(v[0], 2) * comp(v[1], 1),
+                        comp(v[0], 2) * comp(v[1], 0) - comp(v[0], 0) * comp(v[1], 2),
+                        comp(v[0], 0) * comp(v[1], 1) - comp(v[0], 1) * comp(v[1], 0)}, anyDouble);
+                case REFLECT -> {
+                    int n = vectorLength(v[0]);
+                    double d = 0;
+                    for (int i = 0; i < n; i++) {
+                        d += comp(v[1], i) * comp(v[0], i);   // dot(N, I)
+                    }
+                    double[] r = new double[n];
+                    for (int i = 0; i < n; i++) {
+                        r[i] = comp(v[0], i) - 2 * d * comp(v[1], i);
+                    }
+                    yield pack(r, anyDouble);
+                }
+                default -> elementwise(v, anyDouble);
+            };
+        }
+
+        /** Unary/binary/ternary ops applied per component, scalars broadcasting; scalar result if no vector arg. */
+        private Object elementwise(Object[] v, boolean anyDouble) {
+            int n = 0;
+            for (Object o : v) {
+                n = Math.max(n, o instanceof float[] f ? f.length : o instanceof double[] d ? d.length
+                        : o instanceof int[] a ? a.length : 0);
+            }
+            if (n == 0) {
+                return scalar(applyScalar(v, 0), anyDouble);
+            }
+            double[] r = new double[n];
+            for (int i = 0; i < n; i++) {
+                r[i] = applyScalar(v, i);
+            }
+            return pack(r, anyDouble);
+        }
+
+        private double applyScalar(Object[] v, int i) {
+            double a = comp(v[0], i);
+            return switch (fn) {
+                case ABS -> Math.abs(a);
+                case SIGN -> Math.signum(a);
+                case SQRT -> Math.sqrt(a);
+                case INVERSE_SQRT -> 1.0 / Math.sqrt(a);
+                case FLOOR -> Math.floor(a);
+                case CEIL -> Math.ceil(a);
+                case TRUNC -> (double) (long) a;
+                case ROUND, ROUND_EVEN -> Math.rint(a);
+                case FRACT -> a - Math.floor(a);
+                case SIN -> Math.sin(a);
+                case COS -> Math.cos(a);
+                case TAN -> Math.tan(a);
+                case ASIN -> Math.asin(a);
+                case ACOS -> Math.acos(a);
+                case ATAN -> Math.atan(a);
+                case SINH -> Math.sinh(a);
+                case COSH -> Math.cosh(a);
+                case TANH -> Math.tanh(a);
+                case EXP -> Math.exp(a);
+                case LOG -> Math.log(a);
+                case EXP2 -> Math.pow(2, a);
+                case LOG2 -> Math.log(a) / Math.log(2);
+                case RADIANS -> Math.toRadians(a);
+                case DEGREES -> Math.toDegrees(a);
+                case MIN -> Math.min(a, comp(v[1], i));
+                case MAX -> Math.max(a, comp(v[1], i));
+                case POW -> Math.pow(a, comp(v[1], i));
+                case ATAN2 -> Math.atan2(a, comp(v[1], i));
+                case STEP -> comp(v[1], i) < a ? 0.0 : 1.0;               // step(edge=a, x=v1)
+                case CLAMP -> Math.min(Math.max(a, comp(v[1], i)), comp(v[2], i));
+                case MIX -> a + (comp(v[1], i) - a) * comp(v[2], i);
+                case FMA -> a * comp(v[1], i) + comp(v[2], i);
+                case SMOOTHSTEP -> {
+                    double e0 = a;
+                    double t = Math.min(Math.max((comp(v[2], i) - e0) / (comp(v[1], i) - e0), 0.0), 1.0);
+                    yield t * t * (3.0 - 2.0 * t);
+                }
+                default -> throw new UnsupportedOperationException("CPU MathCall not implemented: " + fn);
+            };
+        }
+
+        private static double comp(Object o, int i) {
+            return switch (o) {
+                case float[] f -> f[i];
+                case double[] d -> d[i];
+                case int[] a -> a[i];
+                default -> ((Number) o).doubleValue();   // scalar broadcasts to any component
+            };
+        }
+
+        private static int vectorLength(Object o) {
+            return switch (o) {
+                case float[] f -> f.length;
+                case double[] d -> d.length;
+                case int[] a -> a.length;
+                default -> 1;
+            };
+        }
+
+        private static double sumSquares(Object o) {
+            double s = 0;
+            for (int i = 0; i < vectorLength(o); i++) {
+                double c = comp(o, i);
+                s += c * c;
+            }
+            return s;
+        }
+
+        private static Object scalar(double value, boolean anyDouble) {
+            return anyDouble ? (Object) value : (Object) (float) value;
+        }
+
+        private static Object pack(double[] values, boolean anyDouble) {
+            if (anyDouble) {
+                return values;
+            }
+            float[] r = new float[values.length];
+            for (int i = 0; i < values.length; i++) {
+                r[i] = (float) values[i];
+            }
+            return r;
         }
     }
 }
