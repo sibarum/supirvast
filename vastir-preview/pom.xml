@@ -63,4 +63,27 @@
             <artifactId>joml</artifactId>
         </dependency>
     </dependencies>
+
+    <build>
+        <plugins>
+            <!--
+              Pre-compile the ShaderSource implementations (ModelShaders) to SPIR-V after compilation. The
+              binaries land in target/classes/META-INF/supirvast/shaders/ and ship in the jar; at runtime
+              Shaders.load("model.vert") / loadOrLower(...) reads them as resources instead of re-lowering.
+            -->
+            <plugin>
+                <groupId>dev.supirvast</groupId>
+                <artifactId>supirvast-maven-plugin</artifactId>
+                <version>${project.version}</version>
+                <executions>
+                    <execution>
+                        <id>precompile-shaders</id>
+                        <goals>
+                            <goal>compile-shaders</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
 </project>

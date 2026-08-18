@@ -26,6 +26,8 @@
         <module>vast</module>
         <!-- Bundled native SPIR-V toolchain + differential harness; depends on vastir and vast. -->
         <module>vastir-tools</module>
+        <!-- Maven plugin: pre-compiles ShaderSource implementations to SPIR-V classpath resources. -->
+        <module>supirvast-maven-plugin</module>
         <!-- Windowed Vulkan shader previewer (application): loads exported SPIR-V + a model, renders it. -->
         <module>vastir-preview</module>
         <!-- PBR surface-shader authoring: pick channels + a surface function, generate a lit shader pair. -->

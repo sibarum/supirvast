@@ -13,6 +13,7 @@ import dev.supirvast.vastir.core.PushConstants;
 import dev.supirvast.vastir.core.Statement;
 import dev.supirvast.vastir.core.Texture;
 import dev.supirvast.vastir.lower.CoreToSpirv;
+import dev.supirvast.vastir.shader.Shaders;
 import dev.supirvast.vastir.type.Type;
 import org.lwjgl.system.MemoryUtil;
 
@@ -294,38 +295,19 @@ public final class SampleAssets {
         return new float[]{x, y, z2};
     }
 
-    /** {@code gl_Position = vec4(position, 1.0); vNormal = normal;} */
+    /**
+     * {@code gl_Position = vec4(position, 1.0); vNormal = normal;} — the pre-compiled {@code model.vert}
+     * resource when the build plugin has run, lowered in-process otherwise. See {@link ModelShaders.Vertex}.
+     */
     static byte[] vertexShader() {
-        InterfaceVar position = InterfaceVar.input("position", 0, VEC3);
-        InterfaceVar normal = InterfaceVar.input("normal", 1, VEC3);
-        InterfaceVar vNormal = InterfaceVar.output("vNormal", 0, VEC3);
-        Expr clip = new Expr.VectorConstruct(VEC4,
-                List.of(new Expr.InterfaceRead(position), new Expr.ConstFloat(F32, 1.0)));
-        Region body = Region.of(
-                new Statement.BuiltinWrite(Builtin.POSITION, clip),
-                new Statement.InterfaceWrite(vNormal, new Expr.InterfaceRead(normal)),
-                new Statement.ReturnVoid());
-        Function main = new Function("main", new Type.FunctionType(Type.VOID, List.of()), body);
-        return new CoreToSpirv()
-                .lower(new CoreModule().addEntryPoint(EntryPoint.of(main, ShaderStage.VERTEX)))
-                .toByteArray();
+        return Shaders.loadOrLower(new ModelShaders.Vertex());
     }
 
-    /** {@code fragColor = vec4(vNormal * 0.5 + 0.5, 1.0);} — maps the [-1,1] normal into a [0,1] color. */
+    /**
+     * {@code fragColor = vec4(vNormal * 0.5 + 0.5, 1.0);} — the pre-compiled {@code model.frag} resource
+     * when the build plugin has run, lowered in-process otherwise. See {@link ModelShaders.Fragment}.
+     */
     static byte[] fragmentShader() {
-        InterfaceVar vNormal = InterfaceVar.input("vNormal", 0, VEC3);
-        InterfaceVar fragColor = InterfaceVar.output("fragColor", 0, VEC4);
-        Expr half = new Expr.VectorConstruct(VEC3, List.of(
-                new Expr.ConstFloat(F32, 0.5), new Expr.ConstFloat(F32, 0.5), new Expr.ConstFloat(F32, 0.5)));
-        Expr scaled = new Expr.Binary(BinaryOp.MUL, new Expr.InterfaceRead(vNormal), half);
-        Expr biased = new Expr.Binary(BinaryOp.ADD, scaled, half);
-        Expr color = new Expr.VectorConstruct(VEC4, List.of(biased, new Expr.ConstFloat(F32, 1.0)));
-        Region body = Region.of(
-                new Statement.InterfaceWrite(fragColor, color),
-                new Statement.ReturnVoid());
-        Function main = new Function("main", new Type.FunctionType(Type.VOID, List.of()), body);
-        return new CoreToSpirv()
-                .lower(new CoreModule().addEntryPoint(EntryPoint.of(main, ShaderStage.FRAGMENT)))
-                .toByteArray();
+        return Shaders.loadOrLower(new ModelShaders.Fragment());
     }
 }
