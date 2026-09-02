@@ -21,6 +21,13 @@
 
     <!-- No GraalVM/Truffle dependency here, by design. Only the inherited test stack applies. -->
 
+    <dependencies>
+        <dependency>
+            <groupId>sibarum.atchung</groupId>
+            <artifactId>atchung-probe</artifactId>
+        </dependency>
+    </dependencies>
+
     <build>
         <plugins>
             <!--

@@ -67,6 +67,13 @@ public final class CoreToSpirv {
      * can't run).
      */
     public SpirvModule lower(CoreModule module, SpirvTarget target) {
+        try (sibarum.probe.Zone z = sibarum.probe.Probe.zone(sibarum.probe.Lane.SHADER, "lower to spirv")) {
+            return lowerModule(module, target);
+        }
+    }
+
+    /** The body of {@link #lower(CoreModule, SpirvTarget)}, split out so the probe span wraps all of it. */
+    private SpirvModule lowerModule(CoreModule module, SpirvTarget target) {
         Builder b = new Builder();
 
         Map<Function, Integer> functionIds = new LinkedHashMap<>();

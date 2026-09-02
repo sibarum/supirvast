@@ -22,6 +22,10 @@
     <!-- Only the core IR is needed to produce a CoreModule. Inherits the JUnit test stack from the parent. -->
     <dependencies>
         <dependency>
+            <groupId>sibarum.atchung</groupId>
+            <artifactId>atchung-probe</artifactId>
+        </dependency>
+        <dependency>
             <groupId>dev.supirvast</groupId>
             <artifactId>vastir</artifactId>
         </dependency>

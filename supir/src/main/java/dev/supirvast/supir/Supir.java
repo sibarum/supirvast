@@ -1,5 +1,9 @@
 package dev.supirvast.supir;
 
+import sibarum.probe.Lane;
+import sibarum.probe.Probe;
+import sibarum.probe.Zone;
+
 import dev.supirvast.vastir.core.CoreModule;
 
 /**
@@ -24,7 +28,12 @@ public final class Supir {
      * @throws SupirParseException on any lex, parse, or resolution error (carries the offending {@link Span})
      */
     public static CoreModule parseModule(String source) {
-        return Parser.parse(source);
+        // Parsing is where a shader pipeline first spends real time, and it spends it once per kernel at
+        // startup - which is exactly the cost that presents as "the app hangs for a second on launch"
+        // rather than as a frame-rate problem, and so never shows up in a per-frame measurement.
+        try (Zone z = Probe.zone(Lane.SHADER, "parse")) {
+            return Parser.parse(source);
+        }
     }
 
     /** Prints a {@link CoreModule} as canonical Supir flat-assembly text. */

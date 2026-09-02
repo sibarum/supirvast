@@ -54,6 +54,13 @@
 
     <dependencyManagement>
         <dependencies>
+            <!-- The stack-wide profiling seam. Zero dependencies of its own, which is what lets the shader
+                 pipeline carry instrumentation without acquiring anything else. -->
+            <dependency>
+                <groupId>sibarum.atchung</groupId>
+                <artifactId>atchung-probe</artifactId>
+                <version>1.0-SNAPSHOT</version>
+            </dependency>
             <!-- Truffle (used by the vast module only). -->
             <dependency>
                 <groupId>org.graalvm.truffle</groupId>
