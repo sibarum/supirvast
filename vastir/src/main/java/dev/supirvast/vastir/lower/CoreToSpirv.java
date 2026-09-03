@@ -775,12 +775,35 @@ public final class CoreToSpirv {
             return pointer;
         }
 
-        /** Element size in bytes — the runtime-array {@code ArrayStride}. */
+        /**
+         * Element size in bytes — the runtime-array {@code ArrayStride}.
+         *
+         * <p>Under std430 an array element's stride is its size rounded up to its own alignment, which is why
+         * a {@code vec3} element strides 16 rather than 12. Returning a wrong stride here does not produce
+         * invalid SPIR-V — {@code spirv-val} accepts it — it silently produces a wrong memory layout, so
+         * anything without a defined stride is rejected rather than guessed at.
+         *
+         * @throws IllegalArgumentException if the element type has no defined array stride
+         */
         private static int byteSize(Type element) {
             return switch (element) {
                 case Type.Int i -> i.width() / 8;
                 case Type.Float f -> f.width() / 8;
-                default -> Integer.BYTES;
+                case Type.Vector v -> {
+                    int component = switch (v.component()) {
+                        case Type.Int i -> i.width() / 8;
+                        case Type.Float f -> f.width() / 8;
+                        default -> throw new IllegalArgumentException(
+                                "buffer element vector component must be an integer or float type, got "
+                                        + v.component());
+                    };
+                    int alignment = (v.count() == 2 ? 2 : 4) * component;
+                    int size = v.count() * component;
+                    yield (size + alignment - 1) / alignment * alignment;
+                }
+                default -> throw new IllegalArgumentException(
+                        "no defined array stride for buffer element type " + element
+                                + " (supported: integer, float, and vector elements)");
             };
         }
     }
@@ -954,11 +977,12 @@ public final class CoreToSpirv {
             for (int i = 0; i < members.size(); i++) {
                 Type type = members.get(i).type();
                 offset = align(offset, alignmentOf(type));
-                if (type instanceof Type.Matrix) {
+                if (type instanceof Type.Matrix matrix) {
                     b.emit(b.annotations, Op.OpMemberDecorate).id(structType).literal(i)
                             .enumValue(Decoration.ColMajor.value());
+                    // Same padded-column stride sizeOf assumes, so the two cannot drift apart.
                     b.emit(b.annotations, Op.OpMemberDecorate).id(structType).literal(i)
-                            .enumValue(Decoration.MatrixStride.value()).literal(16);
+                            .enumValue(Decoration.MatrixStride.value()).literal(alignmentOf(matrix.column()));
                 }
                 b.emit(b.annotations, Op.OpMemberDecorate).id(structType).literal(i)
                         .enumValue(Decoration.Offset.value()).literal(offset);
@@ -970,21 +994,50 @@ public final class CoreToSpirv {
             return (offset + alignment - 1) / alignment * alignment;
         }
 
-        /** std430-ish byte size of a push-constant member (32-bit components). */
+        /**
+         * std430 byte size of a push-constant member. Component width is honoured, so a 64-bit scalar
+         * contributes 8 bytes rather than 4 — getting this wrong shifts the offset of every later member.
+         *
+         * @throws IllegalArgumentException if the type has no defined push-constant layout
+         */
         private static int sizeOf(Type type) {
             return switch (type) {
-                case Type.Matrix m -> m.columns() * 16;
-                case Type.Vector v -> v.count() == 3 ? 12 : v.count() * 4;
-                default -> 4;
+                case Type.Int i -> i.width() / 8;
+                case Type.Float f -> f.width() / 8;
+                case Type.Vector v -> v.count() * scalarBytes(v.component());
+                // Column-major: each column is padded up to its own alignment (the MatrixStride).
+                case Type.Matrix m -> m.columns() * alignmentOf(m.column());
+                default -> throw new IllegalArgumentException(
+                        "no defined push-constant layout for member type " + type
+                                + " (supported: integer, float, vector, and matrix members)");
             };
         }
 
-        /** std430-ish alignment of a push-constant member. */
+        /**
+         * std430 alignment of a push-constant member.
+         *
+         * @throws IllegalArgumentException if the type has no defined push-constant layout
+         */
         private static int alignmentOf(Type type) {
             return switch (type) {
-                case Type.Matrix ignored -> 16;
-                case Type.Vector v -> v.count() == 2 ? 8 : 16;
-                default -> 4;
+                case Type.Int i -> i.width() / 8;
+                case Type.Float f -> f.width() / 8;
+                // vec2 aligns to 2 components; vec3 and vec4 both align to 4.
+                case Type.Vector v -> (v.count() == 2 ? 2 : 4) * scalarBytes(v.component());
+                case Type.Matrix m -> alignmentOf(m.column());
+                default -> throw new IllegalArgumentException(
+                        "no defined push-constant layout for member type " + type
+                                + " (supported: integer, float, vector, and matrix members)");
+            };
+        }
+
+        /** Byte width of a scalar component, rejecting anything that is not a numeric scalar. */
+        private static int scalarBytes(Type component) {
+            return switch (component) {
+                case Type.Int i -> i.width() / 8;
+                case Type.Float f -> f.width() / 8;
+                default -> throw new IllegalArgumentException(
+                        "vector component must be an integer or float type, got " + component);
             };
         }
     }
@@ -1546,8 +1599,11 @@ public final class CoreToSpirv {
                     switch (t.width()) {
                         case 8 -> usesInt8 = true;
                         case 16 -> usesInt16 = true;
+                        case 32 -> { } // the default profile; needs no extra capability
                         case 64 -> usesInt64 = true;
-                        default -> { }
+                        default -> throw new IllegalArgumentException(
+                                "only 8-, 16-, 32- and 64-bit integer types are supported, got width "
+                                        + t.width());
                     }
                     yield emit(Op.OpTypeInt, i -> i.literal(t.width()).literal(t.signed() ? 1 : 0));
                 }
