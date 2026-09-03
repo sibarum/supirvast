@@ -12,6 +12,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /** Drives {@link DifferentialHarness}: the same core body runs on the CPU and produces canonical valid SPIR-V. */
@@ -23,6 +24,13 @@ class DifferentialHarnessTest {
         return new Expr.ConstInt(I32, value);
     }
 
+    /**
+     * Set {@code -Dsupirvast.requireGpu=true} to turn "no Vulkan device" from a skip into a failure. CI
+     * runners that are supposed to have a GPU should set it: without it, a runner that silently lost its
+     * device would still report these tests as skipped rather than failed.
+     */
+    private static final boolean REQUIRE_GPU = Boolean.getBoolean("supirvast.requireGpu");
+
     private DifferentialHarness.Report run(String name, List<Statement> body, LocalVar result) {
         DifferentialHarness harness = new DifferentialHarness();
         assumeTrue(harness.toolsAvailable(), "native SPIR-V tools not bundled");
@@ -30,11 +38,19 @@ class DifferentialHarnessTest {
         assertTrue(report.spirvValid(), () -> "spirv-val rejected " + name + ":\n" + report.validationOutput());
         assertTrue(report.disassemblyRoundTrips(),
                 () -> name + ": our SPIR-V round-trip through spirv-dis/spirv-as is unstable");
-        // When a GPU is present, the same shader run on hardware must produce the CPU's value.
-        if (report.gpuExecuted()) {
-            assertEquals(report.cpuResult(), report.gpuResult().intValue(),
-                    () -> name + ": GPU result " + report.gpuResult() + " != CPU result " + report.cpuResult());
+
+        // The differential itself. Without a device there is nothing to compare, and reporting that as a
+        // pass would claim GPU/CPU agreement we never observed — so fail if a GPU was required, and
+        // otherwise abort so the result shows up as skipped rather than green.
+        if (!report.gpuExecuted()) {
+            if (REQUIRE_GPU) {
+                fail(name + ": -Dsupirvast.requireGpu=true but no Vulkan device was available, "
+                        + "so the GPU/CPU differential never ran");
+            }
+            assumeTrue(false, name + ": no Vulkan device — GPU/CPU differential not run");
         }
+        assertEquals(report.cpuResult(), report.gpuResult().intValue(),
+                () -> name + ": GPU result " + report.gpuResult() + " != CPU result " + report.cpuResult());
         return report;
     }
 
