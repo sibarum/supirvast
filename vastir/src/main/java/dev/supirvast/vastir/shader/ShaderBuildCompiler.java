@@ -42,13 +42,21 @@ public final class ShaderBuildCompiler {
     public static List<String> compile(Path classesDir, Path outputDir) throws IOException {
         ClassLoader loader = ShaderBuildCompiler.class.getClassLoader();
         TreeMap<String, ShaderSource> sources = new TreeMap<>();
+        List<String> skipped = new ArrayList<>();
         for (String className : classNames(classesDir)) {
             Class<?> type;
             try {
                 type = Class.forName(className, false, loader);
-            } catch (ClassNotFoundException | LinkageError e) {
-                continue; // e.g. optional dependency missing from the scan classpath — not a shader source
+            } catch (ClassNotFoundException | NoClassDefFoundError e) {
+                // A class we cannot even resolve: typically an optional dependency that is absent from the
+                // scan classpath, so it cannot be a shader source we are meant to compile. Reported rather
+                // than dropped, because it is also how a genuinely broken ShaderSource would look.
+                skipped.add(className + " (" + e.getClass().getSimpleName() + ": " + e.getMessage() + ")");
+                continue;
             }
+            // Any other LinkageError (ExceptionInInitializerError, IncompatibleClassChangeError, a static
+            // initializer that threw) means the class exists but is broken. Skipping it silently would emit
+            // no .spv and leave it out of the index, turning a build error into a runtime one.
             if (!ShaderSource.class.isAssignableFrom(type) || type.isInterface()
                     || Modifier.isAbstract(type.getModifiers())) {
                 continue;
@@ -65,6 +73,13 @@ public final class ShaderBuildCompiler {
                 throw new IllegalStateException("shader name '" + source.name() + "' is declared by both "
                         + clash.getClass().getName() + " and " + className);
             }
+        }
+
+        if (!skipped.isEmpty()) {
+            // Visible in the build log: if a shader is unexpectedly missing at runtime, this is where it went.
+            System.out.println("[supirvast] skipped " + skipped.size()
+                    + " unresolvable class(es) while scanning for shader sources:");
+            skipped.forEach(entry -> System.out.println("[supirvast]   " + entry));
         }
 
         Path shaderDir = outputDir.resolve(Shaders.RESOURCE_DIR);
