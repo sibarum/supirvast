@@ -662,6 +662,7 @@ final class Parser {
         return switch (name) {
             case "Position" -> Builtin.POSITION;
             case "VertexIndex" -> Builtin.VERTEX_INDEX;
+            case "FragDepth" -> Builtin.FRAG_DEPTH;
             default -> null;
         };
     }

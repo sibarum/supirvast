@@ -100,7 +100,7 @@ public final class CoreToSpirv {
                 .enumValue(target.memoryModel());
 
         emitEntryPoints(module, b, functionIds, output, kernel, interfaceResources, textures, pushConstants);
-        emitExecutionModes(module, b, functionIds);
+        emitExecutionModes(module, b, functionIds, iface.builtins().contains(Builtin.FRAG_DEPTH));
 
         TypeTable types = new TypeTable(b);
         ConstantTable constants = new ConstantTable(b, types);
@@ -186,7 +186,17 @@ public final class CoreToSpirv {
         }
     }
 
-    private void emitExecutionModes(CoreModule module, Builder b, Map<Function, Integer> functionIds) {
+    /**
+     * @param replacesDepth whether the module writes {@link Builtin#FRAG_DEPTH}, which every fragment entry
+     *                      point must then declare {@code DepthReplacing} for. Module-wide rather than per
+     *                      entry point, the same coarseness {@link #usesInvocationId} has: the interface scan
+     *                      walks every function without attributing it to the entry point that reaches it,
+     *                      and over-declaring costs a fragment shader its early-z where under-declaring is
+     *                      undefined behaviour. A module with two fragment entry points, one of which writes
+     *                      depth, is the case that pays for that — and no such module exists yet.
+     */
+    private void emitExecutionModes(CoreModule module, Builder b, Map<Function, Integer> functionIds,
+                                    boolean replacesDepth) {
         for (EntryPoint entryPoint : module.entryPoints()) {
             int functionId = functionIds.get(entryPoint.function());
             switch (entryPoint.stage()) {
@@ -198,9 +208,20 @@ public final class CoreToSpirv {
                             .enumValue(ExecutionMode.LocalSize.value())
                             .literal(wg.x()).literal(wg.y()).literal(wg.z());
                 }
-                case FRAGMENT -> b.emit(b.executionModes, Op.OpExecutionMode)
-                        .id(functionId)
-                        .enumValue(ExecutionMode.OriginUpperLeft.value());
+                case FRAGMENT -> {
+                    b.emit(b.executionModes, Op.OpExecutionMode)
+                            .id(functionId)
+                            .enumValue(ExecutionMode.OriginUpperLeft.value());
+                    if (replacesDepth) {
+                        // Required, not advisory: a shader that stores to the FragDepth variable without this
+                        // mode is invalid SPIR-V. The mode is also the whole cost of the feature — it tells the
+                        // implementation the depth test cannot be settled before the shader runs, so early-z
+                        // for this pipeline is gone.
+                        b.emit(b.executionModes, Op.OpExecutionMode)
+                                .id(functionId)
+                                .enumValue(ExecutionMode.DepthReplacing.value());
+                    }
+                }
                 case VERTEX -> { /* no execution mode required */ }
             }
         }
@@ -871,6 +892,7 @@ public final class CoreToSpirv {
             return switch (builtin) {
                 case POSITION -> BuiltIn.Position.value();
                 case VERTEX_INDEX -> BuiltIn.VertexIndex.value();
+                case FRAG_DEPTH -> BuiltIn.FragDepth.value();
             };
         }
     }

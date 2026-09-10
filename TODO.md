@@ -92,6 +92,19 @@ highest-value next proof; **P1** deepens the language; **P2** broadens targets; 
       fragment pair (`VertexFragmentShaderTest`) validates and cross-compiles to GLSL/HLSL/MSL. *Verification is
       `spirv-val` + cross-compile, not CPU==GPU — a fragment shader needs rasterization the headless compute
       path can't drive. Still TODO: vertex attribute inputs, multiple render targets, more builtins.*
+- [x] `Builtin.FRAG_DEPTH` — `gl_FragDepth` as a fragment output, `float`. The built-in a ray-marched fragment
+      cannot do without: it draws over a fullscreen triangle whose vertices carry one fixed depth, so without
+      this it can only contribute that constant, and occludes a rasterised mesh at a flat plane instead of at
+      its own geometry. Writing it makes the lowering declare the `DepthReplacing` execution mode — required
+      rather than advisory, since a `FragDepth` store without it is invalid SPIR-V, and it is also the whole
+      cost of the feature: it tells the implementation the depth test cannot be settled before the fragment
+      shader runs, so that pipeline loses early-z. Declared only when the module actually writes the built-in,
+      so no other fragment shader pays for it. `FragDepthShaderTest` checks both directions — `spirv-val`
+      accepts the writing shader and cross-compiles it to `gl_FragDepth`, and the mode is absent from a shader
+      that writes none. *The clip-depth convention itself — near plane, far plane, the curve between them, and
+      whether "depth" means distance to the eye or to the image plane — is deliberately not modelled here:
+      `core` would have to acquire a notion of camera, and two stages disagreeing about that convention is not
+      something a type in this enum could catch.*
 - [x] Cross-compile coverage — `CrossCompileCoverageTest` cross-compiles a real data-parallel kernel to GLSL,
       HLSL, and MSL (was only trivial-GLSL before); HLSL now targets Shader Model 5.0 (`--shader-model 50`) so
       compute/UAVs and system-value semantics like `SV_VertexID` are supported.

@@ -399,6 +399,7 @@ final class Printer {
         return switch (b) {
             case POSITION -> "Position";
             case VERTEX_INDEX -> "VertexIndex";
+            case FRAG_DEPTH -> "FragDepth";
         };
     }
 
