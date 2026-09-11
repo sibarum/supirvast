@@ -85,7 +85,7 @@ public final class CoreToSpirv {
         List<Buffer> buffers = collectBuffers(module);
         boolean invocationId = usesInvocationId(module);
         KernelResources kernel = (!buffers.isEmpty() || invocationId)
-                ? new KernelResources(b, buffers, invocationId) : null;
+                ? new KernelResources(b, buffers, invocationId, storedBindings(module)) : null;
         InterfaceUsage iface = collectInterface(module);
         InterfaceResources interfaceResources = iface.isEmpty()
                 ? null : new InterfaceResources(b, iface.builtins(), iface.variables());
@@ -257,6 +257,43 @@ public final class CoreToSpirv {
             collectBuffers(function.body(), byBinding);
         }
         return List.copyOf(byBinding.values());
+    }
+
+    /**
+     * The bindings some statement in the module stores to — so every other buffer is provably read-only and
+     * can be decorated {@code NonWritable}.
+     *
+     * <p>Derived rather than declared. A flag on {@link Buffer} would work and would be one more thing a
+     * caller can get wrong in the direction that matters: marking a buffer read-only and then writing to it
+     * is a promise to the driver the shader breaks, and nothing in the toolchain currently catches it —
+     * {@code spirv-val} does not object, and the kernel still computes the right answer until some
+     * implementation decides to act on what it was told. Here the decoration <em>is</em> the code, so the two
+     * cannot disagree.
+     *
+     * <p>Exact, not conservative: {@link Statement.BufferStore} names its {@link Buffer} by value, so there is
+     * no aliasing to be careful about, and a store can only appear as a statement — never inside an
+     * expression — so this walks regions and does not descend into operands.
+     */
+    private Set<Integer> storedBindings(CoreModule module) {
+        Set<Integer> stored = new LinkedHashSet<>();
+        for (Function function : module.functions()) {
+            storedBindings(function.body(), stored);
+        }
+        return stored;
+    }
+
+    private void storedBindings(Region region, Set<Integer> stored) {
+        for (Statement statement : region.statements()) {
+            switch (statement) {
+                case Statement.BufferStore s -> stored.add(s.buffer().binding());
+                case Statement.If f -> {
+                    storedBindings(f.thenRegion(), stored);
+                    storedBindings(f.elseRegion(), stored);
+                }
+                case Statement.While w -> storedBindings(w.body(), stored);
+                default -> { }
+            }
+        }
     }
 
     private void collectBuffers(Region region, Map<Integer, Buffer> out) {
@@ -693,9 +730,13 @@ public final class CoreToSpirv {
         private int gidComponentPointer; // Input* uint
         private int uintZeroConst;       // the .x component index
 
-        KernelResources(Builder b, List<Buffer> buffers, boolean useInvocationId) {
+        /** The bindings some statement stores to; every other buffer is decorated {@code NonWritable}. */
+        private final Set<Integer> storedBindings;
+
+        KernelResources(Builder b, List<Buffer> buffers, boolean useInvocationId, Set<Integer> storedBindings) {
             this.buffers = buffers;
             this.useInvocationId = useInvocationId;
+            this.storedBindings = storedBindings;
             for (Buffer buffer : buffers) {
                 variableByBinding.put(buffer.binding(), b.allocateId());
             }
@@ -750,6 +791,17 @@ public final class CoreToSpirv {
                         .enumValue(Decoration.DescriptorSet.value()).literal(0);
                 b.emit(b.annotations, Op.OpDecorate).id(variable)
                         .enumValue(Decoration.Binding.value()).literal(buffer.binding());
+                if (!storedBindings.contains(buffer.binding())) {
+                    // Required of a fragment stage, and true of every stage that only loads. Without the
+                    // fragmentStoresAndAtomics device feature -- which nothing should enable to buy silence,
+                    // because it promises the implementation a write that never comes -- a fragment shader's
+                    // storage buffers must all carry this (VUID-RuntimeSpirv-NonWritable-06340). On the
+                    // variable rather than the block's member: variables are per buffer already, where the
+                    // block type below is shared by every buffer of the same element type and could not
+                    // carry a decoration that differs between two of them.
+                    b.emit(b.annotations, Op.OpDecorate).id(variable)
+                            .enumValue(Decoration.NonWritable.value());
+                }
             }
 
             if (useInvocationId) {

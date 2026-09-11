@@ -105,6 +105,19 @@ highest-value next proof; **P1** deepens the language; **P2** broadens targets; 
       whether "depth" means distance to the eye or to the image plane — is deliberately not modelled here:
       `core` would have to acquire a notion of camera, and two stages disagreeing about that convention is not
       something a type in this enum could catch.*
+- [x] `NonWritable` on storage buffers nothing stores to — **derived, not declared**. Without the
+      `fragmentStoresAndAtomics` device feature, every storage buffer a *fragment* stage declares must carry
+      this decoration (`VUID-RuntimeSpirv-NonWritable-06340`), and a ray-marched fragment reading its geometry
+      out of a buffer is exactly that shape; VexelRay's `MarchSmokeTest` reported it on every pipeline it
+      built. A flag on `Buffer` would have worked and would have put the decoration in the author's hands,
+      where the direction that goes wrong is the dangerous one: a buffer marked read-only and then written is
+      a promise to the driver that **nothing in this toolchain catches** — `spirv-val` does not object and the
+      kernel computes the right answer until an implementation acts on what it was told. So `CoreToSpirv`
+      collects the bindings some `Statement.BufferStore` targets and decorates every other buffer, which makes
+      the decoration and the code the same fact. On the variable, not the block member: variables are already
+      per buffer, where the block type is shared by every buffer of one element type and could not carry a
+      decoration that differs between two of them. `NonWritableBufferTest` pins both directions, including a
+      store nested inside an `if`.
 - [x] Cross-compile coverage — `CrossCompileCoverageTest` cross-compiles a real data-parallel kernel to GLSL,
       HLSL, and MSL (was only trivial-GLSL before); HLSL now targets Shader Model 5.0 (`--shader-model 50`) so
       compute/UAVs and system-value semantics like `SV_VertexID` are supported.
