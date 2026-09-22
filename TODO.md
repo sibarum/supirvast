@@ -219,6 +219,54 @@ highest-value next proof; **P1** deepens the language; **P2** broadens targets; 
 - [ ] Streamed (vs bulk) data feeding — persistent ring buffers + async double-buffering; only if overlap/unbounded
       sources are needed (bulk-per-batch is the v1).
 
+## Workgroups — the build order (decided 2026-09-22)
+
+Driven by `vexelray-sim-fluid`, whose particle-to-grid scatter is the first kernel that will want all of it.
+In this order, and each of the last two only once a kernel is **measured** to need it:
+
+- [ ] **1. Configurable workgroup size.** `Accelerator.register` builds every entry point `1×1×1`, so a
+      dispatch of N is N one-invocation workgroups — on NVIDIA, 31 of 32 lanes idle. Needs: the size on
+      `KernelSpec`, a dispatch of `ceil(n / size)` groups, a bounds guard for the tail (the extra
+      invocations must not touch memory), and `LocalInvocationId` / `WorkgroupId` built-ins. The CPU backend
+      is unaffected: invocation order within and across groups is still whatever it likes. Measure the gain,
+      because it decides how urgent the rest is. A prerequisite for everything below — a workgroup of one
+      has nobody to share with.
+- [ ] **2. Workgroup memory and barriers.** Arrays in the `Workgroup` storage class, `OpControlBarrier`,
+      atomics on workgroup memory. The declared size is known at compile time, so registration checks it
+      against `maxComputeSharedMemorySize` (16 KB guaranteed, ~48 KB typical) through the same budget path
+      as a capability, falling back to CPU when it does not fit. A barrier must sit in uniform control flow;
+      the IR's structure is what makes that checkable. **The CPU side is the real design work:** sequential
+      invocations cannot express "nobody continues until everybody arrives". Split the kernel at its
+      barriers and run each phase for every invocation of the group, spilling locals between phases — how
+      CPU OpenCL implementations do it, and tractable here because barriers can only be where every
+      invocation reaches them. Not threads-per-invocation, which would be an emulation rather than an
+      execution model.
+- [ ] **3. Subgroup operations.** Reductions and shuffles across the 32/64 lanes that execute together — no
+      workgroup memory, no explicit barrier, often the better way to pre-reduce before one global atomic.
+      The CPU backend reuses step 2's phase machinery.
+
+## A CPU runtime — decided against building one yet (2026-09-22)
+
+The CPU backend is a faithful reference, not a production runtime: every value boxed, one call per
+invocation, single-threaded, no vectorisation. Whether it should become one was weighed and **deferred**:
+
+- **Nothing forces the decision.** A CPU lowering is another backend under `core`; building it later costs
+  what building it now would. What would close the option is `core` acquiring GPU-only constructs with no
+  CPU meaning — so every new feature settles its CPU semantics when it lands (step 2 above is the example).
+- **Not a third backend.** Every IR feature is already implemented twice. A third that must track every
+  addition is the maintenance tax that retired three hand-maintained applications from `vexelray-framework`.
+- **Not a replacement for Truffle either.** Only Truffle compiles at run time inside a native image, and
+  VexelRay's render == sim for user-authored geometry depends on that — a surface typed at run time is
+  queryable on the CPU at once. A build-time bytecode backend could not do it.
+- **So if it is ever built, it is Truffle hardened:** primitive specialisations (the P3 entry below), the
+  dispatch loop inside the compiled root, workgroups across platform threads. Its costs are named in
+  advance: Truffle's compiler in the binary, and a first-use compile that is a frame spike unless it happens
+  on a background thread with the interpreter covering.
+- **What would justify it:** small volumes measured faster end-to-end on the CPU once readback is counted;
+  a headless server or a GPU saturated by rendering as a real target; results needed on the CPU in the same
+  frame. A build-time bytecode backend is reconsidered only if hardened Truffle is measured to fall well
+  short of hand-written Java, or its binary size or warm-up proves unacceptable.
+
 ## P3 — Performance, quality, infra
 
 - [ ] Truffle node specialization (`@Specialization`, typed frame slots) — remove `Object` boxing for JIT speed
