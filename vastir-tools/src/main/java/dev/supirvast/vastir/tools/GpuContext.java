@@ -35,8 +35,13 @@ import org.lwjgl.vulkan.VkShaderModuleCreateInfo;
 import org.lwjgl.vulkan.VkSubmitInfo;
 import org.lwjgl.vulkan.VkWriteDescriptorSet;
 
+import org.lwjgl.vulkan.EXTShaderAtomicFloat;
+import org.lwjgl.vulkan.EXTShaderAtomicFloat2;
+import org.lwjgl.vulkan.VkExtensionProperties;
 import org.lwjgl.vulkan.VkPhysicalDeviceFeatures;
 import org.lwjgl.vulkan.VkPhysicalDeviceFeatures2;
+import org.lwjgl.vulkan.VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT;
+import org.lwjgl.vulkan.VkPhysicalDeviceShaderAtomicFloatFeaturesEXT;
 import org.lwjgl.vulkan.VkPhysicalDeviceVulkan12Features;
 import dev.supirvast.vastir.spirv.Capability;
 
@@ -365,31 +370,86 @@ public final class GpuContext implements AutoCloseable {
         // etc. is actually licensed). Uses the Features2 pNext chain; pEnabledFeatures must then be null.
         VkPhysicalDeviceVulkan12Features features12 = VkPhysicalDeviceVulkan12Features.calloc(stack)
                 .sType$Default().shaderInt8(supported.int8());
+        long chain = features12.address();
+        // The float-atomic extensions are enabled only when their feature is, since enabling one licenses the
+        // capability the lowering will then emit. float2 extends float, so min/max implies the add extension.
+        java.util.List<String> extensions = new java.util.ArrayList<>();
+        if (supported.floatAtomicAdd() || supported.floatAtomicMinMax()) {
+            extensions.add(EXTShaderAtomicFloat.VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
+            chain = VkPhysicalDeviceShaderAtomicFloatFeaturesEXT.calloc(stack).sType$Default().pNext(chain)
+                    .shaderBufferFloat32AtomicAdd(supported.floatAtomicAdd()).address();
+        }
+        if (supported.floatAtomicMinMax()) {
+            extensions.add(EXTShaderAtomicFloat2.VK_EXT_SHADER_ATOMIC_FLOAT_2_EXTENSION_NAME);
+            chain = VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT.calloc(stack).sType$Default().pNext(chain)
+                    .shaderBufferFloat32AtomicMinMax(true).address();
+        }
         VkPhysicalDeviceFeatures2 features2 = VkPhysicalDeviceFeatures2.calloc(stack)
-                .sType$Default().pNext(features12.address());
+                .sType$Default().pNext(chain);
         features2.features()
                 .shaderInt16(supported.int16())
                 .shaderInt64(supported.int64())
                 .shaderFloat64(supported.float64());
+        PointerBuffer extensionNames = stack.mallocPointer(extensions.size());
+        for (String extension : extensions) {
+            extensionNames.put(stack.UTF8(extension));
+        }
+        extensionNames.flip();
         VkDeviceCreateInfo info = VkDeviceCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO)
                 .pNext(features2.address())
-                .pQueueCreateInfos(queues);
+                .pQueueCreateInfos(queues)
+                .ppEnabledExtensionNames(extensionNames);
         PointerBuffer pDevice = stack.mallocPointer(1);
         check(vkCreateDevice(physical, info, null, pDevice), "vkCreateDevice");
         return new VkDevice(pDevice.get(0), physical, info);
     }
 
     /** What the physical device supports among the optional capabilities our lowering can emit. */
-    private record Supported(boolean int8, boolean int16, boolean int64, boolean float64) {}
+    private record Supported(boolean int8, boolean int16, boolean int64, boolean float64,
+            boolean floatAtomicAdd, boolean floatAtomicMinMax) {}
 
     private static Supported querySupported(VkPhysicalDevice physical, MemoryStack stack) {
+        Set<String> extensions = deviceExtensions(physical, stack);
+        boolean hasFloat = extensions.contains(EXTShaderAtomicFloat.VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
+        boolean hasFloat2 = hasFloat
+                && extensions.contains(EXTShaderAtomicFloat2.VK_EXT_SHADER_ATOMIC_FLOAT_2_EXTENSION_NAME);
+
         VkPhysicalDeviceVulkan12Features features12 = VkPhysicalDeviceVulkan12Features.calloc(stack).sType$Default();
+        long chain = features12.address();
+        // A feature struct is chained only when its extension exists: querying one the driver does not know
+        // is harmless in practice and undefined on paper.
+        VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomicFloat = null;
+        if (hasFloat) {
+            atomicFloat = VkPhysicalDeviceShaderAtomicFloatFeaturesEXT.calloc(stack).sType$Default().pNext(chain);
+            chain = atomicFloat.address();
+        }
+        VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT atomicFloat2 = null;
+        if (hasFloat2) {
+            atomicFloat2 = VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT.calloc(stack).sType$Default().pNext(chain);
+            chain = atomicFloat2.address();
+        }
         VkPhysicalDeviceFeatures2 features2 = VkPhysicalDeviceFeatures2.calloc(stack)
-                .sType$Default().pNext(features12.address());
+                .sType$Default().pNext(chain);
         vkGetPhysicalDeviceFeatures2(physical, features2);
         VkPhysicalDeviceFeatures core = features2.features();
-        return new Supported(features12.shaderInt8(), core.shaderInt16(), core.shaderInt64(), core.shaderFloat64());
+        return new Supported(features12.shaderInt8(), core.shaderInt16(), core.shaderInt64(), core.shaderFloat64(),
+                atomicFloat != null && atomicFloat.shaderBufferFloat32AtomicAdd(),
+                atomicFloat2 != null && atomicFloat2.shaderBufferFloat32AtomicMinMax());
+    }
+
+    private static Set<String> deviceExtensions(VkPhysicalDevice physical, MemoryStack stack) {
+        IntBuffer count = stack.mallocInt(1);
+        check(vkEnumerateDeviceExtensionProperties(physical, (String) null, count, null),
+                "vkEnumerateDeviceExtensionProperties");
+        VkExtensionProperties.Buffer properties = VkExtensionProperties.malloc(count.get(0), stack);
+        check(vkEnumerateDeviceExtensionProperties(physical, (String) null, count, properties),
+                "vkEnumerateDeviceExtensionProperties");
+        Set<String> names = new java.util.HashSet<>();
+        for (int i = 0; i < properties.capacity(); i++) {
+            names.add(properties.get(i).extensionNameString());
+        }
+        return names;
     }
 
     private static Set<Capability> capabilitySet(Supported s) {
@@ -405,6 +465,12 @@ public final class GpuContext implements AutoCloseable {
         }
         if (s.float64()) {
             caps.add(Capability.Float64);
+        }
+        if (s.floatAtomicAdd()) {
+            caps.add(Capability.AtomicFloat32AddEXT);
+        }
+        if (s.floatAtomicMinMax()) {
+            caps.add(Capability.AtomicFloat32MinMaxEXT);
         }
         return Set.copyOf(caps);
     }

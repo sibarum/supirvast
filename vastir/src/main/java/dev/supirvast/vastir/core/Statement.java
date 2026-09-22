@@ -1,5 +1,7 @@
 package dev.supirvast.vastir.core;
 
+import dev.supirvast.vastir.type.Type;
+
 /**
  * A core-level statement. Control flow is structured: {@link If} and {@link While} carry nested {@link Region}s
  * rather than branching to labels, which is exactly what lets the lowering produce SPIR-V's structured
@@ -20,7 +22,7 @@ public sealed interface Statement {
      */
     record StoreResult(Expr value) implements Statement {}
 
-    /** Writes {@code value} to {@code buffer[index]} (an i32 element of a storage buffer). */
+    /** Writes {@code value} to {@code buffer[index]} (an element of a storage buffer). */
     record BufferStore(Buffer buffer, Expr index, Expr value) implements Statement {}
 
     /** Writes a graphics-pipeline built-in output (e.g. {@code gl_Position}). */
@@ -40,4 +42,67 @@ public sealed interface Statement {
 
     /** Structured pre-tested loop: {@code while (condition) { body }}. */
     record While(Expr condition, Region body) implements Statement {}
+
+    /**
+     * Atomically replaces {@code buffer[index]} with {@code op(buffer[index], value)}, and assigns the element's
+     * value from before the update to {@code previous}.
+     *
+     * <p>A statement rather than an expression on purpose: a side effect inside an expression tree is one a
+     * pass that folds, substitutes or drops dead subexpressions can duplicate or erase, and the passes that
+     * rewrite trees above this IR have no reason to know which nodes are unsafe to touch.
+     *
+     * <p>{@code previous} is {@code null} when the old value is not wanted. When it is given, this statement
+     * assigns it, and declares it if nothing else does — so a loop can reuse one variable across iterations.
+     * Memory scope is the device and ordering is relaxed: atomicity per element, with no ordering between
+     * elements. Anything that needs the latter needs a barrier, which this IR does not have.
+     */
+    record AtomicUpdate(LocalVar previous, AtomicOp op, Buffer buffer, Expr index, Expr value)
+            implements Statement {
+        public AtomicUpdate {
+            if (!op.definedOn(buffer.element())) {
+                throw new IllegalArgumentException(
+                        "atomic " + op + " is not defined on buffer '" + buffer.name() + "' of " + buffer.element());
+            }
+            requireType(value.type(), buffer, "value");
+            if (previous != null) {
+                requireType(previous.type(), buffer, "previous");
+            }
+        }
+
+        /** An update whose old value is not wanted. */
+        public AtomicUpdate(AtomicOp op, Buffer buffer, Expr index, Expr value) {
+            this(null, op, buffer, index, value);
+        }
+    }
+
+    /**
+     * Atomically: if {@code buffer[index] == expected}, replace it with {@code desired}. Either way, assign the
+     * value found there to {@code previous} — the exchange happened exactly when {@code previous == expected}.
+     *
+     * <p>Integer elements only, as in SPIR-V. {@code previous} is required: a compare-exchange whose outcome is
+     * not read cannot be told apart from one that failed. Declared by this statement if nothing else declares
+     * it, which is what lets a retry loop reuse it. Device scope, relaxed ordering on both outcomes.
+     */
+    record AtomicCompareExchange(LocalVar previous, Buffer buffer, Expr index, Expr expected, Expr desired)
+            implements Statement {
+        public AtomicCompareExchange {
+            if (!(buffer.element() instanceof Type.Int i && i.width() == 32)) {
+                throw new IllegalArgumentException("atomic compare-exchange needs a 32-bit integer buffer; '"
+                        + buffer.name() + "' holds " + buffer.element());
+            }
+            if (previous == null) {
+                throw new IllegalArgumentException("atomic compare-exchange needs a variable for its outcome");
+            }
+            requireType(previous.type(), buffer, "previous");
+            requireType(expected.type(), buffer, "expected");
+            requireType(desired.type(), buffer, "desired");
+        }
+    }
+
+    private static void requireType(Type type, Buffer buffer, String role) {
+        if (!type.equals(buffer.element())) {
+            throw new IllegalArgumentException("atomic " + role + " is " + type + ", but buffer '" + buffer.name()
+                    + "' holds " + buffer.element());
+        }
+    }
 }

@@ -1,5 +1,7 @@
 package dev.supirvast.supir;
 
+import dev.supirvast.vastir.core.AtomicOp;
+import dev.supirvast.vastir.core.Buffer;
 import dev.supirvast.vastir.core.Builtin;
 import dev.supirvast.vastir.core.CoreModule;
 import dev.supirvast.vastir.core.EntryPoint;
@@ -10,6 +12,7 @@ import dev.supirvast.vastir.core.LocalVar;
 import dev.supirvast.vastir.core.Region;
 import dev.supirvast.vastir.core.ShaderStage;
 import dev.supirvast.vastir.core.Statement;
+import dev.supirvast.vastir.core.UnaryOp;
 import dev.supirvast.vastir.lower.CoreToSpirv;
 import dev.supirvast.vastir.type.Type;
 import org.junit.jupiter.api.Test;
@@ -71,6 +74,42 @@ class RoundTripTest {
                 new Statement.ReturnVoid());
         Function main = new Function("main", new Type.FunctionType(Type.VOID, List.of()), body);
         assertFixpoint(new CoreModule().addEntryPoint(EntryPoint.of(main, ShaderStage.FRAGMENT)));
+    }
+
+    /**
+     * Atomics in all three spellings — a discarded update, one that declares its old value, and a
+     * compare-exchange in a retry loop that reuses a variable declared before it — plus a float add.
+     */
+    @Test
+    void atomicsRoundTrip() {
+        Type.Int i32 = Type.int32();
+        Buffer bins = new Buffer("bins", 0, i32);
+        Buffer sums = new Buffer("sums", 1, F32);
+        Expr zero = new Expr.ConstInt(i32, 0);
+        Expr one = new Expr.ConstInt(i32, 1);
+        LocalVar ticket = new LocalVar("ticket", i32);
+        LocalVar previous = new LocalVar("previous", i32);
+        LocalVar done = new LocalVar("done", Type.BOOL);
+        Region body = Region.of(
+                new Statement.AtomicUpdate(AtomicOp.MAX, bins, one, new Expr.InvocationId()),
+                new Statement.AtomicUpdate(ticket, AtomicOp.ADD, bins, zero, one),
+                new Statement.AtomicUpdate(AtomicOp.ADD, sums, zero, f(0.5)),
+                new Statement.DeclareVar(previous, zero),
+                new Statement.DeclareVar(done, new Expr.ConstBool(false)),
+                new Statement.While(new Expr.Unary(UnaryOp.LOGICAL_NOT, new Expr.Read(done)), Region.of(
+                        new Statement.AtomicCompareExchange(previous, bins, new Expr.ConstInt(i32, 2),
+                                zero, new Expr.Read(ticket)),
+                        new Statement.Assign(done, new Expr.ConstBool(true)))),
+                new Statement.ReturnVoid());
+        Function main = new Function("main", new Type.FunctionType(Type.VOID, List.of()), body);
+        CoreModule module = new CoreModule().addEntryPoint(EntryPoint.compute(main, 1, 1, 1));
+        assertFixpoint(module);
+
+        String text = Supir.print(module);
+        assertTrue(text.contains("atomic max bins[1], invocation_id"), text);
+        assertTrue(text.contains("ticket = atomic add bins[0], 1"), text);
+        assertTrue(text.contains("atomic add sums[0], 0.5"), text);
+        assertTrue(text.contains("previous = atomic cmpxchg bins[2], 0, ticket"), text);
     }
 
     @Test

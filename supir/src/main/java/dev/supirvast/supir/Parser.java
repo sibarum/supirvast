@@ -1,5 +1,6 @@
 package dev.supirvast.supir;
 
+import dev.supirvast.vastir.core.AtomicOp;
 import dev.supirvast.vastir.core.BinaryOp;
 import dev.supirvast.vastir.core.Buffer;
 import dev.supirvast.vastir.core.Builtin;
@@ -260,8 +261,76 @@ final class Parser {
             }
             case "if" -> ifStatement(scope);
             case "loop" -> loopStatement(scope);
+            case "atomic" -> {
+                advance();
+                yield atomic(scope, null, null, null);
+            }
             default -> assignment(scope);
         };
+    }
+
+    private static final Map<String, AtomicOp> ATOMIC = Map.of(
+            "add", AtomicOp.ADD, "sub", AtomicOp.SUB, "min", AtomicOp.MIN, "max", AtomicOp.MAX,
+            "and", AtomicOp.AND, "or", AtomicOp.OR, "xor", AtomicOp.XOR, "exchange", AtomicOp.EXCHANGE);
+
+    /**
+     * After {@code atomic}: {@code <op> buf[index], value}, or {@code cmpxchg buf[index], expected, desired}.
+     * {@code previousName} is the left-hand side when there is one — reassigned if it is already a local,
+     * declared with the buffer's element type if not — and is bound only after the operands are read, so an
+     * operand naming it means the variable from before.
+     */
+    private Statement atomic(Scope scope, String previousName, Lexer.Token previousAt, Type declared) {
+        Lexer.Token opToken = peek();
+        String opWord = ident("an atomic operation");
+        boolean compareExchange = opWord.equals("cmpxchg");
+        AtomicOp op = ATOMIC.get(opWord);
+        if (!compareExchange && op == null) {
+            throw new SupirParseException(opToken.span(), "unknown atomic operation '" + opWord + "'");
+        }
+        Lexer.Token bufferToken = peek();
+        String bufferName = ident("a buffer");
+        Buffer buffer = scope.buffer(bufferName);
+        if (buffer == null) {
+            throw new SupirParseException(bufferToken.span(), "undefined buffer '" + bufferName + "'");
+        }
+        expect(Lexer.Kind.LBRACKET, "[");
+        Expr idx = atom(scope);
+        expect(Lexer.Kind.RBRACKET, "]");
+        expect(Lexer.Kind.COMMA, ",");
+        Expr first = atom(scope);
+        Expr second = null;
+        if (compareExchange) {
+            expect(Lexer.Kind.COMMA, ",");
+            second = atom(scope);
+            if (previousName == null) {
+                throw new SupirParseException(opToken.span(), "atomic cmpxchg needs a variable for its outcome");
+            }
+        }
+
+        LocalVar previous = null;
+        if (previousName != null) {
+            previous = scope.local(previousName);
+            if (previous == null) {
+                previous = new LocalVar(previousName, declared != null ? declared : buffer.element());
+                scope.defineLocal(previousName, previous, previousAt.span());
+            }
+        }
+        try {
+            return compareExchange
+                    ? new Statement.AtomicCompareExchange(previous, buffer, idx, first, second)
+                    : new Statement.AtomicUpdate(previous, op, buffer, idx, first);
+        } catch (IllegalArgumentException invalid) {
+            throw new SupirParseException(opToken.span(), invalid.getMessage());
+        }
+    }
+
+    private boolean atAtomic() {
+        String word = identText(peek());
+        if (word != null && word.equals("atomic")) {
+            advance();
+            return true;
+        }
+        return false;
     }
 
     /** {@code Position = …} / {@code outVar = …} / {@code buf[i] = …} / {@code name[: type] = …}. */
@@ -285,6 +354,9 @@ final class Parser {
         if (accept(Lexer.Kind.COLON)) {
             Type declared = type();
             expect(Lexer.Kind.EQUALS, "=");
+            if (atAtomic()) {
+                return atomic(scope, name, lhs, declared);
+            }
             Expr value = rhs(scope);
             LocalVar var = new LocalVar(name, declared);
             scope.defineLocal(name, var, lhs.span());
@@ -292,6 +364,9 @@ final class Parser {
         }
 
         expect(Lexer.Kind.EQUALS, "=");
+        if (atAtomic()) {
+            return atomic(scope, name, lhs, null);
+        }
 
         Builtin builtin = builtinOrNull(name);
         if (builtin != null) {

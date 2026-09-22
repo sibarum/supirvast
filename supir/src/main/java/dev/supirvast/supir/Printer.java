@@ -179,6 +179,16 @@ final class Printer {
             case Statement.StoreResult sr -> line("store_result " + emitToAtom(sr.value()));
             case Statement.BufferStore bs ->
                     line(bs.buffer().name() + "[" + emitToAtom(bs.index()) + "] = " + renderRhs(bs.value()));
+            case Statement.AtomicUpdate au -> {
+                String text = "atomic " + au.op().name().toLowerCase(java.util.Locale.ROOT) + " "
+                        + au.buffer().name() + "[" + emitToAtom(au.index()) + "], " + emitToAtom(au.value());
+                line(au.previous() == null ? text : previousName(au.previous()) + " = " + text);
+            }
+            case Statement.AtomicCompareExchange cx -> {
+                String text = "atomic cmpxchg " + cx.buffer().name() + "[" + emitToAtom(cx.index()) + "], "
+                        + emitToAtom(cx.expected()) + ", " + emitToAtom(cx.desired());
+                line(previousName(cx.previous()) + " = " + text);
+            }
             case Statement.BuiltinWrite bw -> line(builtinName(bw.builtin()) + " = " + renderRhs(bw.value()));
             case Statement.InterfaceWrite iw -> line(iw.variable().name() + " = " + renderRhs(iw.value()));
             case Statement.DeclareVar dv -> line(declareName(dv.variable()) + " = " + renderRhs(dv.initializer()));
@@ -321,6 +331,11 @@ final class Printer {
         used.add(name);
         localNames.put(var, name);
         return name;
+    }
+
+    /** An atomic's old-value variable: declared here on first sight, reassigned after, as the parser reads it. */
+    private String previousName(LocalVar var) {
+        return localNames.containsKey(var) ? localName(var) : declareName(var);
     }
 
     private String localName(LocalVar var) {
@@ -514,6 +529,17 @@ final class Printer {
                 res.add(bs.buffer());
                 collectExpr(bs.index(), res);
                 collectExpr(bs.value(), res);
+            }
+            case Statement.AtomicUpdate au -> {
+                res.add(au.buffer());
+                collectExpr(au.index(), res);
+                collectExpr(au.value(), res);
+            }
+            case Statement.AtomicCompareExchange cx -> {
+                res.add(cx.buffer());
+                collectExpr(cx.index(), res);
+                collectExpr(cx.expected(), res);
+                collectExpr(cx.desired(), res);
             }
             case Statement.BuiltinWrite bw -> collectExpr(bw.value(), res);
             case Statement.InterfaceWrite iw -> {

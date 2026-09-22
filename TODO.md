@@ -81,6 +81,24 @@ highest-value next proof; **P1** deepens the language; **P2** broadens targets; 
       invocation-id load was hoisted to the entry block (it dominates all blocks) to fix a dominance error when
       the first `gid` use sat inside a loop. CPU already unwinds via its return exception. `EarlyReturnKernelTest`
       (guard clause, early return from a loop, both-arms-return) — CPU==GPU.
+- [x] Atomics — `Statement.AtomicUpdate` (`AtomicOp`: add, sub, min, max, and, or, xor, exchange) and
+      `Statement.AtomicCompareExchange`, each assigning the old value to an optional `previous`, which the
+      statement declares only if nothing else does (so a retry loop reuses one variable). **Statements, not
+      expressions**: a side effect inside a tree is one a folding or dead-code pass above this IR can duplicate
+      or erase. The table is SPIR-V's and is enforced at construction: every op on i32/u32 (min/max pick
+      `S`/`U` by signedness), add/min/max/exchange on f32, compare-exchange integer-only. Device scope, relaxed
+      semantics. Float add and float min/max are `AtomicFloat32AddEXT`/`AtomicFloat32MinMaxEXT` plus their
+      `OpExtension`s — a new extensions section in the module — and go through the target budget, so a device
+      without them registers the kernel CPU-only; `GpuContext` detects `VK_EXT_shader_atomic_float`/`_float2`
+      and enables them. An atomic target counts as stored for the `NonWritable` derivation. The CPU backend's
+      dispatch is sequential, so a plain read-modify-write is atomic by construction. Supir spells them
+      `old = atomic add buf[i], v`, `atomic max buf[i], v` and `old = atomic cmpxchg buf[i], expected, desired`.
+      `KernelColumn` gained a fixed `length` (`withLength`), because the shape atomics exist for — many
+      invocations reducing into few elements — was unmarshallable under one-element-per-invocation.
+      `AtomicKernelTest`: histogram, ticket allocation, signed/unsigned min/max, bitwise, a compare-exchange
+      retry loop, exchange, f32 add and min/max — each backend checked against the order-independent answer.
+      *Still TODO: 64-bit atomics (`Int64Atomics`, `shaderBufferInt64Atomics`); atomics on workgroup memory,
+      which needs workgroup memory first; the graphics-stage device features (`fragmentStoresAndAtomics`).*
 
 ## P2 — Targets & toolchain
 

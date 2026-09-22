@@ -163,10 +163,12 @@ public final class KernelHandle implements Registration, AutoCloseable {
                 throw new IllegalArgumentException("column " + i + " ('"
                         + spec.columns().get(i).name() + "') is null");
             }
-            int needed = n * wordsPerElement(spec.columns().get(i).type());
+            KernelColumn column = spec.columns().get(i);
+            int elements = column.elementsFor(n);
+            int needed = elements * wordsPerElement(column.type());
             if (columns[i].length < needed) {
-                throw new IllegalArgumentException("column " + i + " ('" + spec.columns().get(i).name()
-                        + "') has length " + columns[i].length + " < " + needed + " words needed for " + n
+                throw new IllegalArgumentException("column " + i + " ('" + column.name()
+                        + "') has length " + columns[i].length + " < " + needed + " words needed for " + elements
                         + " elements");
             }
         }

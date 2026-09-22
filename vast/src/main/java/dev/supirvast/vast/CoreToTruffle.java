@@ -8,6 +8,7 @@ import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.nodes.ControlFlowException;
 import com.oracle.truffle.api.nodes.Node;
 import com.oracle.truffle.api.nodes.RootNode;
+import dev.supirvast.vastir.core.AtomicOp;
 import dev.supirvast.vastir.core.BinaryOp;
 import dev.supirvast.vastir.core.Buffer;
 import dev.supirvast.vastir.core.Expr;
@@ -105,6 +106,12 @@ public final class CoreToTruffle {
                     "stage interface outputs are GPU-only; the CPU backend runs compute kernels");
             case Statement.BufferStore s -> new BufferStoreNode(ctx.bufferSlots().get(s.buffer().binding()),
                     s.buffer().element(), lowerExpr(s.index(), ctx), lowerExpr(s.value(), ctx));
+            case Statement.AtomicUpdate s -> new AtomicUpdateNode(ctx.bufferSlots().get(s.buffer().binding()),
+                    s.buffer().element(), s.op(), s.previous() == null ? -1 : ctx.slots().get(s.previous()),
+                    lowerExpr(s.index(), ctx), lowerExpr(s.value(), ctx));
+            case Statement.AtomicCompareExchange s -> new AtomicCompareExchangeNode(
+                    ctx.bufferSlots().get(s.buffer().binding()), ctx.slots().get(s.previous()),
+                    lowerExpr(s.index(), ctx), lowerExpr(s.expected(), ctx), lowerExpr(s.desired(), ctx));
             case Statement.DeclareVar d -> new AssignNode(ctx.slots().get(d.variable()), lowerExpr(d.initializer(), ctx));
             case Statement.Assign a -> new AssignNode(ctx.slots().get(a.variable()), lowerExpr(a.value(), ctx));
             case Statement.If f -> new IfNode(lowerExpr(f.condition(), ctx),
@@ -246,6 +253,12 @@ public final class CoreToTruffle {
         for (Statement statement : region.statements()) {
             switch (statement) {
                 case Statement.DeclareVar d -> out.add(d.variable());
+                case Statement.AtomicUpdate s -> {
+                    if (s.previous() != null) {
+                        addOnce(s.previous(), out);
+                    }
+                }
+                case Statement.AtomicCompareExchange s -> addOnce(s.previous(), out);
                 case Statement.If f -> {
                     collectVariables(f.thenRegion(), out);
                     collectVariables(f.elseRegion(), out);
@@ -260,6 +273,16 @@ public final class CoreToTruffle {
                 case Statement.InterfaceWrite ignored -> { }
             }
         }
+    }
+
+    /** An atomic declares its {@code previous} only if nothing else does; by identity, as {@code CoreToSpirv} does. */
+    private static void addOnce(LocalVar variable, List<LocalVar> out) {
+        for (LocalVar existing : out) {
+            if (existing == variable) {
+                return;
+            }
+        }
+        out.add(variable);
     }
 
     // --- Truffle nodes ---------------------------------------------------------------------------------
@@ -588,6 +611,101 @@ public final class CoreToTruffle {
         @Override
         void execute(VirtualFrame frame) {
             writeColumnElement(bufferAt(frame, slot), (Integer) index.execute(frame), element, value.execute(frame));
+        }
+    }
+
+    // Atomics. The CPU dispatch calls the target once per invocation, one after another, so a plain
+    // read-modify-write on the column is atomic by construction: no two invocations are ever inside one at
+    // once. A CPU dispatch that ran invocations in parallel would have to revisit these two nodes, and nothing
+    // else here.
+
+    private static final class AtomicUpdateNode extends StatementNode {
+        private final int slot;
+        private final Type element;
+        private final AtomicOp op;
+        private final int previousSlot; // -1 when the old value is not wanted
+        @Child private ExprNode index;
+        @Child private ExprNode value;
+
+        AtomicUpdateNode(int slot, Type element, AtomicOp op, int previousSlot, ExprNode index, ExprNode value) {
+            this.slot = slot;
+            this.element = element;
+            this.op = op;
+            this.previousSlot = previousSlot;
+            this.index = index;
+            this.value = value;
+        }
+
+        @Override
+        void execute(VirtualFrame frame) {
+            int[] words = bufferAt(frame, slot);
+            int i = (Integer) index.execute(frame);
+            Object operand = value.execute(frame);
+            Object old = readColumnElement(words, i, element);
+            Object updated = element instanceof Type.Float
+                    ? (Object) applyFloat(op, (Float) old, (Float) operand)
+                    : (Object) applyInt(op, ((Type.Int) element).signed(), (Integer) old, (Integer) operand);
+            writeColumnElement(words, i, element, updated);
+            if (previousSlot >= 0) {
+                frame.setObject(previousSlot, old);
+            }
+        }
+
+        private static int applyInt(AtomicOp op, boolean signed, int old, int operand) {
+            return switch (op) {
+                case ADD -> old + operand;
+                case SUB -> old - operand;
+                case MIN -> signed ? Math.min(old, operand) : (Integer.compareUnsigned(old, operand) <= 0 ? old : operand);
+                case MAX -> signed ? Math.max(old, operand) : (Integer.compareUnsigned(old, operand) >= 0 ? old : operand);
+                case AND -> old & operand;
+                case OR -> old | operand;
+                case XOR -> old ^ operand;
+                case EXCHANGE -> operand;
+            };
+        }
+
+        /**
+         * Float min and max follow the extension's {@code fmin}/{@code fmax} reading, where a NaN operand is
+         * ignored in favour of the other. Whether a given device does the same is not something this backend
+         * can promise, and the two are not required to agree.
+         */
+        private static float applyFloat(AtomicOp op, float old, float operand) {
+            return switch (op) {
+                case ADD -> old + operand;
+                case MIN -> Float.isNaN(old) ? operand : Float.isNaN(operand) ? old : Math.min(old, operand);
+                case MAX -> Float.isNaN(old) ? operand : Float.isNaN(operand) ? old : Math.max(old, operand);
+                case EXCHANGE -> operand;
+                case SUB, AND, OR, XOR -> throw new IllegalStateException("atomic " + op + " on a float");
+            };
+        }
+    }
+
+    private static final class AtomicCompareExchangeNode extends StatementNode {
+        private final int slot;
+        private final int previousSlot;
+        @Child private ExprNode index;
+        @Child private ExprNode expected;
+        @Child private ExprNode desired;
+
+        AtomicCompareExchangeNode(int slot, int previousSlot, ExprNode index, ExprNode expected, ExprNode desired) {
+            this.slot = slot;
+            this.previousSlot = previousSlot;
+            this.index = index;
+            this.expected = expected;
+            this.desired = desired;
+        }
+
+        @Override
+        void execute(VirtualFrame frame) {
+            int[] words = bufferAt(frame, slot);
+            int i = (Integer) index.execute(frame);
+            int comparator = (Integer) expected.execute(frame);
+            int replacement = (Integer) desired.execute(frame);
+            int old = words[i];
+            if (old == comparator) {
+                words[i] = replacement;
+            }
+            frame.setObject(previousSlot, old);
         }
     }
 

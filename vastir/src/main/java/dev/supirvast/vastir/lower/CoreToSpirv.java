@@ -2,6 +2,7 @@ package dev.supirvast.vastir.lower;
 
 import dev.supirvast.vastir.binary.Instruction;
 import dev.supirvast.vastir.binary.SpirvModule;
+import dev.supirvast.vastir.core.AtomicOp;
 import dev.supirvast.vastir.core.BinaryOp;
 import dev.supirvast.vastir.core.Buffer;
 import dev.supirvast.vastir.core.Builtin;
@@ -27,7 +28,9 @@ import dev.supirvast.vastir.spirv.ExecutionModel;
 import dev.supirvast.vastir.spirv.FunctionControl;
 import dev.supirvast.vastir.spirv.LoopControl;
 import dev.supirvast.vastir.spirv.MemoryModel;
+import dev.supirvast.vastir.spirv.MemorySemantics;
 import dev.supirvast.vastir.spirv.Op;
+import dev.supirvast.vastir.spirv.Scope;
 import dev.supirvast.vastir.spirv.SelectionControl;
 import dev.supirvast.vastir.spirv.Dim;
 import dev.supirvast.vastir.spirv.ImageFormat;
@@ -143,6 +146,11 @@ public final class CoreToSpirv {
         if (types.usesFloat64()) {
             required.add(Capability.Float64);
         }
+        Set<Capability> atomics = new LinkedHashSet<>();
+        for (Function function : module.functions()) {
+            floatAtomicCapabilities(function.body(), atomics);
+        }
+        required.addAll(atomics);
         List<Capability> disallowed = required.stream().filter(c -> !target.allows(c)).toList();
         if (!disallowed.isEmpty()) {
             throw new CapabilityException("kernel requires capabilities outside the target profile: " + disallowed);
@@ -150,7 +158,46 @@ public final class CoreToSpirv {
         for (Capability capability : required) {
             b.emit(b.capabilities, Op.OpCapability).enumValue(capability.value());
         }
+        for (Capability capability : atomics) {
+            b.emit(b.extensions, Op.OpExtension).string(extensionFor(capability));
+        }
         return b.finish();
+    }
+
+    /**
+     * The capabilities a module's float atomics need. Integer atomics on a storage buffer are core
+     * {@code Shader}; float add and float min/max are each an extension, which a device may lack — so they go
+     * through the target budget like every other optional capability, and a device without them gets the
+     * kernel registered CPU-only rather than a pipeline that fails to build. Float exchange is core.
+     */
+    private void floatAtomicCapabilities(Region region, Set<Capability> out) {
+        for (Statement statement : region.statements()) {
+            switch (statement) {
+                case Statement.AtomicUpdate s -> {
+                    if (s.buffer().element() instanceof Type.Float) {
+                        switch (s.op()) {
+                            case ADD -> out.add(Capability.AtomicFloat32AddEXT);
+                            case MIN, MAX -> out.add(Capability.AtomicFloat32MinMaxEXT);
+                            default -> { }
+                        }
+                    }
+                }
+                case Statement.If f -> {
+                    floatAtomicCapabilities(f.thenRegion(), out);
+                    floatAtomicCapabilities(f.elseRegion(), out);
+                }
+                case Statement.While w -> floatAtomicCapabilities(w.body(), out);
+                default -> { }
+            }
+        }
+    }
+
+    private static String extensionFor(Capability capability) {
+        return switch (capability) {
+            case AtomicFloat32AddEXT -> "SPV_EXT_shader_atomic_float_add";
+            case AtomicFloat32MinMaxEXT -> "SPV_EXT_shader_atomic_float_min_max";
+            default -> throw new IllegalArgumentException("no extension recorded for " + capability);
+        };
     }
 
     private void emitEntryPoints(CoreModule module, Builder b, Map<Function, Integer> functionIds,
@@ -273,6 +320,9 @@ public final class CoreToSpirv {
      * <p>Exact, not conservative: {@link Statement.BufferStore} names its {@link Buffer} by value, so there is
      * no aliasing to be careful about, and a store can only appear as a statement — never inside an
      * expression — so this walks regions and does not descend into operands.
+     *
+     * <p>An atomic writes too, whatever else it does. Missing one here would decorate the buffer an atomic
+     * targets {@code NonWritable}, which is the broken promise described above.
      */
     private Set<Integer> storedBindings(CoreModule module) {
         Set<Integer> stored = new LinkedHashSet<>();
@@ -286,6 +336,8 @@ public final class CoreToSpirv {
         for (Statement statement : region.statements()) {
             switch (statement) {
                 case Statement.BufferStore s -> stored.add(s.buffer().binding());
+                case Statement.AtomicUpdate s -> stored.add(s.buffer().binding());
+                case Statement.AtomicCompareExchange s -> stored.add(s.buffer().binding());
                 case Statement.If f -> {
                     storedBindings(f.thenRegion(), stored);
                     storedBindings(f.elseRegion(), stored);
@@ -303,6 +355,17 @@ public final class CoreToSpirv {
                     out.putIfAbsent(s.buffer().binding(), s.buffer());
                     collectBuffers(s.index(), out);
                     collectBuffers(s.value(), out);
+                }
+                case Statement.AtomicUpdate s -> {
+                    out.putIfAbsent(s.buffer().binding(), s.buffer());
+                    collectBuffers(s.index(), out);
+                    collectBuffers(s.value(), out);
+                }
+                case Statement.AtomicCompareExchange s -> {
+                    out.putIfAbsent(s.buffer().binding(), s.buffer());
+                    collectBuffers(s.index(), out);
+                    collectBuffers(s.expected(), out);
+                    collectBuffers(s.desired(), out);
                 }
                 case Statement.Return r -> collectBuffers(r.value(), out);
                 case Statement.StoreResult s -> collectBuffers(s.value(), out);
@@ -370,6 +433,8 @@ public final class CoreToSpirv {
         for (Statement statement : region.statements()) {
             switch (statement) {
                 case Statement.BufferStore s -> { scanForInvocationId(s.index(), found); scanForInvocationId(s.value(), found); }
+                case Statement.AtomicUpdate s -> { scanForInvocationId(s.index(), found); scanForInvocationId(s.value(), found); }
+                case Statement.AtomicCompareExchange s -> { scanForInvocationId(s.index(), found); scanForInvocationId(s.expected(), found); scanForInvocationId(s.desired(), found); }
                 case Statement.Return r -> scanForInvocationId(r.value(), found);
                 case Statement.StoreResult s -> scanForInvocationId(s.value(), found);
                 case Statement.BuiltinWrite s -> scanForInvocationId(s.value(), found);
@@ -451,6 +516,15 @@ public final class CoreToSpirv {
                     scanInterface(s.index(), scan);
                     scanInterface(s.value(), scan);
                 }
+                case Statement.AtomicUpdate s -> {
+                    scanInterface(s.index(), scan);
+                    scanInterface(s.value(), scan);
+                }
+                case Statement.AtomicCompareExchange s -> {
+                    scanInterface(s.index(), scan);
+                    scanInterface(s.expected(), scan);
+                    scanInterface(s.desired(), scan);
+                }
                 case Statement.Return r -> scanInterface(r.value(), scan);
                 case Statement.StoreResult s -> scanInterface(s.value(), scan);
                 case Statement.DeclareVar d -> scanInterface(d.initializer(), scan);
@@ -530,6 +604,17 @@ public final class CoreToSpirv {
                     prepareExpr(s.index(), types, constants);
                     prepareExpr(s.value(), types, constants);
                 }
+                case Statement.AtomicUpdate s -> {
+                    prepareAtomic(s.buffer(), s.previous(), types, constants);
+                    prepareExpr(s.index(), types, constants);
+                    prepareExpr(s.value(), types, constants);
+                }
+                case Statement.AtomicCompareExchange s -> {
+                    prepareAtomic(s.buffer(), s.previous(), types, constants);
+                    prepareExpr(s.index(), types, constants);
+                    prepareExpr(s.expected(), types, constants);
+                    prepareExpr(s.desired(), types, constants);
+                }
                 case Statement.DeclareVar d -> {
                     types.pointerType(StorageClass.Function.value(), d.variable().type());
                     prepareExpr(d.initializer(), types, constants);
@@ -546,6 +631,16 @@ public final class CoreToSpirv {
                 }
             }
         }
+    }
+
+    /** The element type, the old value's variable, and the scope and semantics constants every atomic names. */
+    private void prepareAtomic(Buffer buffer, LocalVar previous, TypeTable types, ConstantTable constants) {
+        types.idOf(buffer.element());
+        if (previous != null) {
+            types.pointerType(StorageClass.Function.value(), previous.type());
+        }
+        constants.intConst(Type.uint32(), Scope.Device.value());
+        constants.intConst(Type.uint32(), MemorySemantics.Relaxed.value());
     }
 
     private void prepareExpr(Expr expr, TypeTable types, ConstantTable constants) {
@@ -626,6 +721,7 @@ public final class CoreToSpirv {
     private static final class Builder {
         final SpirvModule module = new SpirvModule();
         final List<Instruction> capabilities = new ArrayList<>();
+        final List<Instruction> extensions = new ArrayList<>();
         final List<Instruction> extInstImports = new ArrayList<>();
         final List<Instruction> memoryModel = new ArrayList<>();
         final List<Instruction> entryPoints = new ArrayList<>();
@@ -656,7 +752,7 @@ public final class CoreToSpirv {
 
         SpirvModule finish() {
             // OpExtInstImport must follow capabilities/extensions and precede OpMemoryModel (SPIR-V layout).
-            List<List<Instruction>> ordered = List.of(capabilities, extInstImports, memoryModel, entryPoints,
+            List<List<Instruction>> ordered = List.of(capabilities, extensions, extInstImports, memoryModel, entryPoints,
                     executionModes, annotations, globals, functions);
             for (List<Instruction> section : ordered) {
                 section.forEach(module::add);
@@ -1216,6 +1312,30 @@ public final class CoreToSpirv {
                     int value = lowerExpr(s.value());
                     kernel.storeElement(b, types, s.buffer(), index, value);
                 }
+                case Statement.AtomicUpdate s -> {
+                    int index = lowerExpr(s.index());
+                    int value = lowerExpr(s.value());
+                    int pointer = kernel.elementPointer(b, s.buffer(), index);
+                    int old = b.allocateId();
+                    b.emit(b.functions, atomicOp(s.op(), s.buffer().element()))
+                            .id(types.idOf(s.buffer().element())).id(old).id(pointer)
+                            .id(deviceScope()).id(relaxed()).id(value);
+                    if (s.previous() != null) {
+                        store(s.previous(), old);
+                    }
+                }
+                case Statement.AtomicCompareExchange s -> {
+                    int index = lowerExpr(s.index());
+                    int expected = lowerExpr(s.expected());
+                    int desired = lowerExpr(s.desired());
+                    int pointer = kernel.elementPointer(b, s.buffer(), index);
+                    int old = b.allocateId();
+                    // Operand order is SPIR-V's: the value to write comes before the comparator.
+                    b.emit(b.functions, Op.OpAtomicCompareExchange)
+                            .id(types.idOf(s.buffer().element())).id(old).id(pointer)
+                            .id(deviceScope()).id(relaxed()).id(relaxed()).id(desired).id(expected);
+                    store(s.previous(), old);
+                }
                 case Statement.BuiltinWrite s -> {
                     int value = lowerExpr(s.value());
                     b.emit(b.functions, Op.OpStore).id(interfaceResources.builtinVariable(s.builtin())).id(value);
@@ -1233,6 +1353,38 @@ public final class CoreToSpirv {
 
         private void store(LocalVar variable, int valueId) {
             b.emit(b.functions, Op.OpStore).id(variablePointers.get(variable)).id(valueId);
+        }
+
+        private int deviceScope() {
+            return constants.intConst(Type.uint32(), Scope.Device.value());
+        }
+
+        private int relaxed() {
+            return constants.intConst(Type.uint32(), MemorySemantics.Relaxed.value());
+        }
+
+        /** The instruction for {@code op} on {@code element}; {@link AtomicOp#definedOn} has already vetted the pair. */
+        private static Op atomicOp(AtomicOp op, Type element) {
+            if (element instanceof Type.Float) {
+                return switch (op) {
+                    case ADD -> Op.OpAtomicFAddEXT;
+                    case MIN -> Op.OpAtomicFMinEXT;
+                    case MAX -> Op.OpAtomicFMaxEXT;
+                    case EXCHANGE -> Op.OpAtomicExchange;
+                    case SUB, AND, OR, XOR -> throw new IllegalStateException("atomic " + op + " on a float");
+                };
+            }
+            boolean signed = ((Type.Int) element).signed();
+            return switch (op) {
+                case ADD -> Op.OpAtomicIAdd;
+                case SUB -> Op.OpAtomicISub;
+                case MIN -> signed ? Op.OpAtomicSMin : Op.OpAtomicUMin;
+                case MAX -> signed ? Op.OpAtomicSMax : Op.OpAtomicUMax;
+                case AND -> Op.OpAtomicAnd;
+                case OR -> Op.OpAtomicOr;
+                case XOR -> Op.OpAtomicXor;
+                case EXCHANGE -> Op.OpAtomicExchange;
+            };
         }
 
         /** Loads gl_GlobalInvocationID.x once per function and reuses the (signed-int) result. */
@@ -1605,6 +1757,12 @@ public final class CoreToSpirv {
             for (Statement statement : region.statements()) {
                 switch (statement) {
                     case Statement.DeclareVar d -> out.add(d.variable());
+                    case Statement.AtomicUpdate s -> {
+                        if (s.previous() != null) {
+                            addOnce(s.previous(), out);
+                        }
+                    }
+                    case Statement.AtomicCompareExchange s -> addOnce(s.previous(), out);
                     case Statement.If f -> {
                         collectVariables(f.thenRegion(), out);
                         collectVariables(f.elseRegion(), out);
@@ -1619,6 +1777,20 @@ public final class CoreToSpirv {
                     case Statement.InterfaceWrite ignored -> { }
                 }
             }
+        }
+
+        /**
+         * An atomic's {@code previous} is declared by the atomic only if nothing else declares it, so a retry
+         * loop can reuse one variable. By identity: two distinct variables with the same name and type are
+         * still two variables, which record equality would merge.
+         */
+        private static void addOnce(LocalVar variable, List<LocalVar> out) {
+            for (LocalVar existing : out) {
+                if (existing == variable) {
+                    return;
+                }
+            }
+            out.add(variable);
         }
     }
 
