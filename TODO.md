@@ -235,12 +235,22 @@ In this order, and each of the last two only once a kernel is **measured** to ne
       allocation, upload and readback, the kernel itself went from ~32 ms to ~1 ms. `LocalInvocationId` and
       `WorkgroupId` moved to step 2: nothing can use them before workgroup memory, and their CPU meaning
       belongs with that step's phase design.
-- [ ] **1½. Resident, device-local buffers — now the bottleneck.** Step 1's measurement put ~16 ms of fixed
-      cost on every 4 MB run. `GpuContext` allocates per dispatch from `HOST_VISIBLE | HOST_COHERENT` memory:
-      on a discrete card the kernel reaches that across PCIe, and without `HOST_CACHED` the readback is an
-      uncached read. Wanted: buffers that live on the device between dispatches (`DEVICE_LOCAL`), staged in
-      and out explicitly, with the readback staging buffer `HOST_CACHED` — and a way for a caller to say a
-      column stays resident across runs, which is what a stepped simulation is.
+- [x] **1½. Resident, device-local buffers.** Step 1's measurement put ~16 ms of fixed cost on every 4 MB
+      run, because `GpuContext` allocated per dispatch from `HOST_VISIBLE | HOST_COHERENT` memory — reached
+      across PCIe by the kernel, read back uncached by the host. Now `Accelerator.allocate(type, elements)`
+      returns a `ResidentBuffer`: `DEVICE_LOCAL` memory with a GPU, a host array without, the same to a
+      caller. `write`/`read` are staged copies, the readback's staging `HOST_CACHED` where the device has it.
+      `KernelHandle.dispatch(buffers, n)` runs against them in place and returns without waiting: every
+      resident command buffer goes on one queue and opens with a memory barrier, whose first scope is all
+      earlier work in submission order, so each dispatch sees its predecessor's writes and cannot overwrite
+      what its predecessor still reads. At most 64 are in flight before a dispatch waits for the oldest;
+      finished ones are reclaimed lazily. A handle that cannot use the GPU dispatches on the CPU — over host
+      arrays in place, over device buffers by read, run, write back. `release` and `close` wait for resident
+      work before destroying a pipeline under it. `ResidentBufferTest`: a hundred ping-pong steps queued with
+      no read between, an atomic histogram accumulating across dispatches, both CPU fallbacks, and the
+      refusals. **Measured** on a 2²⁰-element f32 field stepped 100 times: 34.8 ms per step through `run`,
+      0.35 ms per step resident, one read included. *Still per dispatch: a descriptor pool and set; caching
+      them per buffer tuple is the next cut if dispatch overhead ever shows.*
 - [ ] **2. Workgroup memory and barriers.** Arrays in the `Workgroup` storage class, `OpControlBarrier`,
       atomics on workgroup memory. The declared size is known at compile time, so registration checks it
       against `maxComputeSharedMemorySize` (16 KB guaranteed, ~48 KB typical) through the same budget path

@@ -57,6 +57,7 @@ public final class Accelerator implements AutoCloseable {
 
     private final NativeTools tools = new NativeTools();
     private final Map<KernelHandle, GpuContext.ResidentKernel> pipelines = new IdentityHashMap<>();
+    private final List<ResidentBuffer> residentBuffers = new ArrayList<>();
     private final SpirvTarget budget;   // optional caller-imposed capability restriction (#2)
     private Boolean gpuAvailable;       // probed once (probing builds a Vulkan instance — not free)
     private GpuContext context;         // opened lazily on first GPU need, held for this Accelerator's life
@@ -151,9 +152,33 @@ public final class Accelerator implements AutoCloseable {
         return new Capabilities(gpuAvailable(), tools.isAvailable(), device);
     }
 
-    /** Releases the resident GPU pipelines and context. Safe to call when no GPU was ever used. */
+    /**
+     * A {@link ResidentBuffer} of {@code elements} elements of {@code element}: device-local memory when a GPU
+     * is present, a host array the CPU backend runs over in place when not. Its contents are undefined on the
+     * device and zero on the host until written. Closed by {@link #close} if the caller has not.
+     */
+    public ResidentBuffer allocate(Type element, int elements) {
+        if (!isSupportedColumnType(element)) {
+            throw new IllegalArgumentException("unsupported element type for a resident buffer: " + element);
+        }
+        if (elements < 1) {
+            throw new IllegalArgumentException("a resident buffer needs at least one element, got " + elements);
+        }
+        ResidentBuffer buffer = gpuAvailable()
+                ? ResidentBuffer.onDevice(context(), element, elements)
+                : ResidentBuffer.onHost(element, elements);
+        residentBuffers.add(buffer);
+        return buffer;
+    }
+
+    /** Releases resident buffers, pipelines and the context. Safe to call when no GPU was ever used. */
     @Override
     public void close() {
+        if (context != null) {
+            context.finish();   // nothing may be destroyed under a dispatch still running
+        }
+        residentBuffers.forEach(ResidentBuffer::close);
+        residentBuffers.clear();
         pipelines.values().forEach(GpuContext.ResidentKernel::close);
         pipelines.clear();
         if (context != null) {
@@ -179,6 +204,7 @@ public final class Accelerator implements AutoCloseable {
         if (pipeline == null) {
             return false;
         }
+        context().finish();   // a resident dispatch of this kernel may still be executing its pipeline
         pipeline.close();
         return true;
     }
@@ -201,6 +227,15 @@ public final class Accelerator implements AutoCloseable {
             throw new IllegalStateException("no GPU pipeline for this kernel (not preloaded)");
         }
         return context().submitAsync(pipeline, columns, n);
+    }
+
+    /** Submits {@code handle}'s pipeline against resident device buffers; called by {@link KernelHandle#dispatch}. */
+    void dispatchResident(KernelHandle handle, GpuContext.DeviceBuffer[] buffers, int n) {
+        GpuContext.ResidentKernel pipeline = pipelines.get(handle);
+        if (pipeline == null) {
+            throw new IllegalStateException("no GPU pipeline for this kernel (not preloaded)");
+        }
+        context().dispatchResident(pipeline, buffers, n);
     }
 
     /** Awaits a {@link #submitGpu} submission and reads its results; called by {@link KernelHandle#await}. */

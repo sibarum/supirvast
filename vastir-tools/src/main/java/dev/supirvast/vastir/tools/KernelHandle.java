@@ -59,6 +59,42 @@ public final class KernelHandle implements Registration, AutoCloseable {
         return onGpu() ? runGpu(columns, n) : runCpu(columns, n);
     }
 
+    /**
+     * Runs the kernel over {@code n} invocations against resident buffers, one per column in binding order,
+     * updating them where they live. Nothing is copied in or out: a stepped kernel dispatches repeatedly and
+     * the host {@link ResidentBuffer#read reads} only when it wants to look. On the GPU this returns without
+     * waiting, and every later dispatch, read or write is ordered after it.
+     *
+     * <p>Where the kernel cannot run on the GPU — no device, a capability the device lacks, a released
+     * pipeline — it runs on the CPU instead, over host buffers in place, or over device buffers by reading
+     * them, running, and writing them back. Slower, never wrong.
+     */
+    public void dispatch(List<ResidentBuffer> buffers, int n) {
+        validateResident(buffers, n);
+        boolean allOnDevice = buffers.stream().allMatch(ResidentBuffer::onDevice);
+        if (onGpu() && allOnDevice) {
+            GpuContext.DeviceBuffer[] devices = new GpuContext.DeviceBuffer[buffers.size()];
+            for (int i = 0; i < devices.length; i++) {
+                devices[i] = buffers.get(i).device();
+            }
+            accelerator.dispatchResident(this, devices, n);
+            return;
+        }
+        int[][] work = new int[buffers.size()][];
+        for (int i = 0; i < work.length; i++) {
+            ResidentBuffer buffer = buffers.get(i);
+            work[i] = buffer.onDevice() ? buffer.read() : buffer.hostArray();
+        }
+        for (int i = 0; i < n; i++) {
+            cpuTarget.call(i, work);
+        }
+        for (int i = 0; i < work.length; i++) {
+            if (buffers.get(i).onDevice()) {
+                buffers.get(i).write(work[i]);
+            }
+        }
+    }
+
     /** The backend {@link #run} would choose right now (GPU if a pipeline was preloaded for it, else CPU). */
     public Backend preferredBackend() {
         return onGpu() ? Backend.GPU : Backend.CPU;
@@ -145,6 +181,34 @@ public final class KernelHandle implements Registration, AutoCloseable {
             cpuTarget.call(i, work);
         }
         return work;
+    }
+
+    private void validateResident(List<ResidentBuffer> buffers, int n) {
+        if (buffers == null || buffers.size() != spec.columns().size()) {
+            throw new IllegalArgumentException("expected " + spec.columns().size() + " resident buffers ("
+                    + spec.columns().stream().map(KernelColumn::name).toList() + "), got "
+                    + (buffers == null ? "null" : buffers.size()));
+        }
+        if (n < 0) {
+            throw new IllegalArgumentException("invocation count must be >= 0, got " + n);
+        }
+        for (int i = 0; i < buffers.size(); i++) {
+            KernelColumn column = spec.columns().get(i);
+            ResidentBuffer buffer = buffers.get(i);
+            if (buffer == null || buffer.isClosed()) {
+                throw new IllegalArgumentException("resident buffer " + i + " ('" + column.name() + "') is "
+                        + (buffer == null ? "null" : "closed"));
+            }
+            if (!buffer.element().equals(column.type())) {
+                throw new IllegalArgumentException("resident buffer " + i + " ('" + column.name() + "') holds "
+                        + buffer.element() + ", but the column is " + column.type());
+            }
+            if (buffer.elements() < column.elementsFor(n)) {
+                throw new IllegalArgumentException("resident buffer " + i + " ('" + column.name() + "') holds "
+                        + buffer.elements() + " elements < " + column.elementsFor(n) + " needed for " + n
+                        + " invocations");
+            }
+        }
     }
 
     private void validate(int[][] columns, int n) {

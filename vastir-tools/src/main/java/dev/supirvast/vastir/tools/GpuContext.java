@@ -5,7 +5,10 @@ import org.lwjgl.system.Configuration;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.VkApplicationInfo;
+import org.lwjgl.vulkan.VkBufferCopy;
 import org.lwjgl.vulkan.VkBufferCreateInfo;
+import org.lwjgl.vulkan.VkMappedMemoryRange;
+import org.lwjgl.vulkan.VkMemoryBarrier;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkCommandBufferAllocateInfo;
 import org.lwjgl.vulkan.VkCommandBufferBeginInfo;
@@ -271,8 +274,251 @@ public final class GpuContext implements AutoCloseable {
         return q;
     }
 
+    // --- resident buffers ------------------------------------------------------------------------------
+    //
+    // Buffers that live in device-local memory between dispatches, so a stepped kernel pays for transfers
+    // only when the host actually wants the data. Everything touching them goes through one queue, and every
+    // command buffer on it opens with a memory barrier, so each dispatch or copy sees the writes of all the
+    // work submitted before it -- a pipeline barrier's first scope is everything earlier in submission order
+    // on the same queue, across command buffers. That is what lets a dispatch be submitted without waiting.
+
+    /** Resident work submitted and not yet reclaimed; past this many, a dispatch waits for the oldest. */
+    private static final int MAX_PENDING = 64;
+
+    private final java.util.ArrayDeque<Pending> pending = new java.util.ArrayDeque<>();
+
+    /** A submitted resident command buffer and what to free once its fence signals. */
+    private record Pending(VkCommandBuffer cmd, long fence, long descriptorPool) {}
+
+    /**
+     * A storage buffer in device-local memory that outlives dispatches. Owning-thread only, like the rest of
+     * this context; close it before the context.
+     */
+    public static final class DeviceBuffer implements AutoCloseable {
+        private final GpuContext owner;
+        private final long buffer;
+        private final long memory;
+        private final int words;
+        private boolean closed;
+
+        private DeviceBuffer(GpuContext owner, long buffer, long memory, int words) {
+            this.owner = owner;
+            this.buffer = buffer;
+            this.memory = memory;
+            this.words = words;
+        }
+
+        /** Capacity in 32-bit words. */
+        public int words() {
+            return words;
+        }
+
+        /** Waits for resident work that may still use it, then frees it. Idempotent. */
+        @Override
+        public void close() {
+            if (!closed) {
+                owner.finish();
+                vkDestroyBuffer(owner.device, buffer, null);
+                vkFreeMemory(owner.device, memory, null);
+                closed = true;
+            }
+        }
+
+        private long handle() {
+            if (closed) {
+                throw new IllegalStateException("device buffer is closed");
+            }
+            return buffer;
+        }
+    }
+
+    /** A device-local buffer of {@code words} 32-bit words, contents undefined until written. */
+    public DeviceBuffer allocateBuffer(int words) {
+        if (words < 1) {
+            throw new IllegalArgumentException("a device buffer needs at least one word, got " + words);
+        }
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            long buffer = createBuffer(device, (long) words * Integer.BYTES,
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                            | VK_BUFFER_USAGE_TRANSFER_DST_BIT, stack);
+            // Device-local where the implementation has it for this buffer; any allowed type otherwise, which
+            // on an integrated GPU is the same memory anyway.
+            Allocation allocation = allocate(physical, device, buffer, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, stack);
+            return new DeviceBuffer(this, buffer, allocation.memory(), words);
+        }
+    }
+
+    /** Replaces the start of {@code target} with {@code data}, through a staging buffer. Waits for the copy. */
+    public void write(DeviceBuffer target, int[] data) {
+        if (data.length > target.words()) {
+            throw new IllegalArgumentException(data.length + " words do not fit a " + target.words() + "-word buffer");
+        }
+        if (data.length == 0) {
+            return;
+        }
+        long size = (long) data.length * Integer.BYTES;
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            long staging = createBuffer(device, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, stack);
+            Allocation memory = allocate(physical, device, staging, 0,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stack);
+            try {
+                writeInts(device, memory.memory(), data);
+                VkCommandBuffer cmd = beginOneShot(stack);
+                residentBarrier(cmd, stack);
+                vkCmdCopyBuffer(cmd, staging, target.handle(), VkBufferCopy.calloc(1, stack).size(size));
+                check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
+                submitResidentAndWait(cmd, stack);
+            } finally {
+                vkDestroyBuffer(device, staging, null);
+                vkFreeMemory(device, memory.memory(), null);
+            }
+        }
+    }
+
+    /**
+     * The first {@code words} words of {@code source}, once all resident work submitted before this call has
+     * finished with it. Through a host-cached staging buffer where the device has one: an uncached read of
+     * mapped memory is what made the per-dispatch path slow.
+     */
+    public int[] read(DeviceBuffer source, int words) {
+        if (words > source.words()) {
+            throw new IllegalArgumentException(words + " words exceed a " + source.words() + "-word buffer");
+        }
+        if (words == 0) {
+            return new int[0];
+        }
+        long size = (long) words * Integer.BYTES;
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            long staging = createBuffer(device, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, stack);
+            Allocation memory = allocate(physical, device, staging, VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, stack);
+            try {
+                VkCommandBuffer cmd = beginOneShot(stack);
+                residentBarrier(cmd, stack);
+                vkCmdCopyBuffer(cmd, source.handle(), staging, VkBufferCopy.calloc(1, stack).size(size));
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                        VkMemoryBarrier.calloc(1, stack).sType$Default()
+                                .srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT).dstAccessMask(VK_ACCESS_HOST_READ_BIT),
+                        null, null);
+                check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
+                submitResidentAndWait(cmd, stack);
+                if (!memory.coherent()) {
+                    check(vkInvalidateMappedMemoryRanges(device, VkMappedMemoryRange.calloc(1, stack).sType$Default()
+                            .memory(memory.memory()).offset(0).size(VK_WHOLE_SIZE)), "vkInvalidateMappedMemoryRanges");
+                }
+                return readInts(device, memory.memory(), words);
+            } finally {
+                vkDestroyBuffer(device, staging, null);
+                vkFreeMemory(device, memory.memory(), null);
+            }
+        }
+    }
+
+    /**
+     * Submits {@code kernel} over {@code invocations} invocations against resident {@code buffers} (one per
+     * binding) and returns without waiting. The next dispatch, {@link #read} or {@link #write} on this context
+     * is ordered after it. No data moves.
+     */
+    public void dispatchResident(ResidentKernel kernel, DeviceBuffer[] buffers, int invocations) {
+        if (buffers.length != kernel.bindingCount) {
+            throw new IllegalArgumentException("kernel expects " + kernel.bindingCount + " buffers, got "
+                    + buffers.length);
+        }
+        if (pending.size() >= MAX_PENDING) {
+            retire(pending.removeFirst(), true);
+        }
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            long[] handles = new long[buffers.length];
+            for (int i = 0; i < buffers.length; i++) {
+                handles[i] = buffers[i].handle();
+            }
+            long descriptorPool = createDescriptorPool(device, kernel.bindingCount, stack);
+            long descriptorSet = allocateDescriptorSet(device, descriptorPool, kernel.setLayout, stack);
+            bindBuffers(device, descriptorSet, handles, stack);
+
+            VkCommandBuffer cmd = beginOneShot(stack);
+            residentBarrier(cmd, stack);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipelineLayout, 0,
+                    stack.longs(descriptorSet), null);
+            if (kernel.guarded()) {
+                vkCmdPushConstants(cmd, kernel.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, stack.ints(invocations));
+            }
+            vkCmdDispatch(cmd, kernel.groupsFor(invocations), 1, 1);
+            check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
+
+            long fence = createFence(device, stack);
+            check(vkQueueSubmit(queues[0], VkSubmitInfo.calloc(stack).sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
+                    .pCommandBuffers(stack.pointers(cmd)), fence), "vkQueueSubmit");
+            pending.addLast(new Pending(cmd, fence, descriptorPool));
+        }
+        reclaim();
+    }
+
+    /** Blocks until every resident dispatch submitted so far has finished, and frees what they held. */
+    public void finish() {
+        while (!pending.isEmpty()) {
+            retire(pending.removeFirst(), true);
+        }
+    }
+
+    /** Frees the resident work that has already finished, oldest first, without waiting. */
+    private void reclaim() {
+        while (!pending.isEmpty() && vkGetFenceStatus(device, pending.peekFirst().fence()) == VK_SUCCESS) {
+            retire(pending.removeFirst(), false);
+        }
+    }
+
+    private void retire(Pending work, boolean wait) {
+        if (wait) {
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                check(vkWaitForFences(device, stack.longs(work.fence()), true, Long.MAX_VALUE), "vkWaitForFences");
+            }
+        }
+        vkDestroyFence(device, work.fence(), null);
+        vkFreeCommandBuffers(device, commandPool, work.cmd());
+        vkDestroyDescriptorPool(device, work.descriptorPool(), null);
+    }
+
+    private VkCommandBuffer beginOneShot(MemoryStack stack) {
+        PointerBuffer pCmd = stack.mallocPointer(1);
+        check(vkAllocateCommandBuffers(device, VkCommandBufferAllocateInfo.calloc(stack)
+                .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO).commandPool(commandPool)
+                .level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1), pCmd), "vkAllocateCommandBuffers");
+        VkCommandBuffer cmd = new VkCommandBuffer(pCmd.get(0), device);
+        check(vkBeginCommandBuffer(cmd, VkCommandBufferBeginInfo.calloc(stack)
+                .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+                .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)), "vkBeginCommandBuffer");
+        return cmd;
+    }
+
+    /** Submits a copy on the resident queue — ordered after every pending dispatch — and waits for it. */
+    private void submitResidentAndWait(VkCommandBuffer cmd, MemoryStack stack) {
+        long fence = createFence(device, stack);
+        check(vkQueueSubmit(queues[0], VkSubmitInfo.calloc(stack).sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
+                .pCommandBuffers(stack.pointers(cmd)), fence), "vkQueueSubmit");
+        check(vkWaitForFences(device, stack.longs(fence), true, Long.MAX_VALUE), "vkWaitForFences");
+        vkDestroyFence(device, fence, null);
+        vkFreeCommandBuffers(device, commandPool, cmd);
+        reclaim();   // the queue is in order, so everything submitted before this copy has finished too
+    }
+
+    /**
+     * Every earlier shader or transfer write, made visible to every later shader or transfer access. Coarse on
+     * purpose: one barrier per command buffer is negligible against a dispatch, and a finer one would have to
+     * know which buffers each dispatch touches — which is the kind of bookkeeping that is wrong once.
+     */
+    private static void residentBarrier(VkCommandBuffer cmd, MemoryStack stack) {
+        int stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+        vkCmdPipelineBarrier(cmd, stages, stages, 0, VkMemoryBarrier.calloc(1, stack).sType$Default()
+                .srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT)
+                .dstAccessMask(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+                        | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT), null, null);
+    }
+
     @Override
     public void close() {
+        finish();
         vkDestroyCommandPool(device, commandPool, null);
         vkDestroyDevice(device, null);
         vkDestroyInstance(instance, null);
@@ -515,10 +761,14 @@ public final class GpuContext implements AutoCloseable {
     }
 
     private static long createBuffer(VkDevice device, long sizeBytes, MemoryStack stack) {
+        return createBuffer(device, sizeBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, stack);
+    }
+
+    private static long createBuffer(VkDevice device, long sizeBytes, int usage, MemoryStack stack) {
         VkBufferCreateInfo info = VkBufferCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO)
                 .size(sizeBytes)
-                .usage(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+                .usage(usage)
                 .sharingMode(VK_SHARING_MODE_EXCLUSIVE);
         LongBuffer pBuffer = stack.mallocLong(1);
         check(vkCreateBuffer(device, info, null, pBuffer), "vkCreateBuffer");
@@ -526,23 +776,31 @@ public final class GpuContext implements AutoCloseable {
     }
 
     private static long allocateAndBind(VkPhysicalDevice physical, VkDevice device, long buffer, MemoryStack stack) {
+        return allocate(physical, device, buffer, 0,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stack).memory();
+    }
+
+    /** Bound device memory, and whether host writes and reads of it need no flush or invalidate. */
+    private record Allocation(long memory, boolean coherent) {}
+
+    /**
+     * Allocates and binds memory for {@code buffer} from a type that has every {@code required} property,
+     * preferring one that also has every {@code preferred} property.
+     */
+    private static Allocation allocate(VkPhysicalDevice physical, VkDevice device, long buffer, int preferred,
+            int required, MemoryStack stack) {
         VkMemoryRequirements requirements = VkMemoryRequirements.malloc(stack);
         vkGetBufferMemoryRequirements(device, buffer, requirements);
 
         VkPhysicalDeviceMemoryProperties memProps = VkPhysicalDeviceMemoryProperties.malloc(stack);
         vkGetPhysicalDeviceMemoryProperties(physical, memProps);
-        int wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        int typeIndex = -1;
-        for (int i = 0; i < memProps.memoryTypeCount(); i++) {
-            boolean allowed = (requirements.memoryTypeBits() & (1 << i)) != 0;
-            boolean visible = (memProps.memoryTypes(i).propertyFlags() & wanted) == wanted;
-            if (allowed && visible) {
-                typeIndex = i;
-                break;
-            }
+        int typeIndex = memoryType(memProps, requirements.memoryTypeBits(), required | preferred);
+        if (typeIndex < 0) {
+            typeIndex = memoryType(memProps, requirements.memoryTypeBits(), required);
         }
         if (typeIndex < 0) {
-            throw new IllegalStateException("no host-visible memory type for the storage buffer");
+            throw new IllegalStateException("no memory type with properties 0x" + Integer.toHexString(required)
+                    + " for the buffer");
         }
 
         VkMemoryAllocateInfo info = VkMemoryAllocateInfo.calloc(stack)
@@ -553,7 +811,18 @@ public final class GpuContext implements AutoCloseable {
         check(vkAllocateMemory(device, info, null, pMemory), "vkAllocateMemory");
         long memory = pMemory.get(0);
         check(vkBindBufferMemory(device, buffer, memory, 0), "vkBindBufferMemory");
-        return memory;
+        boolean coherent = (memProps.memoryTypes(typeIndex).propertyFlags() & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+        return new Allocation(memory, coherent);
+    }
+
+    private static int memoryType(VkPhysicalDeviceMemoryProperties memProps, int allowedTypes, int properties) {
+        for (int i = 0; i < memProps.memoryTypeCount(); i++) {
+            boolean allowed = (allowedTypes & (1 << i)) != 0;
+            if (allowed && (memProps.memoryTypes(i).propertyFlags() & properties) == properties) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     private static long createShaderModule(VkDevice device, byte[] spirv, MemoryStack stack) {
