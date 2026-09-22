@@ -29,6 +29,7 @@ import org.lwjgl.vulkan.VkPhysicalDevice;
 import org.lwjgl.vulkan.VkPhysicalDeviceMemoryProperties;
 import org.lwjgl.vulkan.VkPipelineLayoutCreateInfo;
 import org.lwjgl.vulkan.VkPipelineShaderStageCreateInfo;
+import org.lwjgl.vulkan.VkPushConstantRange;
 import org.lwjgl.vulkan.VkQueue;
 import org.lwjgl.vulkan.VkQueueFamilyProperties;
 import org.lwjgl.vulkan.VkShaderModuleCreateInfo;
@@ -156,25 +157,41 @@ public final class GpuContext implements AutoCloseable {
      * dispatches and must be {@link ResidentKernel#close() closed} (before this context).
      */
     public ResidentKernel build(byte[] spirv, String entryPoint, int bindingCount) {
+        return build(spirv, entryPoint, bindingCount, 1);
+    }
+
+    /**
+     * As {@link #build(byte[], String, int)}, for a kernel whose workgroups are {@code workgroupSize}
+     * invocations wide. Above one, the dispatch rounds up to whole workgroups, so the shader must stop the
+     * invocations past the requested count — it reads that count from a 4-byte push constant at offset 0,
+     * which this pipeline's layout declares and every dispatch sets. {@code Accelerator} emits that guard.
+     */
+    public ResidentKernel build(byte[] spirv, String entryPoint, int bindingCount, int workgroupSize) {
+        if (workgroupSize < 1) {
+            throw new IllegalArgumentException("workgroup size must be >= 1, got " + workgroupSize);
+        }
+        boolean guarded = workgroupSize > 1;
         try (MemoryStack stack = MemoryStack.stackPush()) {
             long shaderModule = createShaderModule(device, spirv, stack);
             long setLayout = createSetLayout(device, bindingCount, stack);
-            long pipelineLayout = createPipelineLayout(device, setLayout, stack);
+            long pipelineLayout = createPipelineLayout(device, setLayout, guarded, stack);
             long pipeline = createComputePipeline(device, pipelineLayout, shaderModule, entryPoint, stack);
             // The pipeline/layouts are immutable and safe to share across concurrent dispatches; the
             // mutable binding state (the descriptor set) is allocated PER submission instead, so one
             // pipeline can back several in-flight dispatches at once (see submitAsync).
-            return new ResidentKernel(device, shaderModule, setLayout, pipelineLayout, pipeline, bindingCount);
+            return new ResidentKernel(device, shaderModule, setLayout, pipelineLayout, pipeline, bindingCount,
+                    workgroupSize);
         }
     }
 
     /**
-     * Dispatches {@code kernel} with {@code groupCountX} workgroups against the given buffers (one per
-     * binding; inputs pre-filled, outputs sized). Returns the buffers' contents read back after execution.
-     * Storage buffers are allocated and freed within the call; the pipeline is reused.
+     * Dispatches {@code kernel} over {@code invocations} invocations against the given buffers (one per
+     * binding; inputs pre-filled, outputs sized) — as {@code ceil(invocations / workgroupSize)} workgroups.
+     * Returns the buffers' contents read back after execution. Storage buffers are allocated and freed within
+     * the call; the pipeline is reused.
      */
-    public int[][] dispatch(ResidentKernel kernel, int[][] buffers, int groupCountX) {
-        return await(submitAsync(kernel, buffers, groupCountX));
+    public int[][] dispatch(ResidentKernel kernel, int[][] buffers, int invocations) {
+        return await(submitAsync(kernel, buffers, invocations));
     }
 
     /**
@@ -184,7 +201,7 @@ public final class GpuContext implements AutoCloseable {
      * several concurrent dispatches of the <em>same</em> pipeline (each gets its own descriptor set and
      * buffers). Must be called on the owning thread (recording is not internally synchronized).
      */
-    public Submission submitAsync(ResidentKernel kernel, int[][] buffers, int groupCountX) {
+    public Submission submitAsync(ResidentKernel kernel, int[][] buffers, int invocations) {
         if (buffers.length != kernel.bindingCount) {
             throw new IllegalArgumentException("kernel expects " + kernel.bindingCount + " buffers, got "
                     + buffers.length);
@@ -208,7 +225,7 @@ public final class GpuContext implements AutoCloseable {
             bindBuffers(device, descriptorSet, bufferHandles, stack);
 
             VkCommandBuffer cmd = recordDispatch(device, commandPool, kernel.pipeline, kernel.pipelineLayout,
-                    descriptorSet, groupCountX, stack);
+                    descriptorSet, kernel, invocations, stack);
             long fence = createFence(device, stack);
             VkSubmitInfo submit = VkSubmitInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
@@ -274,15 +291,27 @@ public final class GpuContext implements AutoCloseable {
         private final long pipelineLayout;
         private final long pipeline;
         private final int bindingCount;
+        private final int workgroupSize;
 
         ResidentKernel(VkDevice device, long shaderModule, long setLayout, long pipelineLayout, long pipeline,
-                int bindingCount) {
+                int bindingCount, int workgroupSize) {
             this.device = device;
             this.shaderModule = shaderModule;
             this.setLayout = setLayout;
             this.pipelineLayout = pipelineLayout;
             this.pipeline = pipeline;
             this.bindingCount = bindingCount;
+            this.workgroupSize = workgroupSize;
+        }
+
+        /** Whether the shader reads the invocation count from a push constant to stop the tail. */
+        boolean guarded() {
+            return workgroupSize > 1;
+        }
+
+        /** Whole workgroups covering {@code invocations}; the guard stops the ones past the end. */
+        int groupsFor(int invocations) {
+            return (int) (((long) invocations + workgroupSize - 1) / workgroupSize);
         }
 
         @Override
@@ -559,10 +588,15 @@ public final class GpuContext implements AutoCloseable {
         return pLayout.get(0);
     }
 
-    private static long createPipelineLayout(VkDevice device, long setLayout, MemoryStack stack) {
+    private static long createPipelineLayout(VkDevice device, long setLayout, boolean invocationCount,
+            MemoryStack stack) {
         VkPipelineLayoutCreateInfo info = VkPipelineLayoutCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO)
                 .pSetLayouts(stack.longs(setLayout));
+        if (invocationCount) {
+            info.pPushConstantRanges(VkPushConstantRange.calloc(1, stack)
+                    .stageFlags(VK_SHADER_STAGE_COMPUTE_BIT).offset(0).size(Integer.BYTES));
+        }
         LongBuffer pLayout = stack.mallocLong(1);
         check(vkCreatePipelineLayout(device, info, null, pLayout), "vkCreatePipelineLayout");
         return pLayout.get(0);
@@ -657,7 +691,7 @@ public final class GpuContext implements AutoCloseable {
 
     private static VkCommandBuffer recordDispatch(
             VkDevice device, long commandPool, long pipeline, long pipelineLayout, long descriptorSet,
-            int groupCountX, MemoryStack stack) {
+            ResidentKernel kernel, int invocations, MemoryStack stack) {
         VkCommandBufferAllocateInfo allocInfo = VkCommandBufferAllocateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO)
                 .commandPool(commandPool)
@@ -674,7 +708,10 @@ public final class GpuContext implements AutoCloseable {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0,
                 stack.longs(descriptorSet), null);
-        vkCmdDispatch(cmd, groupCountX, 1, 1);
+        if (kernel.guarded()) {
+            vkCmdPushConstants(cmd, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, stack.ints(invocations));
+        }
+        vkCmdDispatch(cmd, kernel.groupsFor(invocations), 1, 1);
         check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
         return cmd;
     }

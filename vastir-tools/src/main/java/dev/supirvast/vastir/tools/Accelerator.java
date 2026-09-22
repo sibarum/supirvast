@@ -2,9 +2,16 @@ package dev.supirvast.vastir.tools;
 
 import com.oracle.truffle.api.CallTarget;
 import dev.supirvast.vast.CoreToTruffle;
+import dev.supirvast.vastir.core.BinaryOp;
 import dev.supirvast.vastir.core.Buffer;
 import dev.supirvast.vastir.core.CoreModule;
 import dev.supirvast.vastir.core.EntryPoint;
+import dev.supirvast.vastir.core.Expr;
+import dev.supirvast.vastir.core.Function;
+import dev.supirvast.vastir.core.PushConstants;
+import dev.supirvast.vastir.core.Region;
+import dev.supirvast.vastir.core.Statement;
+import dev.supirvast.vastir.core.UnaryOp;
 import dev.supirvast.vastir.lower.CapabilityException;
 import dev.supirvast.vastir.lower.CoreToSpirv;
 import dev.supirvast.vastir.lower.SpirvTarget;
@@ -12,6 +19,7 @@ import dev.supirvast.vastir.spirv.Capability;
 import dev.supirvast.vastir.tools.NativeTools.ValidationResult;
 import dev.supirvast.vastir.type.Type;
 
+import java.util.ArrayList;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
@@ -77,7 +85,11 @@ public final class Accelerator implements AutoCloseable {
             return abiError;
         }
 
-        CoreModule coreModule = new CoreModule().addEntryPoint(EntryPoint.compute(spec.kernel(), 1, 1, 1));
+        // The GPU lowers a guarded copy when workgroups are wider than one; the CPU lowers the kernel as given,
+        // since it runs exactly n invocations and has no tail to stop.
+        int size = spec.workgroupSize();
+        Function gpuKernel = size > 1 ? guarded(spec.kernel()) : spec.kernel();
+        CoreModule coreModule = new CoreModule().addEntryPoint(EntryPoint.compute(gpuKernel, size, 1, 1));
         boolean gpu = gpuAvailable();
         // Effective target = the caller's budget, narrowed to what this device supports when we have one.
         SpirvTarget target = gpu ? deviceConstrained(context().capabilities()) : budget;
@@ -125,7 +137,7 @@ public final class Accelerator implements AutoCloseable {
         KernelHandle handle = new KernelHandle(this, spec, spirv, cpuTarget);
         if (preloadable) {
             try {
-                pipelines.put(handle, context().build(spirv, spec.entryPoint(), spec.columns().size()));
+                pipelines.put(handle, context().build(spirv, spec.entryPoint(), spec.columns().size(), size));
             } catch (RuntimeException e) {
                 return new Rejection("GPU pipeline build failed", String.valueOf(e.getMessage()));
             }
@@ -226,6 +238,26 @@ public final class Accelerator implements AutoCloseable {
     }
 
     /** Columns must be bound 0..n-1 (binding == slot == int[][] index) with at least one output. */
+    /**
+     * {@code kernel} with a first statement returning from every invocation at or past the requested count,
+     * which a dispatch rounded up to whole workgroups adds. The count arrives as the only member of a push
+     * constant block, so one pipeline serves every {@code n}; {@link GpuContext} declares the range and sets
+     * it per dispatch. A kernel handed to this class cannot already own a push constant block — the CPU
+     * backend has no push constants, so such a kernel is rejected before it gets here.
+     */
+    private static Function guarded(Function kernel) {
+        PushConstants count = PushConstants.of("invocations", Type.int32());
+        Statement stopTheTail = new Statement.If(
+                new Expr.Unary(UnaryOp.LOGICAL_NOT,
+                        new Expr.Binary(BinaryOp.LESS_THAN, new Expr.InvocationId(), count.read(0))),
+                Region.of(new Statement.ReturnVoid()),
+                Region.of());
+        List<Statement> body = new ArrayList<>();
+        body.add(stopTheTail);
+        body.addAll(kernel.body().statements());
+        return new Function(kernel.name(), kernel.signature(), new Region(body));
+    }
+
     private static Rejection checkAbi(List<KernelColumn> columns) {
         if (columns.isEmpty()) {
             return new Rejection("empty kernel interface", "a kernel needs at least one column");

@@ -224,13 +224,23 @@ highest-value next proof; **P1** deepens the language; **P2** broadens targets; 
 Driven by `vexelray-sim-fluid`, whose particle-to-grid scatter is the first kernel that will want all of it.
 In this order, and each of the last two only once a kernel is **measured** to need it:
 
-- [ ] **1. Configurable workgroup size.** `Accelerator.register` builds every entry point `1×1×1`, so a
-      dispatch of N is N one-invocation workgroups — on NVIDIA, 31 of 32 lanes idle. Needs: the size on
-      `KernelSpec`, a dispatch of `ceil(n / size)` groups, a bounds guard for the tail (the extra
-      invocations must not touch memory), and `LocalInvocationId` / `WorkgroupId` built-ins. The CPU backend
-      is unaffected: invocation order within and across groups is still whatever it likes. Measure the gain,
-      because it decides how urgent the rest is. A prerequisite for everything below — a workgroup of one
-      has nobody to share with.
+- [x] **1. Configurable workgroup size.** `KernelSpec.workgroupSize`, default 64 (two NVIDIA warps, one AMD
+      wavefront), `withWorkgroupSize` to change it. Above one, `Accelerator` lowers a guarded copy for the
+      GPU — a first statement returning from every invocation at or past `n`, read from a 4-byte push
+      constant so one pipeline serves every `n` — and `GpuContext` dispatches `ceil(n / size)` groups with
+      the count pushed. The CPU lowers the kernel as given. `WorkgroupSizeTest` counts executed invocations
+      with an atomic at sizes 1, 7, 32, 64 and 256 over `n = 1000`, so a tail that ran would be caught rather
+      than landing harmlessly past the buffer. **Measured** on 2²⁰ invocations: at 8192 multiply-adds each,
+      48.1 ms at size 1 against 17.7 ms at 64; at 512, 20.7 against 17.1 — because ~16 ms of every run is
+      allocation, upload and readback, the kernel itself went from ~32 ms to ~1 ms. `LocalInvocationId` and
+      `WorkgroupId` moved to step 2: nothing can use them before workgroup memory, and their CPU meaning
+      belongs with that step's phase design.
+- [ ] **1½. Resident, device-local buffers — now the bottleneck.** Step 1's measurement put ~16 ms of fixed
+      cost on every 4 MB run. `GpuContext` allocates per dispatch from `HOST_VISIBLE | HOST_COHERENT` memory:
+      on a discrete card the kernel reaches that across PCIe, and without `HOST_CACHED` the readback is an
+      uncached read. Wanted: buffers that live on the device between dispatches (`DEVICE_LOCAL`), staged in
+      and out explicitly, with the readback staging buffer `HOST_CACHED` — and a way for a caller to say a
+      column stays resident across runs, which is what a stepped simulation is.
 - [ ] **2. Workgroup memory and barriers.** Arrays in the `Workgroup` storage class, `OpControlBarrier`,
       atomics on workgroup memory. The declared size is known at compile time, so registration checks it
       against `maxComputeSharedMemorySize` (16 KB guaranteed, ~48 KB typical) through the same budget path
