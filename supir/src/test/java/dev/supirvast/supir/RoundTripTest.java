@@ -11,6 +11,7 @@ import dev.supirvast.vastir.core.InterfaceVar;
 import dev.supirvast.vastir.core.LocalVar;
 import dev.supirvast.vastir.core.Region;
 import dev.supirvast.vastir.core.ShaderStage;
+import dev.supirvast.vastir.core.SharedArray;
 import dev.supirvast.vastir.core.Statement;
 import dev.supirvast.vastir.core.UnaryOp;
 import dev.supirvast.vastir.lower.CoreToSpirv;
@@ -110,6 +111,38 @@ class RoundTripTest {
         assertTrue(text.contains("ticket = atomic add bins[0], 1"), text);
         assertTrue(text.contains("atomic add sums[0], 0.5"), text);
         assertTrue(text.contains("previous = atomic cmpxchg bins[2], 0, ticket"), text);
+    }
+
+    /**
+     * Workgroup memory: a shared array declared, stored, loaded and updated atomically, a barrier, and the three
+     * workgroup-level indices — each spelled so that a buffer of the same shape would read the same.
+     */
+    @Test
+    void workgroupMemoryRoundTrips() {
+        Type.Int i32 = Type.int32();
+        Buffer result = new Buffer("result", 0, i32);
+        SharedArray tile = new SharedArray("tile", i32, 64);
+        LocalVar old = new LocalVar("old", i32);
+        Expr lid = new Expr.LocalInvocationId();
+        Region body = Region.of(
+                new Statement.SharedStore(tile, lid, new Expr.WorkgroupId()),
+                new Statement.Barrier(),
+                new Statement.SharedAtomicUpdate(AtomicOp.ADD, tile, new Expr.ConstInt(i32, 0), new Expr.InvocationCount()),
+                new Statement.SharedAtomicCompareExchange(old, tile, new Expr.ConstInt(i32, 1), lid, lid),
+                new Statement.Barrier(),
+                new Statement.BufferStore(result, new Expr.InvocationId(), new Expr.SharedLoad(tile, lid)),
+                new Statement.ReturnVoid());
+        Function main = new Function("main", new Type.FunctionType(Type.VOID, List.of()), body);
+        CoreModule module = new CoreModule().addEntryPoint(EntryPoint.compute(main, 64, 1, 1));
+        assertFixpoint(module);
+
+        String text = Supir.print(module);
+        assertTrue(text.contains("shared tile: i32[64]"), text);
+        assertTrue(text.contains("tile[local_invocation_id] = workgroup_id"), text);
+        assertTrue(text.contains("barrier"), text);
+        assertTrue(text.contains("atomic add tile[0], invocation_count"), text);
+        assertTrue(text.contains("old = atomic cmpxchg tile[1], local_invocation_id, local_invocation_id"), text);
+        assertTrue(text.contains("result[invocation_id] = tile[local_invocation_id]"), text);
     }
 
     @Test

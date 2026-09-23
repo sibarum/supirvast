@@ -1,19 +1,20 @@
 package dev.supirvast.vastir.tools;
 
-import com.oracle.truffle.api.CallTarget;
 import dev.supirvast.vast.CoreToTruffle;
+import dev.supirvast.vast.CpuKernel;
+import dev.supirvast.vastir.core.Barriers;
 import dev.supirvast.vastir.core.BinaryOp;
 import dev.supirvast.vastir.core.Buffer;
 import dev.supirvast.vastir.core.CoreModule;
 import dev.supirvast.vastir.core.EntryPoint;
 import dev.supirvast.vastir.core.Expr;
 import dev.supirvast.vastir.core.Function;
-import dev.supirvast.vastir.core.PushConstants;
 import dev.supirvast.vastir.core.Region;
 import dev.supirvast.vastir.core.Statement;
 import dev.supirvast.vastir.core.UnaryOp;
 import dev.supirvast.vastir.lower.CapabilityException;
 import dev.supirvast.vastir.lower.CoreToSpirv;
+import dev.supirvast.vastir.lower.DeviceFeature;
 import dev.supirvast.vastir.lower.SpirvTarget;
 import dev.supirvast.vastir.spirv.Capability;
 import dev.supirvast.vastir.tools.NativeTools.ValidationResult;
@@ -51,9 +52,14 @@ import java.util.stream.Collectors;
  */
 public final class Accelerator implements AutoCloseable {
 
-    /** What this host can do — queried, not assumed, so integration is discoverable. */
+    /**
+     * What this host can do — queried, not assumed, so integration is discoverable.
+     *
+     * @param maxWorkgroupMemoryBytes the device's {@code maxComputeSharedMemorySize}; 0 without a device
+     * @param deviceFeatures          the device features no capability distinguishes; empty without a device
+     */
     public record Capabilities(boolean gpuAvailable, boolean validationAvailable,
-            Set<Capability> deviceCapabilities) {}
+            Set<Capability> deviceCapabilities, long maxWorkgroupMemoryBytes, Set<DeviceFeature> deviceFeatures) {}
 
     private final NativeTools tools = new NativeTools();
     private final Map<KernelHandle, GpuContext.ResidentKernel> pipelines = new IdentityHashMap<>();
@@ -87,13 +93,16 @@ public final class Accelerator implements AutoCloseable {
         }
 
         // The GPU lowers a guarded copy when workgroups are wider than one; the CPU lowers the kernel as given,
-        // since it runs exactly n invocations and has no tail to stop.
+        // since it runs exactly n invocations and has no tail to stop. A kernel with a barrier is the
+        // exception on both: the tail cannot return before a barrier the rest of its workgroup must reach, so
+        // it runs whole workgroups everywhere and bounds itself with Expr.InvocationCount.
         int size = spec.workgroupSize();
-        Function gpuKernel = size > 1 ? guarded(spec.kernel()) : spec.kernel();
+        boolean guard = size > 1 && !Barriers.contains(spec.kernel().body());
+        Function gpuKernel = guard ? guarded(spec.kernel()) : spec.kernel();
         CoreModule coreModule = new CoreModule().addEntryPoint(EntryPoint.compute(gpuKernel, size, 1, 1));
         boolean gpu = gpuAvailable();
         // Effective target = the caller's budget, narrowed to what this device supports when we have one.
-        SpirvTarget target = gpu ? deviceConstrained(context().capabilities()) : budget;
+        SpirvTarget target = gpu ? deviceConstrained(context()) : budget;
         byte[] spirv;
         boolean preloadable;
         try {
@@ -125,12 +134,12 @@ public final class Accelerator implements AutoCloseable {
             }
         }
 
-        CallTarget cpuTarget;
+        CpuKernel cpuTarget;
         try {
             List<Buffer> buffers = spec.columns().stream()
                     .map(c -> new Buffer(c.name(), c.binding(), c.type()))
                     .toList();
-            cpuTarget = new CoreToTruffle().lowerKernel(spec.kernel(), buffers);
+            cpuTarget = new CoreToTruffle().lowerDispatch(spec.kernel(), buffers, size);
         } catch (RuntimeException e) {
             return new Rejection("not lowerable to the CPU backend", String.valueOf(e.getMessage()));
         }
@@ -149,7 +158,9 @@ public final class Accelerator implements AutoCloseable {
     /** What this host can do right now, including the device's supported SPIR-V capabilities. */
     public Capabilities capabilities() {
         Set<Capability> device = gpuAvailable() ? context().capabilities() : Set.of();
-        return new Capabilities(gpuAvailable(), tools.isAvailable(), device);
+        long workgroupMemory = gpuAvailable() ? context().maxWorkgroupMemoryBytes() : 0;
+        Set<DeviceFeature> features = gpuAvailable() ? context().features() : Set.of();
+        return new Capabilities(gpuAvailable(), tools.isAvailable(), device, workgroupMemory, features);
     }
 
     /**
@@ -248,12 +259,16 @@ public final class Accelerator implements AutoCloseable {
     }
 
     /** The caller's budget, intersected with what the device actually supports. */
-    private SpirvTarget deviceConstrained(Set<Capability> deviceCapabilities) {
+    private SpirvTarget deviceConstrained(GpuContext device) {
+        Set<Capability> deviceCapabilities = device.capabilities();
         Set<Capability> budgetCaps = budget.allowedCapabilities();
         Set<Capability> effective = budgetCaps == null
                 ? deviceCapabilities
                 : budgetCaps.stream().filter(deviceCapabilities::contains).collect(Collectors.toSet());
-        return SpirvTarget.restrictedTo(effective);
+        Set<DeviceFeature> features = device.features().stream().filter(budget::allows).collect(Collectors.toSet());
+        return SpirvTarget.restrictedTo(effective)
+                .withWorkgroupMemoryLimit(Math.min(budget.maxWorkgroupMemoryBytes(), device.maxWorkgroupMemoryBytes()))
+                .withFeatures(features);
     }
 
     boolean gpuAvailable() {
@@ -272,19 +287,17 @@ public final class Accelerator implements AutoCloseable {
         return context;
     }
 
-    /** Columns must be bound 0..n-1 (binding == slot == int[][] index) with at least one output. */
     /**
      * {@code kernel} with a first statement returning from every invocation at or past the requested count,
-     * which a dispatch rounded up to whole workgroups adds. The count arrives as the only member of a push
-     * constant block, so one pipeline serves every {@code n}; {@link GpuContext} declares the range and sets
-     * it per dispatch. A kernel handed to this class cannot already own a push constant block — the CPU
-     * backend has no push constants, so such a kernel is rejected before it gets here.
+     * which a dispatch rounded up to whole workgroups adds. The count is {@link Expr.InvocationCount}, a push
+     * constant, so one pipeline serves every {@code n}; {@link GpuContext} declares the range and sets it per
+     * dispatch. A kernel handed to this class cannot already own a push constant block — the CPU backend has
+     * no push constants, so such a kernel is rejected before it gets here.
      */
     private static Function guarded(Function kernel) {
-        PushConstants count = PushConstants.of("invocations", Type.int32());
         Statement stopTheTail = new Statement.If(
                 new Expr.Unary(UnaryOp.LOGICAL_NOT,
-                        new Expr.Binary(BinaryOp.LESS_THAN, new Expr.InvocationId(), count.read(0))),
+                        new Expr.Binary(BinaryOp.LESS_THAN, new Expr.InvocationId(), new Expr.InvocationCount())),
                 Region.of(new Statement.ReturnVoid()),
                 Region.of());
         List<Statement> body = new ArrayList<>();
@@ -293,6 +306,7 @@ public final class Accelerator implements AutoCloseable {
         return new Function(kernel.name(), kernel.signature(), new Region(body));
     }
 
+    /** Columns must be bound 0..n-1 (binding == slot == int[][] index) with at least one output. */
     private static Rejection checkAbi(List<KernelColumn> columns) {
         if (columns.isEmpty()) {
             return new Rejection("empty kernel interface", "a kernel needs at least one column");

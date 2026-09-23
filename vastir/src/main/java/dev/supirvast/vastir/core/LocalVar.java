@@ -23,4 +23,10 @@ public final class LocalVar {
     public Type type() {
         return type;
     }
+
+    /** The name, so a diagnostic that prints an expression reads as the kernel was written. */
+    @Override
+    public String toString() {
+        return name;
+    }
 }

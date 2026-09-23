@@ -251,16 +251,43 @@ In this order, and each of the last two only once a kernel is **measured** to ne
       refusals. **Measured** on a 2²⁰-element f32 field stepped 100 times: 34.8 ms per step through `run`,
       0.35 ms per step resident, one read included. *Still per dispatch: a descriptor pool and set; caching
       them per buffer tuple is the next cut if dispatch overhead ever shows.*
-- [ ] **2. Workgroup memory and barriers.** Arrays in the `Workgroup` storage class, `OpControlBarrier`,
-      atomics on workgroup memory. The declared size is known at compile time, so registration checks it
-      against `maxComputeSharedMemorySize` (16 KB guaranteed, ~48 KB typical) through the same budget path
-      as a capability, falling back to CPU when it does not fit. A barrier must sit in uniform control flow;
-      the IR's structure is what makes that checkable. **The CPU side is the real design work:** sequential
-      invocations cannot express "nobody continues until everybody arrives". Split the kernel at its
-      barriers and run each phase for every invocation of the group, spilling locals between phases — how
-      CPU OpenCL implementations do it, and tractable here because barriers can only be where every
-      invocation reaches them. Not threads-per-invocation, which would be an emulation rather than an
-      execution model.
+- [x] **2. Workgroup memory and barriers.** `SharedArray` (fixed length, by identity) in the `Workgroup`
+      storage class, read with `Expr.SharedLoad`, written with `Statement.SharedStore`, updated with
+      `SharedAtomicUpdate`/`SharedAtomicCompareExchange` (workgroup scope; the buffer table, so f32 add, min,
+      max and exchange too);
+      `Statement.Barrier` is `OpControlBarrier` at workgroup scope, acquire-release over workgroup *and*
+      buffer memory — the CPU's phases make other invocations' buffer writes visible too, so a barrier that
+      ordered only workgroup memory would let the backends disagree. `Expr.LocalInvocationId`,
+      `Expr.WorkgroupId` and `Expr.InvocationCount` (the requested `n`, a push constant the lowering declares
+      and every compute pipeline now carries). **Uniformity** is `Barriers.check`, run by both lowerings: a
+      barrier only under conditions computed from constants, the workgroup id, the count, push constants and
+      locals assigned only from those in uniform flow, and after no return some invocations may have taken.
+      **The tail:** a kernel with a barrier cannot stop invocations past `n` with an early return, so it runs
+      whole workgroups on both backends and bounds itself with `InvocationCount`; every other kernel keeps the
+      guard. **Budget:** the shared arrays' total goes against `SpirvTarget.maxWorkgroupMemoryBytes` as a
+      `CapabilityException`; `GpuContext` reads `maxComputeSharedMemorySize`, so over the device is CPU-only
+      and over the caller's budget is a `Rejection`. **CPU:** `CoreToTruffle.lowerDispatch` returns a
+      `CpuKernel` that runs by workgroup when the kernel uses any of this. The plan splits at barriers into
+      phases, each run by every live invocation before the next. Each invocation's locals persist in its own
+      materialized frame, and a group-level `if`/`while` evaluates its condition for every invocation and
+      throws if they disagree. Supir spells it `shared tile: i32[64]`, `tile[i]`, `barrier`,
+      `local_invocation_id`, `workgroup_id`, `invocation_count`. `WorkgroupMemoryTest`: an in-workgroup
+      reversal at sizes 7–256, a tree reduction, a shared-memory histogram, a one-winner compare-exchange, the
+      indices, both budget outcomes, a divergent-barrier rejection and a resident barrier kernel, each checked
+      against the answer on both backends at `n = 1000`. **Measured** summing 2²⁰ i32 at size 256, resident:
+      0.27 ms by one global atomic per invocation, 0.49 ms by tree reduction and one global atomic per
+      workgroup. The driver already coalesces same-address atomics within a subgroup, so the reduction's eight
+      barriers cost more than they save. That is the case for step 3 (a subgroup add before the global
+      atomic), and the reason a reduction is not automatically a win here. **Float atomics on workgroup
+      memory** need both the capability a buffer's would and a Vulkan feature per kind of memory
+      (`shaderSharedFloat32AtomicAdd` is not `shaderBufferFloat32AtomicAdd`). So `SpirvTarget` budgets
+      `DeviceFeature`s beside capabilities, `GpuContext` detects and enables the shared and buffer ones, and
+      a kernel whose feature the device lacks registers CPU-only. A pre-reducing f32 scatter (the shape
+      `vexelray-sim-fluid` needs) is in `WorkgroupMemoryTest`. *Not yet: 2-D/3-D workgroups, and barriers in
+      callees.*
+- [ ] **Pick the discrete GPU.** `GpuContext` takes the first device with a compute queue, which on this
+      machine is the Intel iGPU (32 KB workgroup memory, no shared float add) rather than the RTX 5070 Ti
+      (48 KB, shared float add). **Every measurement above is the iGPU's.**
 - [ ] **3. Subgroup operations.** Reductions and shuffles across the 32/64 lanes that execute together — no
       workgroup memory, no explicit barrier, often the better way to pre-reduce before one global atomic.
       The CPU backend reuses step 2's phase machinery.

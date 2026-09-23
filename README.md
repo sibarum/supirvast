@@ -54,6 +54,10 @@ The `core` language currently supports:
 - **Atomics** on storage-buffer elements — add, sub, min, max, and, or, xor, exchange and compare-exchange on
   32-bit integers, and add, min, max and exchange on `f32` where the device has the extensions — as statements,
   returning the old value when asked.
+- **Workgroup memory and barriers** — fixed-length shared arrays, atomics on them (float ones where the device
+  licenses them on workgroup memory), workgroup and local invocation indices, and a barrier checked to sit in
+  uniform control flow. On the CPU a barrier splits the kernel into phases, each run by every invocation of the
+  workgroup before the next begins.
 - **Validation & tooling:** the official `spirv-val`, `spirv-dis`, `spirv-as`, `spirv-opt`, and `spirv-cross`
   binaries are fetched once from the pinned Vulkan SDK and bundled, so validation, disassembly, and
   cross-compilation work out of the box — no separate install.
@@ -88,9 +92,9 @@ the results are identical.
 
 **Experimental and early.** The architecture is proven end-to-end — generated SPIR-V vocabulary → `core` IR →
 validated SPIR-V running on a real GPU, *and* the same IR running on the CPU with matching results — but the
-language is intentionally small. Current limits include: memory-based locals (no SSA `OpPhi` yet), a fixed
-workgroup size (parallelism comes from the dispatch), no workgroup shared memory or barriers, and no 64-bit
-atomics. See [`TODO.md`](TODO.md) for the roadmap.
+language is intentionally small. Current limits include: memory-based locals (no SSA `OpPhi` yet),
+one-dimensional workgroups, no subgroup operations, and no 64-bit atomics. See [`TODO.md`](TODO.md) for the
+roadmap.
 
 ## Requirements
 

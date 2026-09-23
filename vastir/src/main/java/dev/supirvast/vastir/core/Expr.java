@@ -42,6 +42,52 @@ public sealed interface Expr {
         }
     }
 
+    /**
+     * The x component of {@code gl_LocalInvocationID} — this invocation's index within its workgroup, from 0 to
+     * the workgroup size less one. The index a kernel uses for its own slot of a {@link SharedArray}.
+     */
+    record LocalInvocationId() implements Expr {
+        @Override
+        public Type type() {
+            return Type.int32();
+        }
+    }
+
+    /**
+     * The x component of {@code gl_WorkGroupID} — which workgroup this invocation belongs to. The same for every
+     * invocation in a workgroup, so a condition built from it is uniform and may guard a {@link
+     * Statement.Barrier}.
+     */
+    record WorkgroupId() implements Expr {
+        @Override
+        public Type type() {
+            return Type.int32();
+        }
+    }
+
+    /**
+     * The number of invocations the dispatch was asked for — the {@code n} of a run, which is not the number
+     * that execute when the kernel has a barrier: such a kernel runs whole workgroups, and the invocations past
+     * {@code n} use this to do nothing but take part in the barriers. The same for every invocation, so uniform.
+     *
+     * <p>On the GPU it is the only member of a 4-byte push-constant block the lowering declares, which the
+     * dispatcher sets; a module that reads it cannot also declare push constants of its own.
+     */
+    record InvocationCount() implements Expr {
+        @Override
+        public Type type() {
+            return Type.int32();
+        }
+    }
+
+    /** Reads {@code array[index]} — an element of workgroup memory, typed by the array's element type. */
+    record SharedLoad(SharedArray array, Expr index) implements Expr {
+        @Override
+        public Type type() {
+            return array.element();
+        }
+    }
+
     /** Reads {@code buffer[index]} — an element of a storage buffer, typed by the buffer's element type. */
     record BufferLoad(Buffer buffer, Expr index) implements Expr {
         @Override

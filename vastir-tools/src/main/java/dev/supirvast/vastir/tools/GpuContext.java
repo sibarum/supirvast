@@ -30,6 +30,7 @@ import org.lwjgl.vulkan.VkMemoryAllocateInfo;
 import org.lwjgl.vulkan.VkMemoryRequirements;
 import org.lwjgl.vulkan.VkPhysicalDevice;
 import org.lwjgl.vulkan.VkPhysicalDeviceMemoryProperties;
+import org.lwjgl.vulkan.VkPhysicalDeviceProperties;
 import org.lwjgl.vulkan.VkPipelineLayoutCreateInfo;
 import org.lwjgl.vulkan.VkPipelineShaderStageCreateInfo;
 import org.lwjgl.vulkan.VkPushConstantRange;
@@ -47,6 +48,7 @@ import org.lwjgl.vulkan.VkPhysicalDeviceFeatures2;
 import org.lwjgl.vulkan.VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT;
 import org.lwjgl.vulkan.VkPhysicalDeviceShaderAtomicFloatFeaturesEXT;
 import org.lwjgl.vulkan.VkPhysicalDeviceVulkan12Features;
+import dev.supirvast.vastir.lower.DeviceFeature;
 import dev.supirvast.vastir.spirv.Capability;
 
 import java.nio.ByteBuffer;
@@ -103,9 +105,12 @@ public final class GpuContext implements AutoCloseable {
     private final int queueFamily;
     private final long commandPool;
     private final Set<Capability> capabilities;
+    private final long maxWorkgroupMemoryBytes;
+    private final Set<DeviceFeature> features;
 
     private GpuContext(VkInstance instance, VkPhysicalDevice physical, VkDevice device, VkQueue[] queues,
-            int queueFamily, long commandPool, Set<Capability> capabilities) {
+            int queueFamily, long commandPool, Set<Capability> capabilities, long maxWorkgroupMemoryBytes,
+            Set<DeviceFeature> features) {
         this.instance = instance;
         this.physical = physical;
         this.device = device;
@@ -113,11 +118,29 @@ public final class GpuContext implements AutoCloseable {
         this.queueFamily = queueFamily;
         this.commandPool = commandPool;
         this.capabilities = capabilities;
+        this.maxWorkgroupMemoryBytes = maxWorkgroupMemoryBytes;
+        this.features = features;
     }
 
     /** The SPIR-V capabilities this device supports (and that have been enabled on the logical device). */
     public Set<Capability> capabilities() {
         return capabilities;
+    }
+
+    /**
+     * The most workgroup memory one compute pipeline may declare — the device's
+     * {@code maxComputeSharedMemorySize}: 16 KB at least, 32–64 KB on current desktop hardware.
+     */
+    public long maxWorkgroupMemoryBytes() {
+        return maxWorkgroupMemoryBytes;
+    }
+
+    /**
+     * The device features this device supports (and that have been enabled) among those no capability
+     * distinguishes — which kinds of memory its float atomics may point to.
+     */
+    public Set<DeviceFeature> features() {
+        return features;
     }
 
     /** Whether a Vulkan 1.3 device with a compute queue is usable on this machine. */
@@ -149,8 +172,11 @@ public final class GpuContext implements AutoCloseable {
             VkDevice device = createDevice(physical, queueFamily, queueCount, supported, stack);
             VkQueue[] queues = deviceQueues(device, queueFamily, queueCount, stack);
             long commandPool = createCommandPool(device, queueFamily, stack);
+            VkPhysicalDeviceProperties properties = VkPhysicalDeviceProperties.malloc(stack);
+            vkGetPhysicalDeviceProperties(physical, properties);
+            long workgroupMemory = Integer.toUnsignedLong(properties.limits().maxComputeSharedMemorySize());
             return new GpuContext(instance, physical, device, queues, queueFamily, commandPool,
-                    capabilitySet(supported));
+                    capabilitySet(supported), workgroupMemory, featureSet(supported));
         }
     }
 
@@ -165,19 +191,19 @@ public final class GpuContext implements AutoCloseable {
 
     /**
      * As {@link #build(byte[], String, int)}, for a kernel whose workgroups are {@code workgroupSize}
-     * invocations wide. Above one, the dispatch rounds up to whole workgroups, so the shader must stop the
-     * invocations past the requested count — it reads that count from a 4-byte push constant at offset 0,
-     * which this pipeline's layout declares and every dispatch sets. {@code Accelerator} emits that guard.
+     * invocations wide. Above one, the dispatch rounds up to whole workgroups, so the shader must deal with
+     * the invocations past the requested count — stop them, or for a kernel with a barrier bound them itself.
+     * Either way it reads that count ({@code Expr.InvocationCount}) from a 4-byte push constant at offset 0,
+     * which every pipeline's layout declares and every dispatch sets; a shader that never reads it ignores it.
      */
     public ResidentKernel build(byte[] spirv, String entryPoint, int bindingCount, int workgroupSize) {
         if (workgroupSize < 1) {
             throw new IllegalArgumentException("workgroup size must be >= 1, got " + workgroupSize);
         }
-        boolean guarded = workgroupSize > 1;
         try (MemoryStack stack = MemoryStack.stackPush()) {
             long shaderModule = createShaderModule(device, spirv, stack);
             long setLayout = createSetLayout(device, bindingCount, stack);
-            long pipelineLayout = createPipelineLayout(device, setLayout, guarded, stack);
+            long pipelineLayout = createPipelineLayout(device, setLayout, stack);
             long pipeline = createComputePipeline(device, pipelineLayout, shaderModule, entryPoint, stack);
             // The pipeline/layouts are immutable and safe to share across concurrent dispatches; the
             // mutable binding state (the descriptor set) is allocated PER submission instead, so one
@@ -441,9 +467,7 @@ public final class GpuContext implements AutoCloseable {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipelineLayout, 0,
                     stack.longs(descriptorSet), null);
-            if (kernel.guarded()) {
-                vkCmdPushConstants(cmd, kernel.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, stack.ints(invocations));
-            }
+            vkCmdPushConstants(cmd, kernel.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, stack.ints(invocations));
             vkCmdDispatch(cmd, kernel.groupsFor(invocations), 1, 1);
             check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
 
@@ -550,12 +574,7 @@ public final class GpuContext implements AutoCloseable {
             this.workgroupSize = workgroupSize;
         }
 
-        /** Whether the shader reads the invocation count from a push constant to stop the tail. */
-        boolean guarded() {
-            return workgroupSize > 1;
-        }
-
-        /** Whole workgroups covering {@code invocations}; the guard stops the ones past the end. */
+        /** Whole workgroups covering {@code invocations}; the shader deals with the ones past the end. */
         int groupsFor(int invocations) {
             return (int) (((long) invocations + workgroupSize - 1) / workgroupSize);
         }
@@ -646,18 +665,22 @@ public final class GpuContext implements AutoCloseable {
         VkPhysicalDeviceVulkan12Features features12 = VkPhysicalDeviceVulkan12Features.calloc(stack)
                 .sType$Default().shaderInt8(supported.int8());
         long chain = features12.address();
-        // The float-atomic extensions are enabled only when their feature is, since enabling one licenses the
-        // capability the lowering will then emit. float2 extends float, so min/max implies the add extension.
+        // The float-atomic extensions are enabled only when one of their features is, since enabling a feature
+        // licenses what the lowering will then emit. float2 extends float, so min/max implies the first.
         java.util.List<String> extensions = new java.util.ArrayList<>();
-        if (supported.floatAtomicAdd() || supported.floatAtomicMinMax()) {
+        boolean float2 = supported.floatAtomicMinMax() || supported.sharedFloatAtomicMinMax();
+        if (float2 || supported.floatAtomicAdd() || supported.sharedFloatAtomics() || supported.sharedFloatAtomicAdd()) {
             extensions.add(EXTShaderAtomicFloat.VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
             chain = VkPhysicalDeviceShaderAtomicFloatFeaturesEXT.calloc(stack).sType$Default().pNext(chain)
-                    .shaderBufferFloat32AtomicAdd(supported.floatAtomicAdd()).address();
+                    .shaderBufferFloat32AtomicAdd(supported.floatAtomicAdd())
+                    .shaderSharedFloat32Atomics(supported.sharedFloatAtomics())
+                    .shaderSharedFloat32AtomicAdd(supported.sharedFloatAtomicAdd()).address();
         }
-        if (supported.floatAtomicMinMax()) {
+        if (float2) {
             extensions.add(EXTShaderAtomicFloat2.VK_EXT_SHADER_ATOMIC_FLOAT_2_EXTENSION_NAME);
             chain = VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT.calloc(stack).sType$Default().pNext(chain)
-                    .shaderBufferFloat32AtomicMinMax(true).address();
+                    .shaderBufferFloat32AtomicMinMax(supported.floatAtomicMinMax())
+                    .shaderSharedFloat32AtomicMinMax(supported.sharedFloatAtomicMinMax()).address();
         }
         VkPhysicalDeviceFeatures2 features2 = VkPhysicalDeviceFeatures2.calloc(stack)
                 .sType$Default().pNext(chain);
@@ -680,9 +703,14 @@ public final class GpuContext implements AutoCloseable {
         return new VkDevice(pDevice.get(0), physical, info);
     }
 
-    /** What the physical device supports among the optional capabilities our lowering can emit. */
+    /**
+     * What the physical device supports among the optional capabilities our lowering can emit.
+     * {@code floatAtomicAdd}/{@code floatAtomicMinMax} are the storage-buffer features; the {@code shared}
+     * ones license the same instructions on workgroup memory.
+     */
     private record Supported(boolean int8, boolean int16, boolean int64, boolean float64,
-            boolean floatAtomicAdd, boolean floatAtomicMinMax) {}
+            boolean floatAtomicAdd, boolean floatAtomicMinMax,
+            boolean sharedFloatAtomics, boolean sharedFloatAtomicAdd, boolean sharedFloatAtomicMinMax) {}
 
     private static Supported querySupported(VkPhysicalDevice physical, MemoryStack stack) {
         Set<String> extensions = deviceExtensions(physical, stack);
@@ -710,7 +738,31 @@ public final class GpuContext implements AutoCloseable {
         VkPhysicalDeviceFeatures core = features2.features();
         return new Supported(features12.shaderInt8(), core.shaderInt16(), core.shaderInt64(), core.shaderFloat64(),
                 atomicFloat != null && atomicFloat.shaderBufferFloat32AtomicAdd(),
-                atomicFloat2 != null && atomicFloat2.shaderBufferFloat32AtomicMinMax());
+                atomicFloat2 != null && atomicFloat2.shaderBufferFloat32AtomicMinMax(),
+                atomicFloat != null && atomicFloat.shaderSharedFloat32Atomics(),
+                atomicFloat != null && atomicFloat.shaderSharedFloat32AtomicAdd(),
+                atomicFloat2 != null && atomicFloat2.shaderSharedFloat32AtomicMinMax());
+    }
+
+    /** The device features no capability distinguishes, as the lowering's target names them. */
+    private static Set<DeviceFeature> featureSet(Supported s) {
+        EnumSet<DeviceFeature> features = EnumSet.noneOf(DeviceFeature.class);
+        if (s.floatAtomicAdd()) {
+            features.add(DeviceFeature.BUFFER_FLOAT32_ATOMIC_ADD);
+        }
+        if (s.floatAtomicMinMax()) {
+            features.add(DeviceFeature.BUFFER_FLOAT32_ATOMIC_MIN_MAX);
+        }
+        if (s.sharedFloatAtomics()) {
+            features.add(DeviceFeature.SHARED_FLOAT32_ATOMICS);
+        }
+        if (s.sharedFloatAtomicAdd()) {
+            features.add(DeviceFeature.SHARED_FLOAT32_ATOMIC_ADD);
+        }
+        if (s.sharedFloatAtomicMinMax()) {
+            features.add(DeviceFeature.SHARED_FLOAT32_ATOMIC_MIN_MAX);
+        }
+        return Set.copyOf(features);
     }
 
     private static Set<String> deviceExtensions(VkPhysicalDevice physical, MemoryStack stack) {
@@ -741,10 +793,11 @@ public final class GpuContext implements AutoCloseable {
         if (s.float64()) {
             caps.add(Capability.Float64);
         }
-        if (s.floatAtomicAdd()) {
+        // One capability for both kinds of memory; which kinds the device licenses is its feature set's to say.
+        if (s.floatAtomicAdd() || s.sharedFloatAtomicAdd()) {
             caps.add(Capability.AtomicFloat32AddEXT);
         }
-        if (s.floatAtomicMinMax()) {
+        if (s.floatAtomicMinMax() || s.sharedFloatAtomicMinMax()) {
             caps.add(Capability.AtomicFloat32MinMaxEXT);
         }
         return Set.copyOf(caps);
@@ -857,15 +910,13 @@ public final class GpuContext implements AutoCloseable {
         return pLayout.get(0);
     }
 
-    private static long createPipelineLayout(VkDevice device, long setLayout, boolean invocationCount,
-            MemoryStack stack) {
+    /** Set 0, and the 4-byte invocation count at push-constant offset 0 that every dispatch sets. */
+    private static long createPipelineLayout(VkDevice device, long setLayout, MemoryStack stack) {
         VkPipelineLayoutCreateInfo info = VkPipelineLayoutCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO)
-                .pSetLayouts(stack.longs(setLayout));
-        if (invocationCount) {
-            info.pPushConstantRanges(VkPushConstantRange.calloc(1, stack)
-                    .stageFlags(VK_SHADER_STAGE_COMPUTE_BIT).offset(0).size(Integer.BYTES));
-        }
+                .pSetLayouts(stack.longs(setLayout))
+                .pPushConstantRanges(VkPushConstantRange.calloc(1, stack)
+                        .stageFlags(VK_SHADER_STAGE_COMPUTE_BIT).offset(0).size(Integer.BYTES));
         LongBuffer pLayout = stack.mallocLong(1);
         check(vkCreatePipelineLayout(device, info, null, pLayout), "vkCreatePipelineLayout");
         return pLayout.get(0);
@@ -977,9 +1028,7 @@ public final class GpuContext implements AutoCloseable {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0,
                 stack.longs(descriptorSet), null);
-        if (kernel.guarded()) {
-            vkCmdPushConstants(cmd, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, stack.ints(invocations));
-        }
+        vkCmdPushConstants(cmd, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, stack.ints(invocations));
         vkCmdDispatch(cmd, kernel.groupsFor(invocations), 1, 1);
         check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
         return cmd;

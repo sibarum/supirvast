@@ -1,14 +1,17 @@
 package dev.supirvast.vast;
 
 import com.oracle.truffle.api.CallTarget;
+import com.oracle.truffle.api.Truffle;
 import com.oracle.truffle.api.TruffleLanguage;
 import com.oracle.truffle.api.frame.FrameDescriptor;
 import com.oracle.truffle.api.frame.FrameSlotKind;
+import com.oracle.truffle.api.frame.MaterializedFrame;
 import com.oracle.truffle.api.frame.VirtualFrame;
 import com.oracle.truffle.api.nodes.ControlFlowException;
 import com.oracle.truffle.api.nodes.Node;
 import com.oracle.truffle.api.nodes.RootNode;
 import dev.supirvast.vastir.core.AtomicOp;
+import dev.supirvast.vastir.core.Barriers;
 import dev.supirvast.vastir.core.BinaryOp;
 import dev.supirvast.vastir.core.Buffer;
 import dev.supirvast.vastir.core.Expr;
@@ -16,6 +19,7 @@ import dev.supirvast.vastir.core.Function;
 import dev.supirvast.vastir.core.LocalVar;
 import dev.supirvast.vastir.core.MathFn;
 import dev.supirvast.vastir.core.Region;
+import dev.supirvast.vastir.core.SharedArray;
 import dev.supirvast.vastir.core.Statement;
 import dev.supirvast.vastir.core.UnaryOp;
 import dev.supirvast.vastir.type.Type;
@@ -39,9 +43,42 @@ import java.util.Map;
  */
 public final class CoreToTruffle {
 
-    /** Lowering context: local-variable frame slots, buffer slots (kernels), and callee targets (calls). */
+    // An invocation's frame arguments. Every kernel has the first two; a dispatch adds the count; a kernel run
+    // workgroup by workgroup adds its indices within the dispatch and its workgroup's shared arrays.
+    private static final int ARG_INVOCATION = 0;
+    private static final int ARG_BUFFERS = 1;
+    private static final int ARG_COUNT = 2;
+    private static final int ARG_LOCAL = 3;
+    private static final int ARG_WORKGROUP = 4;
+    private static final int ARG_SHARED = 5;
+
+    /** What an invocation's frame arguments carry, and so which expressions this lowering can support. */
+    private enum Args {
+        /** {@code [invocation, buffers]}, or a plain function's parameters. */
+        PLAIN,
+        /** Plus the dispatch's invocation count. */
+        COUNTED,
+        /** Plus the local invocation index, the workgroup index and the workgroup's shared arrays. */
+        GROUPED
+    }
+
+    /**
+     * Lowering context: local-variable frame slots, buffer slots (kernels), callee targets (calls), shared-array
+     * slots (kernels run by workgroup), and what the frame arguments carry.
+     */
     private record Ctx(Map<LocalVar, Integer> slots, Map<Integer, Integer> bufferSlots,
-            Map<Function, CallTarget> targets) {
+            Map<Function, CallTarget> targets, Map<SharedArray, Integer> sharedSlots, Args args) {
+
+        Ctx(Map<LocalVar, Integer> slots, Map<Integer, Integer> bufferSlots, Map<Function, CallTarget> targets) {
+            this(slots, bufferSlots, targets, Map.of(), Args.PLAIN);
+        }
+
+        void require(Args needed, String what) {
+            if (args.ordinal() < needed.ordinal()) {
+                throw new UnsupportedOperationException(what + " needs the dispatch lowering: "
+                        + "CoreToTruffle.lowerDispatch, which runs a kernel a whole dispatch at a time");
+            }
+        }
     }
 
     /** Lowers a core function to a callable Truffle target. Calling it executes the function on the CPU. */
@@ -68,22 +105,163 @@ public final class CoreToTruffle {
      * position of each {@link Buffer} in {@code buffers} (its slot).
      */
     public CallTarget lowerKernel(Function function, List<Buffer> buffers) {
+        return buildTarget(function, bufferSlots(buffers), Map.of());
+    }
+
+    /**
+     * Lowers a data-parallel kernel for {@linkplain CpuKernel#dispatch whole dispatches}, in workgroups of
+     * {@code workgroupSize} — the size only matters to a kernel that uses workgroup memory, workgroup indices
+     * or barriers, and is otherwise how the GPU happens to schedule it. Unlike {@link #lowerKernel} this
+     * supports all of those and {@link Expr.InvocationCount}.
+     *
+     * <p>A barrier splits the kernel into phases, and each workgroup runs one phase for every invocation before
+     * starting the next: sequential invocations cannot wait for each other, but they can take turns. An
+     * invocation's local variables live in its own frame, which persists across the phases, and its shared
+     * arrays belong to the workgroup. That a barrier is in uniform control flow is what makes the phase
+     * boundaries the same for every invocation, so {@link Barriers#check} runs first.
+     *
+     * @throws IllegalArgumentException if a barrier is not in uniform control flow
+     */
+    public CpuKernel lowerDispatch(Function function, List<Buffer> buffers, int workgroupSize) {
+        if (workgroupSize < 1) {
+            throw new IllegalArgumentException("workgroup size must be >= 1, got " + workgroupSize);
+        }
+        Barriers.check(function);
+        WorkgroupScan usage = new WorkgroupScan();
+        usage.scan(function.body());
+        FrameDescriptor.Builder frame = FrameDescriptor.newBuilder();
+        Map<LocalVar, Integer> slots = frameSlots(function, frame);
+        FrameDescriptor descriptor = frame.build();
+        if (!usage.grouped()) {
+            Ctx ctx = new Ctx(slots, bufferSlots(buffers), Map.of(), Map.of(), Args.COUNTED);
+            CallTarget target = new ShaderRootNode(descriptor, lowerRegion(function.body(), ctx)).getCallTarget();
+            return new CpuKernel(target, false, false, workgroupSize);
+        }
+        Map<SharedArray, Integer> sharedSlots = new IdentityHashMap<>();
+        for (SharedArray array : usage.arrays) {
+            sharedSlots.put(array, sharedSlots.size());
+        }
+        Ctx ctx = new Ctx(slots, bufferSlots(buffers), Map.of(), sharedSlots, Args.GROUPED);
+        GroupNode[] plan = lowerGroupRegion(function.body(), ctx);
+        CallTarget target = new WorkgroupRootNode(descriptor, plan, usage.arrays.toArray(SharedArray[]::new),
+                workgroupSize).getCallTarget();
+        return new CpuKernel(target, true, usage.barrier, workgroupSize);
+    }
+
+    private static Map<Integer, Integer> bufferSlots(List<Buffer> buffers) {
         Map<Integer, Integer> bufferSlots = new java.util.HashMap<>();
         for (int i = 0; i < buffers.size(); i++) {
             bufferSlots.put(buffers.get(i).binding(), i);
         }
-        return buildTarget(function, bufferSlots, Map.of());
+        return bufferSlots;
     }
 
     private CallTarget buildTarget(Function function, Map<Integer, Integer> bufferSlots,
             Map<Function, CallTarget> targets) {
         FrameDescriptor.Builder frame = FrameDescriptor.newBuilder();
+        Map<LocalVar, Integer> slots = frameSlots(function, frame);
+        StatementNode[] body = lowerRegion(function.body(), new Ctx(slots, bufferSlots, targets));
+        return new ShaderRootNode(frame.build(), body).getCallTarget();
+    }
+
+    private static Map<LocalVar, Integer> frameSlots(Function function, FrameDescriptor.Builder frame) {
         Map<LocalVar, Integer> slots = new IdentityHashMap<>();
         for (LocalVar variable : collectVariables(function.body())) {
             slots.put(variable, frame.addSlot(FrameSlotKind.Object, variable.name(), null));
         }
-        StatementNode[] body = lowerRegion(function.body(), new Ctx(slots, bufferSlots, targets));
-        return new ShaderRootNode(frame.build(), body).getCallTarget();
+        return slots;
+    }
+
+    /**
+     * The workgroup-level plan of a region: maximal runs of barrier-free statements become {@link PhaseNode}s
+     * that run every invocation through the run in turn; a barrier ends a run; an {@code if} or {@code while}
+     * with a barrier inside is evaluated once for the whole group — its condition is uniform — and its regions
+     * planned the same way.
+     */
+    private GroupNode[] lowerGroupRegion(Region region, Ctx ctx) {
+        List<GroupNode> plan = new ArrayList<>();
+        List<StatementNode> phase = new ArrayList<>();
+        for (Statement statement : region.statements()) {
+            if (!Barriers.contains(statement)) {
+                phase.add(lowerStatement(statement, ctx));
+                continue;
+            }
+            if (!phase.isEmpty()) {
+                plan.add(new PhaseNode(phase.toArray(StatementNode[]::new)));
+                phase.clear();
+            }
+            plan.add(switch (statement) {
+                case Statement.Barrier ignored -> new BarrierNode();
+                case Statement.If f -> new GroupIfNode(lowerExpr(f.condition(), ctx),
+                        lowerGroupRegion(f.thenRegion(), ctx), lowerGroupRegion(f.elseRegion(), ctx));
+                case Statement.While w -> new GroupWhileNode(lowerExpr(w.condition(), ctx),
+                        lowerGroupRegion(w.body(), ctx));
+                default -> throw new IllegalStateException("not a barrier or a region holding one: " + statement);
+            });
+        }
+        if (!phase.isEmpty()) {
+            plan.add(new PhaseNode(phase.toArray(StatementNode[]::new)));
+        }
+        return plan.toArray(GroupNode[]::new);
+    }
+
+    /** The shared arrays a kernel uses, and whether it needs to be run workgroup by workgroup at all. */
+    private static final class WorkgroupScan {
+        final java.util.Set<SharedArray> arrays = new java.util.LinkedHashSet<>();   // identity equality
+        boolean barrier;
+        boolean indices;
+
+        boolean grouped() {
+            return barrier || indices || !arrays.isEmpty();
+        }
+
+        void scan(Region region) {
+            for (Statement statement : region.statements()) {
+                switch (statement) {
+                    case Statement.Barrier ignored -> barrier = true;
+                    case Statement.SharedStore s -> { arrays.add(s.array()); scan(s.index()); scan(s.value()); }
+                    case Statement.SharedAtomicUpdate s -> { arrays.add(s.array()); scan(s.index()); scan(s.value()); }
+                    case Statement.SharedAtomicCompareExchange s -> {
+                        arrays.add(s.array());
+                        scan(s.index());
+                        scan(s.expected());
+                        scan(s.desired());
+                    }
+                    case Statement.BufferStore s -> { scan(s.index()); scan(s.value()); }
+                    case Statement.AtomicUpdate s -> { scan(s.index()); scan(s.value()); }
+                    case Statement.AtomicCompareExchange s -> { scan(s.index()); scan(s.expected()); scan(s.desired()); }
+                    case Statement.Return r -> scan(r.value());
+                    case Statement.StoreResult s -> scan(s.value());
+                    case Statement.BuiltinWrite s -> scan(s.value());
+                    case Statement.InterfaceWrite s -> scan(s.value());
+                    case Statement.DeclareVar d -> scan(d.initializer());
+                    case Statement.Assign a -> scan(a.value());
+                    case Statement.If f -> { scan(f.condition()); scan(f.thenRegion()); scan(f.elseRegion()); }
+                    case Statement.While w -> { scan(w.condition()); scan(w.body()); }
+                    case Statement.ReturnVoid ignored -> { }
+                }
+            }
+        }
+
+        void scan(Expr expr) {
+            switch (expr) {
+                case Expr.LocalInvocationId ignored -> indices = true;
+                case Expr.WorkgroupId ignored -> indices = true;
+                case Expr.SharedLoad l -> { arrays.add(l.array()); scan(l.index()); }
+                case Expr.BufferLoad l -> scan(l.index());
+                case Expr.Binary b -> { scan(b.lhs()); scan(b.rhs()); }
+                case Expr.Unary u -> scan(u.operand());
+                case Expr.Bitcast b -> scan(b.operand());
+                case Expr.Convert c -> scan(c.operand());
+                case Expr.VectorConstruct v -> v.components().forEach(this::scan);
+                case Expr.VectorExtract v -> scan(v.vector());
+                case Expr.Call c -> c.arguments().forEach(this::scan);
+                case Expr.MathCall m -> m.args().forEach(this::scan);
+                case Expr.SampleTexture s -> scan(s.uv());
+                case Expr.MatrixTimesVector m -> { scan(m.matrix()); scan(m.vector()); }
+                default -> { }
+            }
+        }
     }
 
     private StatementNode[] lowerRegion(Region region, Ctx ctx) {
@@ -112,6 +290,19 @@ public final class CoreToTruffle {
             case Statement.AtomicCompareExchange s -> new AtomicCompareExchangeNode(
                     ctx.bufferSlots().get(s.buffer().binding()), ctx.slots().get(s.previous()),
                     lowerExpr(s.index(), ctx), lowerExpr(s.expected(), ctx), lowerExpr(s.desired(), ctx));
+            case Statement.SharedStore s -> new SharedStoreNode(sharedSlot(s.array(), ctx),
+                    lowerExpr(s.index(), ctx), lowerExpr(s.value(), ctx));
+            case Statement.SharedAtomicUpdate s -> new SharedAtomicUpdateNode(sharedSlot(s.array(), ctx),
+                    s.array().element(), s.op(), s.previous() == null ? -1 : ctx.slots().get(s.previous()),
+                    lowerExpr(s.index(), ctx), lowerExpr(s.value(), ctx));
+            case Statement.SharedAtomicCompareExchange s -> new SharedAtomicCompareExchangeNode(
+                    sharedSlot(s.array(), ctx), ctx.slots().get(s.previous()),
+                    lowerExpr(s.index(), ctx), lowerExpr(s.expected(), ctx), lowerExpr(s.desired(), ctx));
+            // Only reached outside a workgroup plan: inside one, a barrier is a phase boundary, not a node.
+            case Statement.Barrier ignored -> {
+                ctx.require(Args.GROUPED, "a barrier");
+                throw new IllegalStateException("a barrier outside the workgroup plan");
+            }
             case Statement.DeclareVar d -> new AssignNode(ctx.slots().get(d.variable()), lowerExpr(d.initializer(), ctx));
             case Statement.Assign a -> new AssignNode(ctx.slots().get(a.variable()), lowerExpr(a.value(), ctx));
             case Statement.If f -> new IfNode(lowerExpr(f.condition(), ctx),
@@ -129,7 +320,20 @@ public final class CoreToTruffle {
                     c.type().width() == 64 ? (Object) c.value() : (Object) (float) c.value());
             case Expr.ConstBool c -> new LiteralNode(c.value());
             case Expr.Read r -> new ReadNode(ctx.slots().get(r.variable()));
-            case Expr.InvocationId ignored -> new InvocationIdNode();
+            case Expr.InvocationId ignored -> new ArgumentNode(ARG_INVOCATION);
+            case Expr.InvocationCount ignored -> {
+                ctx.require(Args.COUNTED, "the invocation count");
+                yield new ArgumentNode(ARG_COUNT);
+            }
+            case Expr.LocalInvocationId ignored -> {
+                ctx.require(Args.GROUPED, "the local invocation id");
+                yield new ArgumentNode(ARG_LOCAL);
+            }
+            case Expr.WorkgroupId ignored -> {
+                ctx.require(Args.GROUPED, "the workgroup id");
+                yield new ArgumentNode(ARG_WORKGROUP);
+            }
+            case Expr.SharedLoad l -> new SharedLoadNode(sharedSlot(l.array(), ctx), lowerExpr(l.index(), ctx));
             case Expr.BufferLoad l -> new BufferLoadNode(ctx.bufferSlots().get(l.buffer().binding()),
                     l.buffer().element(), lowerExpr(l.index(), ctx));
             case Expr.BuiltinRead ignored -> throw new UnsupportedOperationException(
@@ -158,6 +362,11 @@ public final class CoreToTruffle {
             case Expr.MatrixTimesVector ignored -> throw new UnsupportedOperationException(
                     "matrix math is graphics-only — no CPU backend yet");
         };
+    }
+
+    private static int sharedSlot(SharedArray array, Ctx ctx) {
+        ctx.require(Args.GROUPED, "workgroup memory");
+        return ctx.sharedSlots().get(array);
     }
 
     /** Whether {@code type} (or a vector's component) is an unsigned integer, selecting unsigned CPU ops. */
@@ -259,11 +468,19 @@ public final class CoreToTruffle {
                     }
                 }
                 case Statement.AtomicCompareExchange s -> addOnce(s.previous(), out);
+                case Statement.SharedAtomicUpdate s -> {
+                    if (s.previous() != null) {
+                        addOnce(s.previous(), out);
+                    }
+                }
+                case Statement.SharedAtomicCompareExchange s -> addOnce(s.previous(), out);
                 case Statement.If f -> {
                     collectVariables(f.thenRegion(), out);
                     collectVariables(f.elseRegion(), out);
                 }
                 case Statement.While w -> collectVariables(w.body(), out);
+                case Statement.SharedStore ignored -> { }
+                case Statement.Barrier ignored -> { }
                 case Statement.Assign ignored -> { }
                 case Statement.ReturnVoid ignored -> { }
                 case Statement.Return ignored -> { }
@@ -565,12 +782,304 @@ public final class CoreToTruffle {
         }
     }
 
-    // Kernel nodes read the per-invocation arguments: [Integer invocationIndex, int[][] buffers-by-slot].
+    // Kernel nodes read the per-invocation arguments: [Integer invocationIndex, int[][] buffers-by-slot], then
+    // for a dispatch [Integer count], then for a workgroup [Integer local, Integer workgroup, Object[][] shared].
 
-    private static final class InvocationIdNode extends ExprNode {
+    /** One of the invocation's indices, or the dispatch's count, straight from the frame arguments. */
+    private static final class ArgumentNode extends ExprNode {
+        private final int index;
+
+        ArgumentNode(int index) {
+            this.index = index;
+        }
+
         @Override
         Object execute(VirtualFrame frame) {
-            return frame.getArguments()[0];
+            return frame.getArguments()[index];
+        }
+    }
+
+    // --- workgroups ------------------------------------------------------------------------------------
+    //
+    // A kernel run by workgroup has one WorkgroupRootNode call per workgroup. It gives every invocation its own
+    // materialized frame -- where its locals persist between phases -- and the workgroup fresh shared arrays,
+    // then executes the plan: PhaseNodes run each live invocation through a barrier-free run of statements in
+    // turn, and the group-level if/while evaluate their uniform conditions against every invocation, so a
+    // condition that was not uniform after all is a thrown witness rather than a silently wrong answer.
+
+    /** Shared arrays, one element array per slot, reached through the invocation's frame arguments. */
+    private static Object[] sharedAt(VirtualFrame frame, int slot) {
+        return ((Object[][]) frame.getArguments()[ARG_SHARED])[slot];
+    }
+
+    /** The invocations of one workgroup, and which of them have returned. */
+    private static final class Group {
+        final MaterializedFrame[] frames;
+        final boolean[] returned;
+        int live;
+
+        Group(MaterializedFrame[] frames) {
+            this.frames = frames;
+            this.returned = new boolean[frames.length];
+            this.live = frames.length;
+        }
+
+        /**
+         * Whether the group proceeds into a region with a barrier in it. {@link Barriers#check} proves that no
+         * barrier follows a return only some invocations took, so either all have returned or none has.
+         */
+        boolean proceeds() {
+            if (live == 0) {
+                return false;
+            }
+            if (live != frames.length) {
+                throw new IllegalStateException((frames.length - live) + " of " + frames.length
+                        + " invocations returned before a barrier the rest must reach");
+            }
+            return true;
+        }
+
+        /** Evaluates a uniform condition against every invocation, requiring that they agree. */
+        boolean condition(ExprNode condition) {
+            if (!proceeds()) {
+                return false;
+            }
+            boolean first = (Boolean) condition.execute(frames[0]);
+            for (int i = 1; i < frames.length; i++) {
+                if ((Boolean) condition.execute(frames[i]) != first) {
+                    throw new IllegalStateException("a condition guarding a barrier differs between invocations "
+                            + "0 and " + i + " of a workgroup");
+                }
+            }
+            return first;
+        }
+    }
+
+    private static final class WorkgroupRootNode extends RootNode {
+        @Children private final GroupNode[] plan;
+        private final SharedArray[] arrays;
+        private final int workgroupSize;
+
+        WorkgroupRootNode(FrameDescriptor invocationFrame, GroupNode[] plan, SharedArray[] arrays, int workgroupSize) {
+            super((TruffleLanguage<?>) null, invocationFrame);
+            this.plan = plan;
+            this.arrays = arrays;
+            this.workgroupSize = workgroupSize;
+        }
+
+        /** Called as {@code (workgroup, buffers, count, running)}: one workgroup, of {@code running} invocations. */
+        @Override
+        public Object execute(VirtualFrame frame) {
+            Object[] args = frame.getArguments();
+            int workgroup = (Integer) args[0];
+            int running = (Integer) args[3];
+            Object[][] shared = new Object[arrays.length][];
+            for (int s = 0; s < arrays.length; s++) {
+                shared[s] = new Object[arrays[s].length()];
+                java.util.Arrays.fill(shared[s], zero(arrays[s].element()));
+            }
+            MaterializedFrame[] frames = new MaterializedFrame[running];
+            for (int local = 0; local < running; local++) {
+                Object[] invocation = {workgroup * workgroupSize + local, args[1], args[2], local, workgroup, shared};
+                frames[local] = Truffle.getRuntime().createMaterializedFrame(invocation, getFrameDescriptor());
+            }
+            Group group = new Group(frames);
+            for (GroupNode node : plan) {
+                node.execute(group);
+            }
+            return null;
+        }
+
+        /** What an element of workgroup memory starts as here: zero, one of the values "undefined" allows. */
+        private static Object zero(Type element) {
+            return switch (element) {
+                case Type.Int i -> i.width() == 64 ? (Object) 0L : (Object) 0;
+                case Type.Float f -> f.width() == 64 ? (Object) 0.0 : (Object) 0f;
+                case Type.Bool ignored -> false;
+                case Type.Vector v -> v.component() instanceof Type.Float f
+                        ? (f.width() == 64 ? (Object) new double[v.count()] : (Object) new float[v.count()])
+                        : (Object) new int[v.count()];
+                default -> throw new IllegalStateException("no workgroup memory of " + element);
+            };
+        }
+    }
+
+    private abstract static class GroupNode extends Node {
+        abstract void execute(Group group);
+    }
+
+    /** A barrier-free run of statements, run to its end by each live invocation before the next starts it. */
+    private static final class PhaseNode extends GroupNode {
+        @Children private final StatementNode[] body;
+
+        PhaseNode(StatementNode[] body) {
+            this.body = body;
+        }
+
+        @Override
+        void execute(Group group) {
+            for (int i = 0; i < group.frames.length; i++) {
+                if (group.returned[i]) {
+                    continue;
+                }
+                try {
+                    for (StatementNode statement : body) {
+                        statement.execute(group.frames[i]);
+                    }
+                } catch (ReturnException exit) {
+                    group.returned[i] = true;
+                    group.live--;
+                }
+            }
+        }
+    }
+
+    /**
+     * A barrier. The phase boundary is the barrier itself — the phase before it has run for every invocation
+     * before the phase after it starts — so all that is left is to check that everyone arrived.
+     */
+    private static final class BarrierNode extends GroupNode {
+        @Override
+        void execute(Group group) {
+            group.proceeds();
+        }
+    }
+
+    private static final class GroupIfNode extends GroupNode {
+        @Child private ExprNode condition;
+        @Children private final GroupNode[] thenPlan;
+        @Children private final GroupNode[] elsePlan;
+
+        GroupIfNode(ExprNode condition, GroupNode[] thenPlan, GroupNode[] elsePlan) {
+            this.condition = condition;
+            this.thenPlan = thenPlan;
+            this.elsePlan = elsePlan;
+        }
+
+        @Override
+        void execute(Group group) {
+            if (group.live == 0) {
+                return;
+            }
+            for (GroupNode node : group.condition(condition) ? thenPlan : elsePlan) {
+                node.execute(group);
+            }
+        }
+    }
+
+    private static final class GroupWhileNode extends GroupNode {
+        @Child private ExprNode condition;
+        @Children private final GroupNode[] body;
+
+        GroupWhileNode(ExprNode condition, GroupNode[] body) {
+            this.condition = condition;
+            this.body = body;
+        }
+
+        @Override
+        void execute(Group group) {
+            while (group.condition(condition)) {
+                for (GroupNode node : body) {
+                    node.execute(group);
+                }
+            }
+        }
+    }
+
+    private static final class SharedLoadNode extends ExprNode {
+        private final int slot;
+        @Child private ExprNode index;
+
+        SharedLoadNode(int slot, ExprNode index) {
+            this.slot = slot;
+            this.index = index;
+        }
+
+        @Override
+        Object execute(VirtualFrame frame) {
+            return sharedAt(frame, slot)[(Integer) index.execute(frame)];
+        }
+    }
+
+    private static final class SharedStoreNode extends StatementNode {
+        private final int slot;
+        @Child private ExprNode index;
+        @Child private ExprNode value;
+
+        SharedStoreNode(int slot, ExprNode index, ExprNode value) {
+            this.slot = slot;
+            this.index = index;
+            this.value = value;
+        }
+
+        @Override
+        void execute(VirtualFrame frame) {
+            sharedAt(frame, slot)[(Integer) index.execute(frame)] = value.execute(frame);
+        }
+    }
+
+    /** As {@link AtomicUpdateNode}, on workgroup memory, whose elements are already boxed values. */
+    private static final class SharedAtomicUpdateNode extends StatementNode {
+        private final int slot;
+        private final Type element;
+        private final AtomicOp op;
+        private final int previousSlot; // -1 when the old value is not wanted
+        @Child private ExprNode index;
+        @Child private ExprNode value;
+
+        SharedAtomicUpdateNode(int slot, Type element, AtomicOp op, int previousSlot, ExprNode index,
+                ExprNode value) {
+            this.slot = slot;
+            this.element = element;
+            this.op = op;
+            this.previousSlot = previousSlot;
+            this.index = index;
+            this.value = value;
+        }
+
+        @Override
+        void execute(VirtualFrame frame) {
+            Object[] elements = sharedAt(frame, slot);
+            int i = (Integer) index.execute(frame);
+            Object operand = value.execute(frame);
+            Object old = elements[i];
+            elements[i] = element instanceof Type.Float
+                    ? (Object) AtomicUpdateNode.applyFloat(op, (Float) old, (Float) operand)
+                    : (Object) AtomicUpdateNode.applyInt(op, ((Type.Int) element).signed(), (Integer) old,
+                            (Integer) operand);
+            if (previousSlot >= 0) {
+                frame.setObject(previousSlot, old);
+            }
+        }
+    }
+
+    private static final class SharedAtomicCompareExchangeNode extends StatementNode {
+        private final int slot;
+        private final int previousSlot;
+        @Child private ExprNode index;
+        @Child private ExprNode expected;
+        @Child private ExprNode desired;
+
+        SharedAtomicCompareExchangeNode(int slot, int previousSlot, ExprNode index, ExprNode expected,
+                ExprNode desired) {
+            this.slot = slot;
+            this.previousSlot = previousSlot;
+            this.index = index;
+            this.expected = expected;
+            this.desired = desired;
+        }
+
+        @Override
+        void execute(VirtualFrame frame) {
+            Object[] elements = sharedAt(frame, slot);
+            int i = (Integer) index.execute(frame);
+            int comparator = (Integer) expected.execute(frame);
+            int replacement = (Integer) desired.execute(frame);
+            int old = (Integer) elements[i];
+            if (old == comparator) {
+                elements[i] = replacement;
+            }
+            frame.setObject(previousSlot, old);
         }
     }
 

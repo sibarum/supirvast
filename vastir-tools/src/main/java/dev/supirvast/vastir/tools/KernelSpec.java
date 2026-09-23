@@ -11,10 +11,15 @@ import java.util.List;
  * the columns name the buffers it touches, in binding order. This is the highest-level, language-neutral
  * description of a kernel — the {@link Accelerator} turns it into validated, preloaded, runnable form.
  *
- * <p>The workgroup size is a GPU scheduling choice and never a change of meaning: the kernel still runs once
- * per invocation, and the {@link Accelerator} stops the invocations a rounded-up dispatch adds past the end.
- * It defaults to {@link #DEFAULT_WORKGROUP_SIZE}, a whole number of lanes on the common hardware, where a
- * workgroup of one leaves most of each SIMD unit idle.
+ * <p>For most kernels the workgroup size is a GPU scheduling choice and never a change of meaning: the kernel
+ * still runs once per invocation, and the {@link Accelerator} stops the invocations a rounded-up dispatch adds
+ * past the end. It defaults to {@link #DEFAULT_WORKGROUP_SIZE}, a whole number of lanes on the common
+ * hardware, where a workgroup of one leaves most of each SIMD unit idle.
+ *
+ * <p>A kernel that uses workgroup memory or the workgroup indices is the exception, since the size is then
+ * part of what it computes. And a kernel with a barrier runs whole workgroups on both backends, because the
+ * invocations past the end cannot return before a barrier the rest of their workgroup must reach. Such a
+ * kernel reads the requested count as {@code Expr.InvocationCount} and bounds itself.
  */
 public record KernelSpec(Function kernel, List<KernelColumn> columns, int workgroupSize) {
 

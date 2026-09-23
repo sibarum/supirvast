@@ -12,6 +12,7 @@ import dev.supirvast.vastir.core.LocalVar;
 import dev.supirvast.vastir.core.PushConstants;
 import dev.supirvast.vastir.core.Region;
 import dev.supirvast.vastir.core.ShaderStage;
+import dev.supirvast.vastir.core.SharedArray;
 import dev.supirvast.vastir.core.Statement;
 import dev.supirvast.vastir.core.Texture;
 import dev.supirvast.vastir.core.UnaryOp;
@@ -136,6 +137,9 @@ final class Printer {
         for (Buffer b : res.buffers()) {
             line("buffer " + b.name() + ": " + typeText(b.element()) + " @binding " + b.binding());
         }
+        for (SharedArray a : res.shared()) {
+            line("shared " + a.name() + ": " + typeText(a.element()) + "[" + a.length() + "]");
+        }
         for (Texture t : res.textures()) {
             if (t.kind() == Texture.Kind.CUBE) {
                 line("cubemap " + t.name() + " @binding " + t.binding());
@@ -189,6 +193,19 @@ final class Printer {
                         + emitToAtom(cx.expected()) + ", " + emitToAtom(cx.desired());
                 line(previousName(cx.previous()) + " = " + text);
             }
+            case Statement.SharedStore ss ->
+                    line(ss.array().name() + "[" + emitToAtom(ss.index()) + "] = " + renderRhs(ss.value()));
+            case Statement.SharedAtomicUpdate au -> {
+                String text = "atomic " + au.op().name().toLowerCase(java.util.Locale.ROOT) + " "
+                        + au.array().name() + "[" + emitToAtom(au.index()) + "], " + emitToAtom(au.value());
+                line(au.previous() == null ? text : previousName(au.previous()) + " = " + text);
+            }
+            case Statement.SharedAtomicCompareExchange cx -> {
+                String text = "atomic cmpxchg " + cx.array().name() + "[" + emitToAtom(cx.index()) + "], "
+                        + emitToAtom(cx.expected()) + ", " + emitToAtom(cx.desired());
+                line(previousName(cx.previous()) + " = " + text);
+            }
+            case Statement.Barrier ignored -> line("barrier");
             case Statement.BuiltinWrite bw -> line(builtinName(bw.builtin()) + " = " + renderRhs(bw.value()));
             case Statement.InterfaceWrite iw -> line(iw.variable().name() + " = " + renderRhs(iw.value()));
             case Statement.DeclareVar dv -> line(declareName(dv.variable()) + " = " + renderRhs(dv.initializer()));
@@ -263,6 +280,9 @@ final class Printer {
             case Expr.InterfaceRead ignored -> true;
             case Expr.BuiltinRead ignored -> true;
             case Expr.InvocationId ignored -> true;
+            case Expr.LocalInvocationId ignored -> true;
+            case Expr.WorkgroupId ignored -> true;
+            case Expr.InvocationCount ignored -> true;
             case Expr.PushConstantRead ignored -> true;
             default -> false;
         };
@@ -278,6 +298,9 @@ final class Printer {
             case Expr.InterfaceRead ir -> ir.variable().name();
             case Expr.BuiltinRead br -> builtinName(br.builtin());
             case Expr.InvocationId ignored -> "invocation_id";
+            case Expr.LocalInvocationId ignored -> "local_invocation_id";
+            case Expr.WorkgroupId ignored -> "workgroup_id";
+            case Expr.InvocationCount ignored -> "invocation_count";
             case Expr.PushConstantRead pc -> pc.block().members().get(pc.member()).name();
             default -> throw new IllegalStateException("not an atom: " + e);
         };
@@ -302,6 +325,7 @@ final class Printer {
             case Expr.SampleTexture st -> "sample " + st.texture().name() + ", " + arg.apply(st.uv());
             case Expr.MathCall mc -> mathMnemonic(mc.fn()) + " " + joinArgs(mc.args(), arg);
             case Expr.BufferLoad bl -> bl.buffer().name() + "[" + arg.apply(bl.index()) + "]";
+            case Expr.SharedLoad sl -> sl.array().name() + "[" + arg.apply(sl.index()) + "]";
             case Expr.ConstInt c -> typeText(c.type()) + " " + c.value();          // non-default-width int const
             case Expr.ConstFloat c -> typeText(c.type()) + " " + floatText(c.value()); // non-f32 float const
             default -> throw new IllegalStateException("cannot render as an operation: " + e);
@@ -463,8 +487,17 @@ final class Printer {
         private final Map<Integer, InterfaceVar> inputs = new TreeMap<>();
         private final Map<Integer, InterfaceVar> outputs = new TreeMap<>();
         private final Map<Integer, Buffer> buffers = new TreeMap<>();
+        private final Set<SharedArray> shared = new LinkedHashSet<>();   // first use; SharedArray is by identity
         private final Map<Long, Texture> textures = new TreeMap<>();
         private PushConstants pushConstants;
+
+        void add(SharedArray a) {
+            shared.add(a);
+        }
+
+        List<SharedArray> shared() {
+            return new ArrayList<>(shared);
+        }
 
         void add(InterfaceVar v) {
             (v.direction() == InterfaceVar.Direction.INPUT ? inputs : outputs).putIfAbsent(v.location(), v);
@@ -507,6 +540,7 @@ final class Printer {
             inputs.values().forEach(v -> names.add(v.name()));
             outputs.values().forEach(v -> names.add(v.name()));
             buffers.values().forEach(b -> names.add(b.name()));
+            shared.forEach(a -> names.add(a.name()));
             textures.values().forEach(t -> names.add(t.name()));
             if (pushConstants != null) {
                 pushConstants.members().forEach(m -> names.add(m.name()));
@@ -541,6 +575,23 @@ final class Printer {
                 collectExpr(cx.expected(), res);
                 collectExpr(cx.desired(), res);
             }
+            case Statement.SharedStore ss -> {
+                res.add(ss.array());
+                collectExpr(ss.index(), res);
+                collectExpr(ss.value(), res);
+            }
+            case Statement.SharedAtomicUpdate au -> {
+                res.add(au.array());
+                collectExpr(au.index(), res);
+                collectExpr(au.value(), res);
+            }
+            case Statement.SharedAtomicCompareExchange cx -> {
+                res.add(cx.array());
+                collectExpr(cx.index(), res);
+                collectExpr(cx.expected(), res);
+                collectExpr(cx.desired(), res);
+            }
+            case Statement.Barrier ignored -> { /* nothing to collect */ }
             case Statement.BuiltinWrite bw -> collectExpr(bw.value(), res);
             case Statement.InterfaceWrite iw -> {
                 res.add(iw.variable());
@@ -568,6 +619,10 @@ final class Printer {
             case Expr.BufferLoad bl -> {
                 res.add(bl.buffer());
                 collectExpr(bl.index(), res);
+            }
+            case Expr.SharedLoad sl -> {
+                res.add(sl.array());
+                collectExpr(sl.index(), res);
             }
             case Expr.SampleTexture st -> {
                 res.add(st.texture());

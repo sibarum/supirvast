@@ -54,7 +54,7 @@ public sealed interface Statement {
      * <p>{@code previous} is {@code null} when the old value is not wanted. When it is given, this statement
      * assigns it, and declares it if nothing else does — so a loop can reuse one variable across iterations.
      * Memory scope is the device and ordering is relaxed: atomicity per element, with no ordering between
-     * elements. Anything that needs the latter needs a barrier, which this IR does not have.
+     * elements. Ordering within a workgroup is what a {@link Barrier} provides; there is none across them.
      */
     record AtomicUpdate(LocalVar previous, AtomicOp op, Buffer buffer, Expr index, Expr value)
             implements Statement {
@@ -96,6 +96,86 @@ public sealed interface Statement {
             requireType(previous.type(), buffer, "previous");
             requireType(expected.type(), buffer, "expected");
             requireType(desired.type(), buffer, "desired");
+        }
+    }
+
+    /** Writes {@code value} to {@code array[index]} (an element of workgroup memory). */
+    record SharedStore(SharedArray array, Expr index, Expr value) implements Statement {}
+
+    /**
+     * Waits until every invocation in the workgroup has arrived here, and makes each one's earlier writes —
+     * to workgroup memory and to storage buffers — visible to the others after it. The execution barrier
+     * {@code OpControlBarrier} with workgroup scope and acquire-release semantics over both kinds of memory.
+     *
+     * <p>Buffer memory is included deliberately. A barrier that ordered only workgroup memory would let an
+     * invocation read a buffer element another in its group wrote before the barrier and see the old value,
+     * where the CPU backend — which runs the invocations of a workgroup phase by phase — always sees the new
+     * one; the two backends would disagree on a kernel neither rejects.
+     *
+     * <p>Every invocation of the workgroup must reach the same barriers the same number of times, so a barrier
+     * may only sit in <em>uniform</em> control flow: under conditions every invocation in the group evaluates
+     * alike, and after no return some of them took. {@link Barriers#check} enforces that from the IR's structure
+     * and both lowerings call it. A kernel with a barrier runs whole workgroups; see {@link
+     * Expr.InvocationCount}.
+     */
+    record Barrier() implements Statement {}
+
+    /**
+     * {@link AtomicUpdate} on an element of workgroup memory: atomic with respect to the other invocations of
+     * the workgroup, which are the only ones that can see it. Workgroup scope, relaxed ordering.
+     *
+     * <p>The same table of operations as a buffer's, {@link AtomicOp#definedOn}. The float ones each need the
+     * capability a buffer's would and a workgroup-memory device feature besides (float exchange included,
+     * which on workgroup memory is licensed by {@code shaderSharedFloat32Atomics}); a device may license
+     * float atomics on one kind of memory and not the other, so the two are budgeted apart.
+     */
+    record SharedAtomicUpdate(LocalVar previous, AtomicOp op, SharedArray array, Expr index, Expr value)
+            implements Statement {
+        public SharedAtomicUpdate {
+            if (!op.definedOn(array.element())) {
+                throw new IllegalArgumentException("atomic " + op + " is not defined on shared array '"
+                        + array.name() + "' of " + array.element());
+            }
+            requireType(value.type(), array, "value");
+            if (previous != null) {
+                requireType(previous.type(), array, "previous");
+            }
+        }
+
+        /** An update whose old value is not wanted. */
+        public SharedAtomicUpdate(AtomicOp op, SharedArray array, Expr index, Expr value) {
+            this(null, op, array, index, value);
+        }
+    }
+
+    /**
+     * {@link AtomicCompareExchange} on an element of workgroup memory: 32-bit integers only, as in SPIR-V.
+     * Workgroup scope, relaxed ordering.
+     */
+    record SharedAtomicCompareExchange(LocalVar previous, SharedArray array, Expr index, Expr expected,
+            Expr desired) implements Statement {
+        public SharedAtomicCompareExchange {
+            requireInt32(array);
+            if (previous == null) {
+                throw new IllegalArgumentException("atomic compare-exchange needs a variable for its outcome");
+            }
+            requireType(previous.type(), array, "previous");
+            requireType(expected.type(), array, "expected");
+            requireType(desired.type(), array, "desired");
+        }
+    }
+
+    private static void requireInt32(SharedArray array) {
+        if (!(array.element() instanceof Type.Int i && i.width() == 32)) {
+            throw new IllegalArgumentException("atomic compare-exchange needs a 32-bit integer array; '"
+                    + array.name() + "' holds " + array.element());
+        }
+    }
+
+    private static void requireType(Type type, SharedArray array, String role) {
+        if (!type.equals(array.element())) {
+            throw new IllegalArgumentException("atomic " + role + " is " + type + ", but shared array '"
+                    + array.name() + "' holds " + array.element());
         }
     }
 

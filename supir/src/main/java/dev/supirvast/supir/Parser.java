@@ -14,6 +14,7 @@ import dev.supirvast.vastir.core.MathFn;
 import dev.supirvast.vastir.core.PushConstants;
 import dev.supirvast.vastir.core.Region;
 import dev.supirvast.vastir.core.ShaderStage;
+import dev.supirvast.vastir.core.SharedArray;
 import dev.supirvast.vastir.core.Statement;
 import dev.supirvast.vastir.core.Texture;
 import dev.supirvast.vastir.core.UnaryOp;
@@ -92,7 +93,7 @@ final class Parser {
                 moduleScope.defineFunction(fn.name(), fn, t.span());
                 module.addFunction(fn);
             }
-            case "in", "out", "buffer", "texture", "cubemap", "push" -> declaration(moduleScope);
+            case "in", "out", "buffer", "shared", "texture", "cubemap", "push" -> declaration(moduleScope);
             default -> throw new SupirParseException(t.span(), "unknown top-level item '" + word + "'");
         }
     }
@@ -166,7 +167,7 @@ final class Parser {
 
     private static boolean isDecl(String word) {
         return switch (word) {
-            case "in", "out", "buffer", "texture", "cubemap", "push" -> true;
+            case "in", "out", "buffer", "shared", "texture", "cubemap", "push" -> true;
             default -> false;
         };
     }
@@ -192,6 +193,20 @@ final class Parser {
                 Type element = type();
                 int binding = at("binding");
                 scope.defineBuffer(name, new Buffer(name, binding, element), start.span());
+            }
+            case "shared" -> {
+                // shared NAME : TYPE [ LENGTH ]
+                String name = ident("shared array name");
+                expect(Lexer.Kind.COLON, ":");
+                Type element = type();
+                expect(Lexer.Kind.LBRACKET, "[");
+                int length = intLiteral("shared array length");
+                expect(Lexer.Kind.RBRACKET, "]");
+                try {
+                    scope.defineShared(name, new SharedArray(name, element, length), start.span());
+                } catch (IllegalArgumentException invalid) {
+                    throw new SupirParseException(start.span(), invalid.getMessage());
+                }
             }
             case "texture" -> {
                 String name = ident("texture name");
@@ -261,6 +276,10 @@ final class Parser {
             }
             case "if" -> ifStatement(scope);
             case "loop" -> loopStatement(scope);
+            case "barrier" -> {
+                advance();
+                yield new Statement.Barrier();
+            }
             case "atomic" -> {
                 advance();
                 yield atomic(scope, null, null, null);
@@ -274,10 +293,10 @@ final class Parser {
             "and", AtomicOp.AND, "or", AtomicOp.OR, "xor", AtomicOp.XOR, "exchange", AtomicOp.EXCHANGE);
 
     /**
-     * After {@code atomic}: {@code <op> buf[index], value}, or {@code cmpxchg buf[index], expected, desired}.
-     * {@code previousName} is the left-hand side when there is one — reassigned if it is already a local,
-     * declared with the buffer's element type if not — and is bound only after the operands are read, so an
-     * operand naming it means the variable from before.
+     * After {@code atomic}: {@code <op> buf[index], value}, or {@code cmpxchg buf[index], expected, desired},
+     * where {@code buf} is a buffer or a shared array. {@code previousName} is the left-hand side when there is
+     * one — reassigned if it is already a local, declared with the element type if not — and is bound only
+     * after the operands are read, so an operand naming it means the variable from before.
      */
     private Statement atomic(Scope scope, String previousName, Lexer.Token previousAt, Type declared) {
         Lexer.Token opToken = peek();
@@ -290,9 +309,11 @@ final class Parser {
         Lexer.Token bufferToken = peek();
         String bufferName = ident("a buffer");
         Buffer buffer = scope.buffer(bufferName);
-        if (buffer == null) {
+        SharedArray array = buffer == null ? scope.shared(bufferName) : null;
+        if (buffer == null && array == null) {
             throw new SupirParseException(bufferToken.span(), "undefined buffer '" + bufferName + "'");
         }
+        Type element = buffer != null ? buffer.element() : array.element();
         expect(Lexer.Kind.LBRACKET, "[");
         Expr idx = atom(scope);
         expect(Lexer.Kind.RBRACKET, "]");
@@ -311,11 +332,16 @@ final class Parser {
         if (previousName != null) {
             previous = scope.local(previousName);
             if (previous == null) {
-                previous = new LocalVar(previousName, declared != null ? declared : buffer.element());
+                previous = new LocalVar(previousName, declared != null ? declared : element);
                 scope.defineLocal(previousName, previous, previousAt.span());
             }
         }
         try {
+            if (array != null) {
+                return compareExchange
+                        ? new Statement.SharedAtomicCompareExchange(previous, array, idx, first, second)
+                        : new Statement.SharedAtomicUpdate(previous, op, array, idx, first);
+            }
             return compareExchange
                     ? new Statement.AtomicCompareExchange(previous, buffer, idx, first, second)
                     : new Statement.AtomicUpdate(previous, op, buffer, idx, first);
@@ -338,16 +364,19 @@ final class Parser {
         Lexer.Token lhs = peek();
         String name = ident("a statement");
 
-        // buffer store: name[index] = value
+        // buffer or shared-array store: name[index] = value
         if (accept(Lexer.Kind.LBRACKET)) {
             Buffer buffer = scope.buffer(name);
-            if (buffer == null) {
+            SharedArray array = buffer == null ? scope.shared(name) : null;
+            if (buffer == null && array == null) {
                 throw new SupirParseException(lhs.span(), "undefined buffer '" + name + "'");
             }
             Expr idx = atom(scope);
             expect(Lexer.Kind.RBRACKET, "]");
             expect(Lexer.Kind.EQUALS, "=");
-            return new Statement.BufferStore(buffer, idx, rhs(scope));
+            return buffer != null
+                    ? new Statement.BufferStore(buffer, idx, rhs(scope))
+                    : new Statement.SharedStore(array, idx, rhs(scope));
         }
 
         // typed local declaration: name : type = value
@@ -601,22 +630,26 @@ final class Parser {
         String name = t.text();
         advance();
 
-        // buffer load: name[index]
+        // buffer or shared-array load: name[index]
         if (peek().kind() == Lexer.Kind.LBRACKET) {
             Buffer buffer = scope.buffer(name);
-            if (buffer == null) {
+            SharedArray array = buffer == null ? scope.shared(name) : null;
+            if (buffer == null && array == null) {
                 throw new SupirParseException(t.span(), "undefined buffer '" + name + "'");
             }
             advance(); // '['
             Expr idx = atom(scope);
             expect(Lexer.Kind.RBRACKET, "]");
-            return new Expr.BufferLoad(buffer, idx);
+            return buffer != null ? new Expr.BufferLoad(buffer, idx) : new Expr.SharedLoad(array, idx);
         }
 
         switch (name) {
             case "true" -> { return new Expr.ConstBool(true); }
             case "false" -> { return new Expr.ConstBool(false); }
             case "invocation_id" -> { return new Expr.InvocationId(); }
+            case "local_invocation_id" -> { return new Expr.LocalInvocationId(); }
+            case "workgroup_id" -> { return new Expr.WorkgroupId(); }
+            case "invocation_count" -> { return new Expr.InvocationCount(); }
             default -> { /* fall through to lookups */ }
         }
         Builtin builtin = builtinOrNull(name);

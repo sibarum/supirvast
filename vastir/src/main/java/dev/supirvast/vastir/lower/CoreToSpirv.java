@@ -4,6 +4,7 @@ import dev.supirvast.vastir.binary.Instruction;
 import dev.supirvast.vastir.binary.SpirvModule;
 import dev.supirvast.vastir.core.AtomicOp;
 import dev.supirvast.vastir.core.BinaryOp;
+import dev.supirvast.vastir.core.Barriers;
 import dev.supirvast.vastir.core.Buffer;
 import dev.supirvast.vastir.core.Builtin;
 import dev.supirvast.vastir.core.MathFn;
@@ -17,6 +18,7 @@ import dev.supirvast.vastir.core.InterfaceVar;
 import dev.supirvast.vastir.core.LocalVar;
 import dev.supirvast.vastir.core.Region;
 import dev.supirvast.vastir.core.ShaderStage;
+import dev.supirvast.vastir.core.SharedArray;
 import dev.supirvast.vastir.core.Statement;
 import dev.supirvast.vastir.core.UnaryOp;
 import dev.supirvast.vastir.spirv.AddressingModel;
@@ -58,6 +60,22 @@ import java.util.Set;
  */
 public final class CoreToSpirv {
 
+    /**
+     * The push-constant block an {@link Expr.InvocationCount} reads: one {@code int} at offset 0, which is
+     * exactly the 4-byte range {@code GpuContext} declares on every compute pipeline and sets per dispatch.
+     */
+    private static final PushConstants INVOCATION_COUNT = PushConstants.of("invocations", Type.int32());
+
+    /** Workgroup scope, for barriers and atomics on workgroup memory. */
+    private static final int WORKGROUP_SCOPE = Scope.Workgroup.value();
+
+    /**
+     * What a {@link Statement.Barrier} orders: every write before it, to workgroup <em>and</em> buffer memory,
+     * before every read after it — see the barrier's documentation for why buffers are included.
+     */
+    private static final int BARRIER_SEMANTICS = MemorySemantics.AcquireRelease.value()
+            | MemorySemantics.WorkgroupMemory.value() | MemorySemantics.UniformMemory.value();
+
     /** Lowers with no capability restriction (emit whatever the kernel requires). */
     public SpirvModule lower(CoreModule module) {
         return lower(module, SpirvTarget.unconstrained());
@@ -86,23 +104,34 @@ public final class CoreToSpirv {
 
         OutputBuffer output = usesStoreResult(module) ? new OutputBuffer(b) : null;
         List<Buffer> buffers = collectBuffers(module);
-        boolean invocationId = usesInvocationId(module);
-        KernelResources kernel = (!buffers.isEmpty() || invocationId)
-                ? new KernelResources(b, buffers, invocationId, storedBindings(module)) : null;
+        KernelUsage usage = collectKernelUsage(module);
         InterfaceUsage iface = collectInterface(module);
+        checkWorkgroupUsage(module, usage, target);
+        KernelResources kernel = (!buffers.isEmpty() || !usage.builtins().isEmpty())
+                ? new KernelResources(b, buffers, usage.builtins(), storedBindings(module)) : null;
+        WorkgroupResources workgroup = usage.sharedArrays().isEmpty()
+                ? null : new WorkgroupResources(b, usage.sharedArrays());
         InterfaceResources interfaceResources = iface.isEmpty()
                 ? null : new InterfaceResources(b, iface.builtins(), iface.variables());
         TextureResources textures = iface.textures().isEmpty()
                 ? null : new TextureResources(b, iface.textures());
-        PushConstantResources pushConstants = iface.pushConstants() == null
-                ? null : new PushConstantResources(b, iface.pushConstants());
+        PushConstants pushBlock = iface.pushConstants();
+        if (usage.invocationCount()) {
+            if (pushBlock != null) {
+                throw new IllegalArgumentException("a module that reads the invocation count cannot declare push "
+                        + "constants of its own: the count is carried in the push-constant block");
+            }
+            pushBlock = INVOCATION_COUNT;
+        }
+        PushConstantResources pushConstants = pushBlock == null ? null : new PushConstantResources(b, pushBlock);
 
         b.emit(b.capabilities, Op.OpCapability).enumValue(Capability.Shader.value());
         b.emit(b.memoryModel, Op.OpMemoryModel)
                 .enumValue(target.addressingModel())
                 .enumValue(target.memoryModel());
 
-        emitEntryPoints(module, b, functionIds, output, kernel, interfaceResources, textures, pushConstants);
+        emitEntryPoints(module, b, functionIds, output, kernel, workgroup, interfaceResources, textures,
+                pushConstants);
         emitExecutionModes(module, b, functionIds, iface.builtins().contains(Builtin.FRAG_DEPTH));
 
         TypeTable types = new TypeTable(b);
@@ -112,6 +141,9 @@ public final class CoreToSpirv {
         }
         if (kernel != null) {
             kernel.declare(b, types, constants);
+        }
+        if (workgroup != null) {
+            workgroup.declare(b, types, constants);
         }
         if (interfaceResources != null) {
             interfaceResources.declare(b, types);
@@ -125,7 +157,7 @@ public final class CoreToSpirv {
         prepareGlobals(module, types, constants);
 
         for (Function function : module.functions()) {
-            new FunctionLowering(b, types, constants, output, kernel, interfaceResources, textures,
+            new FunctionLowering(b, types, constants, output, kernel, workgroup, interfaceResources, textures,
                     pushConstants, functionIds)
                     .emit(function, functionIds.get(function));
         }
@@ -147,13 +179,18 @@ public final class CoreToSpirv {
             required.add(Capability.Float64);
         }
         Set<Capability> atomics = new LinkedHashSet<>();
+        Set<DeviceFeature> features = new LinkedHashSet<>();
         for (Function function : module.functions()) {
-            floatAtomicCapabilities(function.body(), atomics);
+            floatAtomicCapabilities(function.body(), atomics, features);
         }
         required.addAll(atomics);
         List<Capability> disallowed = required.stream().filter(c -> !target.allows(c)).toList();
         if (!disallowed.isEmpty()) {
             throw new CapabilityException("kernel requires capabilities outside the target profile: " + disallowed);
+        }
+        List<DeviceFeature> withheld = features.stream().filter(f -> !target.allows(f)).toList();
+        if (!withheld.isEmpty()) {
+            throw new CapabilityException("kernel requires device features outside the target profile: " + withheld);
         }
         for (Capability capability : required) {
             b.emit(b.capabilities, Op.OpCapability).enumValue(capability.value());
@@ -169,24 +206,50 @@ public final class CoreToSpirv {
      * {@code Shader}; float add and float min/max are each an extension, which a device may lack — so they go
      * through the target budget like every other optional capability, and a device without them gets the
      * kernel registered CPU-only rather than a pipeline that fails to build. Float exchange is core.
+     *
+     * <p>Each also needs the {@link DeviceFeature} for the memory it points to, since the capability is the
+     * same for buffers and workgroup memory and the device's license is not. On workgroup memory float
+     * exchange needs one too.
      */
-    private void floatAtomicCapabilities(Region region, Set<Capability> out) {
+    private void floatAtomicCapabilities(Region region, Set<Capability> out, Set<DeviceFeature> features) {
         for (Statement statement : region.statements()) {
             switch (statement) {
                 case Statement.AtomicUpdate s -> {
                     if (s.buffer().element() instanceof Type.Float) {
                         switch (s.op()) {
-                            case ADD -> out.add(Capability.AtomicFloat32AddEXT);
-                            case MIN, MAX -> out.add(Capability.AtomicFloat32MinMaxEXT);
+                            case ADD -> {
+                                out.add(Capability.AtomicFloat32AddEXT);
+                                features.add(DeviceFeature.BUFFER_FLOAT32_ATOMIC_ADD);
+                            }
+                            case MIN, MAX -> {
+                                out.add(Capability.AtomicFloat32MinMaxEXT);
+                                features.add(DeviceFeature.BUFFER_FLOAT32_ATOMIC_MIN_MAX);
+                            }
+                            default -> { }
+                        }
+                    }
+                }
+                case Statement.SharedAtomicUpdate s -> {
+                    if (s.array().element() instanceof Type.Float) {
+                        switch (s.op()) {
+                            case ADD -> {
+                                out.add(Capability.AtomicFloat32AddEXT);
+                                features.add(DeviceFeature.SHARED_FLOAT32_ATOMIC_ADD);
+                            }
+                            case MIN, MAX -> {
+                                out.add(Capability.AtomicFloat32MinMaxEXT);
+                                features.add(DeviceFeature.SHARED_FLOAT32_ATOMIC_MIN_MAX);
+                            }
+                            case EXCHANGE -> features.add(DeviceFeature.SHARED_FLOAT32_ATOMICS);
                             default -> { }
                         }
                     }
                 }
                 case Statement.If f -> {
-                    floatAtomicCapabilities(f.thenRegion(), out);
-                    floatAtomicCapabilities(f.elseRegion(), out);
+                    floatAtomicCapabilities(f.thenRegion(), out, features);
+                    floatAtomicCapabilities(f.elseRegion(), out, features);
                 }
-                case Statement.While w -> floatAtomicCapabilities(w.body(), out);
+                case Statement.While w -> floatAtomicCapabilities(w.body(), out, features);
                 default -> { }
             }
         }
@@ -201,8 +264,8 @@ public final class CoreToSpirv {
     }
 
     private void emitEntryPoints(CoreModule module, Builder b, Map<Function, Integer> functionIds,
-            OutputBuffer output, KernelResources kernel, InterfaceResources interfaceResources,
-            TextureResources textures, PushConstantResources pushConstants) {
+            OutputBuffer output, KernelResources kernel, WorkgroupResources workgroup,
+            InterfaceResources interfaceResources, TextureResources textures, PushConstantResources pushConstants) {
         for (EntryPoint entryPoint : module.entryPoints()) {
             Instruction instruction = b.emit(b.entryPoints, Op.OpEntryPoint)
                     .enumValue(executionModel(entryPoint.stage()))
@@ -214,6 +277,11 @@ public final class CoreToSpirv {
             }
             if (kernel != null) {
                 for (int interfaceVar : kernel.interfaceVariables()) {
+                    instruction.id(interfaceVar);
+                }
+            }
+            if (workgroup != null) {
+                for (int interfaceVar : workgroup.interfaceVariables()) {
                     instruction.id(interfaceVar);
                 }
             }
@@ -236,7 +304,7 @@ public final class CoreToSpirv {
     /**
      * @param replacesDepth whether the module writes {@link Builtin#FRAG_DEPTH}, which every fragment entry
      *                      point must then declare {@code DepthReplacing} for. Module-wide rather than per
-     *                      entry point, the same coarseness {@link #usesInvocationId} has: the interface scan
+     *                      entry point, the same coarseness {@link #collectKernelUsage} has: the interface scan
      *                      walks every function without attributing it to the entry point that reaches it,
      *                      and over-declaring costs a fragment shader its early-z where under-declaring is
      *                      undefined behaviour. A module with two fragment entry points, one of which writes
@@ -367,6 +435,20 @@ public final class CoreToSpirv {
                     collectBuffers(s.expected(), out);
                     collectBuffers(s.desired(), out);
                 }
+                case Statement.SharedStore s -> {
+                    collectBuffers(s.index(), out);
+                    collectBuffers(s.value(), out);
+                }
+                case Statement.SharedAtomicUpdate s -> {
+                    collectBuffers(s.index(), out);
+                    collectBuffers(s.value(), out);
+                }
+                case Statement.SharedAtomicCompareExchange s -> {
+                    collectBuffers(s.index(), out);
+                    collectBuffers(s.expected(), out);
+                    collectBuffers(s.desired(), out);
+                }
+                case Statement.Barrier ignored -> { }
                 case Statement.Return r -> collectBuffers(r.value(), out);
                 case Statement.StoreResult s -> collectBuffers(s.value(), out);
                 case Statement.BuiltinWrite s -> collectBuffers(s.value(), out);
@@ -393,6 +475,7 @@ public final class CoreToSpirv {
                 out.putIfAbsent(l.buffer().binding(), l.buffer());
                 collectBuffers(l.index(), out);
             }
+            case Expr.SharedLoad l -> collectBuffers(l.index(), out);
             case Expr.Binary b -> {
                 collectBuffers(b.lhs(), out);
                 collectBuffers(b.rhs(), out);
@@ -415,56 +498,88 @@ public final class CoreToSpirv {
             case Expr.ConstBool ignored -> { }
             case Expr.Read ignored -> { }
             case Expr.InvocationId ignored -> { }
+            case Expr.LocalInvocationId ignored -> { }
+            case Expr.WorkgroupId ignored -> { }
+            case Expr.InvocationCount ignored -> { }
             case Expr.BuiltinRead ignored -> { }
             case Expr.InterfaceRead ignored -> { }
             case Expr.Param ignored -> { }
         }
     }
 
-    private boolean usesInvocationId(CoreModule module) {
-        boolean[] found = {false};
-        for (Function function : module.functions()) {
-            scanForInvocationId(function.body(), found);
+    /**
+     * The compute-only features a module uses: the invocation-index built-ins (in the order their variables
+     * are declared), its shared arrays, whether it reads the invocation count, and whether it has a barrier.
+     */
+    private record KernelUsage(List<BuiltIn> builtins, List<SharedArray> sharedArrays, boolean invocationCount,
+            boolean barrier) {
+        boolean workgroup() {
+            return barrier || !sharedArrays.isEmpty() || builtins.contains(BuiltIn.LocalInvocationId)
+                    || builtins.contains(BuiltIn.WorkgroupId);
         }
-        return found[0];
     }
 
-    private void scanForInvocationId(Region region, boolean[] found) {
+    /** Mutable accumulator threaded through the kernel-usage scan. */
+    private static final class KernelScan {
+        final Set<BuiltIn> builtins = new LinkedHashSet<>();
+        final Set<SharedArray> sharedArrays = new LinkedHashSet<>();   // SharedArray equality is identity
+        boolean invocationCount;
+        boolean barrier;
+    }
+
+    private KernelUsage collectKernelUsage(CoreModule module) {
+        KernelScan scan = new KernelScan();
+        for (Function function : module.functions()) {
+            scanKernel(function.body(), scan);
+        }
+        return new KernelUsage(List.copyOf(scan.builtins), List.copyOf(scan.sharedArrays), scan.invocationCount,
+                scan.barrier);
+    }
+
+    private void scanKernel(Region region, KernelScan scan) {
         for (Statement statement : region.statements()) {
             switch (statement) {
-                case Statement.BufferStore s -> { scanForInvocationId(s.index(), found); scanForInvocationId(s.value(), found); }
-                case Statement.AtomicUpdate s -> { scanForInvocationId(s.index(), found); scanForInvocationId(s.value(), found); }
-                case Statement.AtomicCompareExchange s -> { scanForInvocationId(s.index(), found); scanForInvocationId(s.expected(), found); scanForInvocationId(s.desired(), found); }
-                case Statement.Return r -> scanForInvocationId(r.value(), found);
-                case Statement.StoreResult s -> scanForInvocationId(s.value(), found);
-                case Statement.BuiltinWrite s -> scanForInvocationId(s.value(), found);
-                case Statement.InterfaceWrite s -> scanForInvocationId(s.value(), found);
-                case Statement.DeclareVar d -> scanForInvocationId(d.initializer(), found);
-                case Statement.Assign a -> scanForInvocationId(a.value(), found);
-                case Statement.If f -> { scanForInvocationId(f.condition(), found); scanForInvocationId(f.thenRegion(), found); scanForInvocationId(f.elseRegion(), found); }
-                case Statement.While w -> { scanForInvocationId(w.condition(), found); scanForInvocationId(w.body(), found); }
+                case Statement.BufferStore s -> { scanKernel(s.index(), scan); scanKernel(s.value(), scan); }
+                case Statement.AtomicUpdate s -> { scanKernel(s.index(), scan); scanKernel(s.value(), scan); }
+                case Statement.AtomicCompareExchange s -> { scanKernel(s.index(), scan); scanKernel(s.expected(), scan); scanKernel(s.desired(), scan); }
+                case Statement.SharedStore s -> { scan.sharedArrays.add(s.array()); scanKernel(s.index(), scan); scanKernel(s.value(), scan); }
+                case Statement.SharedAtomicUpdate s -> { scan.sharedArrays.add(s.array()); scanKernel(s.index(), scan); scanKernel(s.value(), scan); }
+                case Statement.SharedAtomicCompareExchange s -> { scan.sharedArrays.add(s.array()); scanKernel(s.index(), scan); scanKernel(s.expected(), scan); scanKernel(s.desired(), scan); }
+                case Statement.Barrier ignored -> scan.barrier = true;
+                case Statement.Return r -> scanKernel(r.value(), scan);
+                case Statement.StoreResult s -> scanKernel(s.value(), scan);
+                case Statement.BuiltinWrite s -> scanKernel(s.value(), scan);
+                case Statement.InterfaceWrite s -> scanKernel(s.value(), scan);
+                case Statement.DeclareVar d -> scanKernel(d.initializer(), scan);
+                case Statement.Assign a -> scanKernel(a.value(), scan);
+                case Statement.If f -> { scanKernel(f.condition(), scan); scanKernel(f.thenRegion(), scan); scanKernel(f.elseRegion(), scan); }
+                case Statement.While w -> { scanKernel(w.condition(), scan); scanKernel(w.body(), scan); }
                 case Statement.ReturnVoid ignored -> { }
             }
         }
     }
 
-    private void scanForInvocationId(Expr expr, boolean[] found) {
+    private void scanKernel(Expr expr, KernelScan scan) {
         switch (expr) {
-            case Expr.InvocationId ignored -> found[0] = true;
-            case Expr.BufferLoad l -> scanForInvocationId(l.index(), found);
-            case Expr.Binary b -> { scanForInvocationId(b.lhs(), found); scanForInvocationId(b.rhs(), found); }
-            case Expr.VectorConstruct vc -> vc.components().forEach(c -> scanForInvocationId(c, found));
-            case Expr.VectorExtract ve -> scanForInvocationId(ve.vector(), found);
-            case Expr.Bitcast bc -> scanForInvocationId(bc.operand(), found);
-            case Expr.Convert cv -> scanForInvocationId(cv.operand(), found);
-            case Expr.Unary u -> scanForInvocationId(u.operand(), found);
-            case Expr.Call c -> c.arguments().forEach(a -> scanForInvocationId(a, found));
-            case Expr.MathCall mc -> mc.args().forEach(a -> scanForInvocationId(a, found));
-            case Expr.SampleTexture s -> scanForInvocationId(s.uv(), found);
+            case Expr.InvocationId ignored -> scan.builtins.add(BuiltIn.GlobalInvocationId);
+            case Expr.LocalInvocationId ignored -> scan.builtins.add(BuiltIn.LocalInvocationId);
+            case Expr.WorkgroupId ignored -> scan.builtins.add(BuiltIn.WorkgroupId);
+            case Expr.InvocationCount ignored -> scan.invocationCount = true;
+            case Expr.SharedLoad l -> { scan.sharedArrays.add(l.array()); scanKernel(l.index(), scan); }
+            case Expr.BufferLoad l -> scanKernel(l.index(), scan);
+            case Expr.Binary b -> { scanKernel(b.lhs(), scan); scanKernel(b.rhs(), scan); }
+            case Expr.VectorConstruct vc -> vc.components().forEach(c -> scanKernel(c, scan));
+            case Expr.VectorExtract ve -> scanKernel(ve.vector(), scan);
+            case Expr.Bitcast bc -> scanKernel(bc.operand(), scan);
+            case Expr.Convert cv -> scanKernel(cv.operand(), scan);
+            case Expr.Unary u -> scanKernel(u.operand(), scan);
+            case Expr.Call c -> c.arguments().forEach(a -> scanKernel(a, scan));
+            case Expr.MathCall mc -> mc.args().forEach(a -> scanKernel(a, scan));
+            case Expr.SampleTexture s -> scanKernel(s.uv(), scan);
             case Expr.PushConstantRead ignored -> { }
             case Expr.MatrixTimesVector m -> {
-                scanForInvocationId(m.matrix(), found);
-                scanForInvocationId(m.vector(), found);
+                scanKernel(m.matrix(), scan);
+                scanKernel(m.vector(), scan);
             }
             case Expr.ConstInt ignored -> { }
             case Expr.ConstFloat ignored -> { }
@@ -473,6 +588,41 @@ public final class CoreToSpirv {
             case Expr.BuiltinRead ignored -> { }
             case Expr.InterfaceRead ignored -> { }
             case Expr.Param ignored -> { }
+        }
+    }
+
+    /**
+     * Workgroup features are compute-only, a barrier belongs to an entry point's own body in uniform control
+     * flow, and the shared arrays must fit the target's workgroup memory — the last a {@link
+     * CapabilityException}, because like a capability it is a limit of where the kernel runs rather than a
+     * defect of the kernel, and an orchestrator can run it elsewhere.
+     */
+    private void checkWorkgroupUsage(CoreModule module, KernelUsage usage, SpirvTarget target) {
+        if (!usage.workgroup()) {
+            return;
+        }
+        for (EntryPoint entryPoint : module.entryPoints()) {
+            if (entryPoint.stage() != ShaderStage.COMPUTE) {
+                throw new IllegalArgumentException("workgroup memory, barriers and workgroup indices are compute "
+                        + "only, but the module has a " + entryPoint.stage() + " entry point '"
+                        + entryPoint.function().name() + "'");
+            }
+        }
+        for (Function function : module.functions()) {
+            if (!Barriers.contains(function.body())) {
+                continue;
+            }
+            boolean entry = module.entryPoints().stream().anyMatch(e -> e.function() == function);
+            if (!entry) {
+                throw new IllegalArgumentException("function '" + function.name() + "' has a barrier, but only "
+                        + "an entry point's own body may: a barrier in a callee is one the caller cannot see");
+            }
+            Barriers.check(function);
+        }
+        long bytes = usage.sharedArrays().stream().mapToLong(SharedArray::bytes).sum();
+        if (bytes > target.maxWorkgroupMemoryBytes()) {
+            throw new CapabilityException("kernel declares " + bytes + " bytes of workgroup memory "
+                    + usage.sharedArrays() + ", over the target's " + target.maxWorkgroupMemoryBytes());
         }
     }
 
@@ -525,6 +675,20 @@ public final class CoreToSpirv {
                     scanInterface(s.expected(), scan);
                     scanInterface(s.desired(), scan);
                 }
+                case Statement.SharedStore s -> {
+                    scanInterface(s.index(), scan);
+                    scanInterface(s.value(), scan);
+                }
+                case Statement.SharedAtomicUpdate s -> {
+                    scanInterface(s.index(), scan);
+                    scanInterface(s.value(), scan);
+                }
+                case Statement.SharedAtomicCompareExchange s -> {
+                    scanInterface(s.index(), scan);
+                    scanInterface(s.expected(), scan);
+                    scanInterface(s.desired(), scan);
+                }
+                case Statement.Barrier ignored -> { }
                 case Statement.Return r -> scanInterface(r.value(), scan);
                 case Statement.StoreResult s -> scanInterface(s.value(), scan);
                 case Statement.DeclareVar d -> scanInterface(d.initializer(), scan);
@@ -557,6 +721,7 @@ public final class CoreToSpirv {
                 scanInterface(m.vector(), scan);
             }
             case Expr.BufferLoad l -> scanInterface(l.index(), scan);
+            case Expr.SharedLoad l -> scanInterface(l.index(), scan);
             case Expr.Binary b -> {
                 scanInterface(b.lhs(), scan);
                 scanInterface(b.rhs(), scan);
@@ -573,6 +738,9 @@ public final class CoreToSpirv {
             case Expr.ConstBool ignored -> { }
             case Expr.Read ignored -> { }
             case Expr.InvocationId ignored -> { }
+            case Expr.LocalInvocationId ignored -> { }
+            case Expr.WorkgroupId ignored -> { }
+            case Expr.InvocationCount ignored -> { }
             case Expr.Param ignored -> { }
         }
     }
@@ -615,6 +783,25 @@ public final class CoreToSpirv {
                     prepareExpr(s.expected(), types, constants);
                     prepareExpr(s.desired(), types, constants);
                 }
+                case Statement.SharedStore s -> {
+                    prepareExpr(s.index(), types, constants);
+                    prepareExpr(s.value(), types, constants);
+                }
+                case Statement.SharedAtomicUpdate s -> {
+                    prepareSharedAtomic(s.array(), s.previous(), types, constants);
+                    prepareExpr(s.index(), types, constants);
+                    prepareExpr(s.value(), types, constants);
+                }
+                case Statement.SharedAtomicCompareExchange s -> {
+                    prepareSharedAtomic(s.array(), s.previous(), types, constants);
+                    prepareExpr(s.index(), types, constants);
+                    prepareExpr(s.expected(), types, constants);
+                    prepareExpr(s.desired(), types, constants);
+                }
+                case Statement.Barrier ignored -> {
+                    constants.intConst(Type.uint32(), WORKGROUP_SCOPE);
+                    constants.intConst(Type.uint32(), BARRIER_SEMANTICS);
+                }
                 case Statement.DeclareVar d -> {
                     types.pointerType(StorageClass.Function.value(), d.variable().type());
                     prepareExpr(d.initializer(), types, constants);
@@ -643,6 +830,16 @@ public final class CoreToSpirv {
         constants.intConst(Type.uint32(), MemorySemantics.Relaxed.value());
     }
 
+    private void prepareSharedAtomic(SharedArray array, LocalVar previous, TypeTable types,
+            ConstantTable constants) {
+        types.idOf(array.element());
+        if (previous != null) {
+            types.pointerType(StorageClass.Function.value(), previous.type());
+        }
+        constants.intConst(Type.uint32(), WORKGROUP_SCOPE);
+        constants.intConst(Type.uint32(), MemorySemantics.Relaxed.value());
+    }
+
     private void prepareExpr(Expr expr, TypeTable types, ConstantTable constants) {
         switch (expr) {
             case Expr.ConstInt c -> constants.intConst(c.type(), c.value());
@@ -650,6 +847,16 @@ public final class CoreToSpirv {
             case Expr.ConstBool c -> constants.boolConst(c.value());
             case Expr.Read r -> types.idOf(r.variable().type());
             case Expr.InvocationId ignored -> types.idOf(Type.int32());
+            case Expr.LocalInvocationId ignored -> types.idOf(Type.int32());
+            case Expr.WorkgroupId ignored -> types.idOf(Type.int32());
+            case Expr.InvocationCount ignored -> {
+                types.idOf(Type.int32());
+                constants.intConst(Type.int32(), 0);   // the access-chain member index
+            }
+            case Expr.SharedLoad l -> {
+                types.idOf(l.array().element());
+                prepareExpr(l.index(), types, constants);
+            }
             case Expr.BuiltinRead r -> types.idOf(r.builtin().type());
             case Expr.InterfaceRead r -> types.idOf(r.variable().type());
             case Expr.BufferLoad l -> {
@@ -809,47 +1016,44 @@ public final class CoreToSpirv {
 
     /**
      * Data-parallel kernel resources: storage buffers (runtime arrays of i32, one variable per binding, all
-     * sharing one Block struct type) and the {@code GlobalInvocationId} builtin input. Buffer elements are
-     * reached with a two-index {@code OpAccessChain} (struct member 0, then the dynamic array index).
+     * sharing one Block struct type) and the invocation-index builtin inputs ({@code GlobalInvocationId},
+     * {@code LocalInvocationId}, {@code WorkgroupId}) the kernel reads. Buffer elements are reached with a
+     * two-index {@code OpAccessChain} (struct member 0, then the dynamic array index).
      */
     private static final class KernelResources {
         private final List<Buffer> buffers;
-        private final boolean useInvocationId;
         private final Map<Integer, Integer> variableByBinding = new LinkedHashMap<>();
-        private int gidVariable;
+        private final Map<BuiltIn, Integer> builtinVariables = new LinkedHashMap<>();
 
         private int memberIndexConst;   // signed-int 0 (the struct member index), shared by all blocks
         // One Block/runtime-array per distinct element type; a buffer var uses the block for its element type.
         private final Map<Type, Integer> blockPointerByElement = new LinkedHashMap<>();
         private final Map<Type, Integer> memberPointerByElement = new LinkedHashMap<>();
         private int uintType;
-        private int gidComponentPointer; // Input* uint
-        private int uintZeroConst;       // the .x component index
+        private int builtinComponentPointer; // Input* uint
+        private int uintZeroConst;           // the .x component index
 
         /** The bindings some statement stores to; every other buffer is decorated {@code NonWritable}. */
         private final Set<Integer> storedBindings;
 
-        KernelResources(Builder b, List<Buffer> buffers, boolean useInvocationId, Set<Integer> storedBindings) {
+        KernelResources(Builder b, List<Buffer> buffers, List<BuiltIn> builtins, Set<Integer> storedBindings) {
             this.buffers = buffers;
-            this.useInvocationId = useInvocationId;
             this.storedBindings = storedBindings;
             for (Buffer buffer : buffers) {
                 variableByBinding.put(buffer.binding(), b.allocateId());
             }
-            if (useInvocationId) {
-                gidVariable = b.allocateId();
+            for (BuiltIn builtin : builtins) {
+                builtinVariables.put(builtin, b.allocateId());
             }
         }
 
-        boolean usesInvocationId() {
-            return useInvocationId;
+        /** The invocation-index builtins this kernel reads, in declaration order. */
+        Set<BuiltIn> builtins() {
+            return builtinVariables.keySet();
         }
 
         List<Integer> interfaceVariables() {
-            List<Integer> ids = new ArrayList<>();
-            if (useInvocationId) {
-                ids.add(gidVariable);
-            }
+            List<Integer> ids = new ArrayList<>(builtinVariables.values());
             ids.addAll(variableByBinding.values());
             return ids;
         }
@@ -900,24 +1104,26 @@ public final class CoreToSpirv {
                 }
             }
 
-            if (useInvocationId) {
+            if (!builtinVariables.isEmpty()) {
                 uintType = types.idOf(Type.uint32());
                 Type.Vector uvec3 = new Type.Vector(Type.uint32(), 3);
-                int gidPointer = types.pointerType(StorageClass.Input.value(), uvec3);
-                gidComponentPointer = types.pointerType(StorageClass.Input.value(), Type.uint32());
+                int builtinPointer = types.pointerType(StorageClass.Input.value(), uvec3);
+                builtinComponentPointer = types.pointerType(StorageClass.Input.value(), Type.uint32());
                 uintZeroConst = constants.intConst(Type.uint32(), 0);
-                b.emit(b.globals, Op.OpVariable).id(gidPointer).id(gidVariable)
-                        .enumValue(StorageClass.Input.value());
-                b.emit(b.annotations, Op.OpDecorate).id(gidVariable)
-                        .enumValue(Decoration.BuiltIn.value()).enumValue(BuiltIn.GlobalInvocationId.value());
+                for (Map.Entry<BuiltIn, Integer> builtin : builtinVariables.entrySet()) {
+                    b.emit(b.globals, Op.OpVariable).id(builtinPointer).id(builtin.getValue())
+                            .enumValue(StorageClass.Input.value());
+                    b.emit(b.annotations, Op.OpDecorate).id(builtin.getValue())
+                            .enumValue(Decoration.BuiltIn.value()).enumValue(builtin.getKey().value());
+                }
             }
         }
 
-        /** Loads gl_GlobalInvocationID.x (uint) and bitcasts it to a signed-int index. */
-        int loadInvocationId(Builder b, TypeTable types) {
+        /** Loads the x component of an invocation-index builtin (uint) and bitcasts it to a signed int. */
+        int loadBuiltin(Builder b, TypeTable types, BuiltIn builtin) {
             int pointer = b.allocateId();
-            b.emit(b.functions, Op.OpAccessChain).id(gidComponentPointer).id(pointer)
-                    .id(gidVariable).id(uintZeroConst);
+            b.emit(b.functions, Op.OpAccessChain).id(builtinComponentPointer).id(pointer)
+                    .id(builtinVariables.get(builtin)).id(uintZeroConst);
             int loaded = b.allocateId();
             b.emit(b.functions, Op.OpLoad).id(uintType).id(loaded).id(pointer);
             int casted = b.allocateId();
@@ -974,6 +1180,56 @@ public final class CoreToSpirv {
                         "no defined array stride for buffer element type " + element
                                 + " (supported: integer, float, and vector elements)");
             };
+        }
+    }
+
+    /**
+     * Workgroup memory: one {@code Workgroup}-storage {@code OpVariable} per {@link SharedArray}, of an
+     * {@code OpTypeArray} of its element type and fixed length. No layout decorations — workgroup memory is
+     * not host-visible, so its layout is the implementation's — and no initializer, since a workgroup
+     * variable cannot have one without an extension. Elements are reached with a one-index access chain.
+     */
+    private static final class WorkgroupResources {
+        private final List<SharedArray> arrays;
+        private final Map<SharedArray, Integer> variables = new LinkedHashMap<>();   // identity keys
+
+        private record ArrayKey(Type element, int length) {}
+
+        WorkgroupResources(Builder b, List<SharedArray> arrays) {
+            this.arrays = arrays;
+            for (SharedArray array : arrays) {
+                variables.put(array, b.allocateId());
+            }
+        }
+
+        List<Integer> interfaceVariables() {
+            return new ArrayList<>(variables.values());
+        }
+
+        void declare(Builder b, TypeTable types, ConstantTable constants) {
+            // Arrays of the same element and length share a pointer type, as they would share a GLSL type.
+            Map<ArrayKey, Integer> pointerTypes = new HashMap<>();
+            for (SharedArray array : arrays) {
+                int pointerType = pointerTypes.computeIfAbsent(new ArrayKey(array.element(), array.length()), k -> {
+                    int elementType = types.idOf(k.element());
+                    int length = constants.intConst(Type.uint32(), k.length());
+                    int arrayType = b.allocateId();
+                    b.emit(b.globals, Op.OpTypeArray).id(arrayType).id(elementType).id(length);
+                    int pointer = b.allocateId();
+                    b.emit(b.globals, Op.OpTypePointer).id(pointer)
+                            .enumValue(StorageClass.Workgroup.value()).id(arrayType);
+                    return pointer;
+                });
+                b.emit(b.globals, Op.OpVariable).id(pointerType).id(variables.get(array))
+                        .enumValue(StorageClass.Workgroup.value());
+            }
+        }
+
+        int elementPointer(Builder b, TypeTable types, SharedArray array, int indexId) {
+            int pointerType = types.pointerType(StorageClass.Workgroup.value(), array.element());
+            int pointer = b.allocateId();
+            b.emit(b.functions, Op.OpAccessChain).id(pointerType).id(pointer).id(variables.get(array)).id(indexId);
+            return pointer;
         }
     }
 
@@ -1128,6 +1384,10 @@ public final class CoreToSpirv {
             return variableId;
         }
 
+        PushConstants block() {
+            return block;
+        }
+
         void declare(Builder b, TypeTable types, ConstantTable constants) {
             List<PushConstants.Member> members = block.members();
             int[] memberTypeIds = members.stream().mapToInt(m -> types.idOf(m.type())).toArray();
@@ -1221,23 +1481,25 @@ public final class CoreToSpirv {
         private final ConstantTable constants;
         private final OutputBuffer output;
         private final KernelResources kernel;
+        private final WorkgroupResources workgroup;
         private final InterfaceResources interfaceResources;
         private final TextureResources textures;
         private final PushConstantResources pushConstants;
         private final Map<Function, Integer> functionIds;
         private final Map<LocalVar, Integer> variablePointers = new IdentityHashMap<>();
         private final List<Integer> parameterIds = new ArrayList<>();
-        private int invocationIdValue; // cached per function (0 = not yet loaded)
+        private final Map<BuiltIn, Integer> builtinValues = new LinkedHashMap<>(); // loaded in the entry block
         private boolean terminated;    // whether the current block already has a terminator (e.g. early return)
 
         FunctionLowering(Builder b, TypeTable types, ConstantTable constants, OutputBuffer output,
-                KernelResources kernel, InterfaceResources interfaceResources, TextureResources textures,
-                PushConstantResources pushConstants, Map<Function, Integer> functionIds) {
+                KernelResources kernel, WorkgroupResources workgroup, InterfaceResources interfaceResources,
+                TextureResources textures, PushConstantResources pushConstants, Map<Function, Integer> functionIds) {
             this.b = b;
             this.types = types;
             this.constants = constants;
             this.output = output;
             this.kernel = kernel;
+            this.workgroup = workgroup;
             this.interfaceResources = interfaceResources;
             this.textures = textures;
             this.pushConstants = pushConstants;
@@ -1266,11 +1528,13 @@ public final class CoreToSpirv {
                 variablePointers.put(variable, pointerId);
             }
 
-            // Load gl_GlobalInvocationID in the entry block (it dominates all others) so the cached id is
-            // usable everywhere — a lazy load at first use can land in a branch/loop that doesn't dominate
+            // Load the invocation-index builtins in the entry block (it dominates all others) so the cached ids
+            // are usable everywhere — a lazy load at first use can land in a branch/loop that doesn't dominate
             // later uses (e.g. code after a loop that contained the first reference).
-            if (kernel != null && kernel.usesInvocationId()) {
-                invocationIdValue = kernel.loadInvocationId(b, types);
+            if (kernel != null) {
+                for (BuiltIn builtin : kernel.builtins()) {
+                    builtinValues.put(builtin, kernel.loadBuiltin(b, types, builtin));
+                }
             }
 
             terminated = false;
@@ -1336,6 +1600,38 @@ public final class CoreToSpirv {
                             .id(deviceScope()).id(relaxed()).id(relaxed()).id(desired).id(expected);
                     store(s.previous(), old);
                 }
+                case Statement.SharedStore s -> {
+                    int index = lowerExpr(s.index());
+                    int value = lowerExpr(s.value());
+                    int pointer = workgroup.elementPointer(b, types, s.array(), index);
+                    b.emit(b.functions, Op.OpStore).id(pointer).id(value);
+                }
+                case Statement.SharedAtomicUpdate s -> {
+                    int index = lowerExpr(s.index());
+                    int value = lowerExpr(s.value());
+                    int pointer = workgroup.elementPointer(b, types, s.array(), index);
+                    int old = b.allocateId();
+                    b.emit(b.functions, atomicOp(s.op(), s.array().element()))
+                            .id(types.idOf(s.array().element())).id(old).id(pointer)
+                            .id(workgroupScope()).id(relaxed()).id(value);
+                    if (s.previous() != null) {
+                        store(s.previous(), old);
+                    }
+                }
+                case Statement.SharedAtomicCompareExchange s -> {
+                    int index = lowerExpr(s.index());
+                    int expected = lowerExpr(s.expected());
+                    int desired = lowerExpr(s.desired());
+                    int pointer = workgroup.elementPointer(b, types, s.array(), index);
+                    int old = b.allocateId();
+                    b.emit(b.functions, Op.OpAtomicCompareExchange)
+                            .id(types.idOf(s.array().element())).id(old).id(pointer)
+                            .id(workgroupScope()).id(relaxed()).id(relaxed()).id(desired).id(expected);
+                    store(s.previous(), old);
+                }
+                case Statement.Barrier ignored -> b.emit(b.functions, Op.OpControlBarrier)
+                        .id(workgroupScope()).id(workgroupScope())
+                        .id(constants.intConst(Type.uint32(), BARRIER_SEMANTICS));
                 case Statement.BuiltinWrite s -> {
                     int value = lowerExpr(s.value());
                     b.emit(b.functions, Op.OpStore).id(interfaceResources.builtinVariable(s.builtin())).id(value);
@@ -1357,6 +1653,10 @@ public final class CoreToSpirv {
 
         private int deviceScope() {
             return constants.intConst(Type.uint32(), Scope.Device.value());
+        }
+
+        private int workgroupScope() {
+            return constants.intConst(Type.uint32(), WORKGROUP_SCOPE);
         }
 
         private int relaxed() {
@@ -1387,12 +1687,9 @@ public final class CoreToSpirv {
             };
         }
 
-        /** Loads gl_GlobalInvocationID.x once per function and reuses the (signed-int) result. */
-        private int invocationId() {
-            if (invocationIdValue == 0) {
-                invocationIdValue = kernel.loadInvocationId(b, types);
-            }
-            return invocationIdValue;
+        /** An invocation-index builtin's x component, loaded once in the entry block (as a signed int). */
+        private int builtin(BuiltIn builtin) {
+            return builtinValues.get(builtin);
         }
 
         private void lowerIf(Statement.If statement) {
@@ -1479,7 +1776,17 @@ public final class CoreToSpirv {
                     b.emit(b.functions, Op.OpLoad).id(resultType).id(result).id(variablePointers.get(r.variable()));
                     yield result;
                 }
-                case Expr.InvocationId ignored -> invocationId();
+                case Expr.InvocationId ignored -> builtin(BuiltIn.GlobalInvocationId);
+                case Expr.LocalInvocationId ignored -> builtin(BuiltIn.LocalInvocationId);
+                case Expr.WorkgroupId ignored -> builtin(BuiltIn.WorkgroupId);
+                case Expr.InvocationCount ignored -> lowerPushConstantRead(pushConstants.block().read(0));
+                case Expr.SharedLoad l -> {
+                    int index = lowerExpr(l.index());
+                    int pointer = workgroup.elementPointer(b, types, l.array(), index);
+                    int result = b.allocateId();
+                    b.emit(b.functions, Op.OpLoad).id(types.idOf(l.array().element())).id(result).id(pointer);
+                    yield result;
+                }
                 case Expr.BufferLoad l -> {
                     int index = lowerExpr(l.index());
                     yield kernel.loadElement(b, types, l.buffer(), index);
@@ -1763,11 +2070,19 @@ public final class CoreToSpirv {
                         }
                     }
                     case Statement.AtomicCompareExchange s -> addOnce(s.previous(), out);
+                    case Statement.SharedAtomicUpdate s -> {
+                        if (s.previous() != null) {
+                            addOnce(s.previous(), out);
+                        }
+                    }
+                    case Statement.SharedAtomicCompareExchange s -> addOnce(s.previous(), out);
                     case Statement.If f -> {
                         collectVariables(f.thenRegion(), out);
                         collectVariables(f.elseRegion(), out);
                     }
                     case Statement.While w -> collectVariables(w.body(), out);
+                    case Statement.SharedStore ignored -> { }
+                    case Statement.Barrier ignored -> { }
                     case Statement.Assign ignored -> { }
                     case Statement.ReturnVoid ignored -> { }
                     case Statement.Return ignored -> { }

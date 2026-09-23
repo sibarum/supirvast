@@ -89,6 +89,7 @@ module-level resource declarations.
 Introduce a name; emit no instruction. Valid at module level or at the top of a body.
 - `in NAME: TYPE @loc N` / `out NAME: TYPE @loc N` — stage interface (varyings, attributes, outputs)
 - `buffer NAME: ELEMTYPE @binding N` — storage buffer
+- `shared NAME: ELEMTYPE[LENGTH]` — a fixed-length array in workgroup memory (compute only)
 - `texture NAME [@set N] @binding N` — 2D sampled texture · `cubemap NAME @binding N` — cubemap
 - `push NAME: TYPE` or `push { a: TYPE, b: TYPE }` — the single push-constant block
 
@@ -101,7 +102,10 @@ Introduce a name; emit no instruction. Valid at module level or at the top of a 
 - `NAME = RHS` — define a local (first use) or reassign it (later use); `NAME: TYPE = RHS` forces the type
 - `OUTVAR = RHS` — write a stage output (when NAME is a declared `out`)
 - `Position = RHS` — write a built-in output
-- `BUF[INDEX] = RHS` — store to a buffer
+- `BUF[INDEX] = RHS` — store to a buffer or shared array
+- `atomic OP BUF[INDEX], ATOM` / `NAME = atomic OP BUF[INDEX], ATOM` — `OP` is `add sub min max and or xor
+  exchange`; `NAME = atomic cmpxchg BUF[INDEX], EXPECTED, DESIRED`. `BUF` may be a buffer or a shared array.
+- `barrier` — every invocation of the workgroup waits here; only in uniform control flow
 - `ret` / `ret ATOM` — return · `store_result ATOM` — write the kernel result buffer
 - `if COND { … }` / `if COND { … } else { … }`
 - `loop while COND { … }`
@@ -111,7 +115,7 @@ A right-hand side is a single **operation** or a bare **atom**. Operation operan
 no nesting (that is the whole point; everything intermediate is named).
 
 - atoms: `42` (i32), `1.0` (f32), `true`/`false`, a name (param / local / `in` var / push-constant member),
-  `VertexIndex`, `invocation_id`, `BUF[INDEX]`
+  `VertexIndex`, `invocation_id`, `local_invocation_id`, `workgroup_id`, `invocation_count`, `BUF[INDEX]`
 - typed constants / conversions: `u32 5` (constant), `f32 idx` (conversion); also `convert x, i64`,
   `bitcast x, u32`
 - arithmetic: `add sub mul div mod` · bitwise: `band bor bxor shl shr` · compare: `lt gt eq` ·

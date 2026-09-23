@@ -6,6 +6,7 @@ import dev.supirvast.vastir.core.Function;
 import dev.supirvast.vastir.core.InterfaceVar;
 import dev.supirvast.vastir.core.LocalVar;
 import dev.supirvast.vastir.core.PushConstants;
+import dev.supirvast.vastir.core.SharedArray;
 import dev.supirvast.vastir.core.Texture;
 
 import java.util.HashMap;
@@ -17,8 +18,9 @@ import java.util.Map;
  * adds params and that function's resources, and each {@code if}/{@code while} region nests a child scope for
  * its locals. Lookups walk up to the root; definitions land in the current scope.
  *
- * <p>Resources (interface vars, buffers, textures, push-constant members) live in whatever scope they were
- * declared, so a resource declared in a function prelude is visible throughout that function's regions.
+ * <p>Resources (interface vars, buffers, shared arrays, textures, push-constant members) live in whatever
+ * scope they were declared, so a resource declared in a function prelude is visible throughout that
+ * function's regions.
  */
 final class Scope {
 
@@ -28,6 +30,7 @@ final class Scope {
     private final Map<String, Expr.Param> params = new HashMap<>();
     private final Map<String, InterfaceVar> interfaces = new HashMap<>();
     private final Map<String, Buffer> buffers = new HashMap<>();
+    private final Map<String, SharedArray> shared = new HashMap<>();
     private final Map<String, Texture> textures = new HashMap<>();
     private final Map<String, Function> functions = new HashMap<>();
 
@@ -73,6 +76,11 @@ final class Scope {
         buffers.put(name, buffer);
     }
 
+    void defineShared(String name, SharedArray array, Span at) {
+        requireFreeResource(name, at);
+        shared.put(name, array);
+    }
+
     void defineTexture(String name, Texture texture, Span at) {
         requireFreeResource(name, at);
         textures.put(name, texture);
@@ -96,7 +104,8 @@ final class Scope {
     }
 
     private void requireFreeResource(String name, Span at) {
-        if (interfaces.containsKey(name) || buffers.containsKey(name) || textures.containsKey(name)) {
+        if (interfaces.containsKey(name) || buffers.containsKey(name) || shared.containsKey(name)
+                || textures.containsKey(name)) {
             throw new SupirParseException(at, "duplicate resource '" + name + "'");
         }
     }
@@ -138,6 +147,16 @@ final class Scope {
             Buffer b = s.buffers.get(name);
             if (b != null) {
                 return b;
+            }
+        }
+        return null;
+    }
+
+    SharedArray shared(String name) {
+        for (Scope s = this; s != null; s = s.parent) {
+            SharedArray a = s.shared.get(name);
+            if (a != null) {
+                return a;
             }
         }
         return null;

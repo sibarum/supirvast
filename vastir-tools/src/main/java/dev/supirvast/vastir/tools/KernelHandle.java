@@ -1,6 +1,6 @@
 package dev.supirvast.vastir.tools;
 
-import com.oracle.truffle.api.CallTarget;
+import dev.supirvast.vast.CpuKernel;
 import dev.supirvast.vastir.type.Type;
 
 import java.util.Arrays;
@@ -30,9 +30,9 @@ public final class KernelHandle implements Registration, AutoCloseable {
     private final Accelerator accelerator;
     private final KernelSpec spec;
     private final byte[] spirv;
-    private final CallTarget cpuTarget;
+    private final CpuKernel cpuTarget;
 
-    KernelHandle(Accelerator accelerator, KernelSpec spec, byte[] spirv, CallTarget cpuTarget) {
+    KernelHandle(Accelerator accelerator, KernelSpec spec, byte[] spirv, CpuKernel cpuTarget) {
         this.accelerator = accelerator;
         this.spec = spec;
         this.spirv = spirv;
@@ -85,9 +85,7 @@ public final class KernelHandle implements Registration, AutoCloseable {
             ResidentBuffer buffer = buffers.get(i);
             work[i] = buffer.onDevice() ? buffer.read() : buffer.hostArray();
         }
-        for (int i = 0; i < n; i++) {
-            cpuTarget.call(i, work);
-        }
+        cpuTarget.dispatch(work, n);
         for (int i = 0; i < work.length; i++) {
             if (buffers.get(i).onDevice()) {
                 buffers.get(i).write(work[i]);
@@ -177,9 +175,7 @@ public final class KernelHandle implements Registration, AutoCloseable {
 
     private int[][] runCpu(int[][] columns, int n) {
         int[][] work = copy(columns);
-        for (int i = 0; i < n; i++) {
-            cpuTarget.call(i, work);
-        }
+        cpuTarget.dispatch(work, n);
         return work;
     }
 
