@@ -285,12 +285,36 @@ In this order, and each of the last two only once a kernel is **measured** to ne
       a kernel whose feature the device lacks registers CPU-only. A pre-reducing f32 scatter (the shape
       `vexelray-sim-fluid` needs) is in `WorkgroupMemoryTest`. *Not yet: 2-D/3-D workgroups, and barriers in
       callees.*
-- [ ] **Pick the discrete GPU.** `GpuContext` takes the first device with a compute queue, which on this
-      machine is the Intel iGPU (32 KB workgroup memory, no shared float add) rather than the RTX 5070 Ti
-      (48 KB, shared float add). **Every measurement above is the iGPU's.**
+- [x] **Pick the discrete GPU.** `GpuContext` took the first device with a compute queue, which on this
+      machine is the Intel iGPU, not the RTX 5070 Ti — so **every measurement above was the iGPU's**. Now it
+      prefers discrete, then integrated, then anything else (`DeviceSelection`), as VexelRay's renderer does.
+      `-Dsupirvast.gpu=integrated|discrete|<part of a name>` overrides it, and an override matching nothing
+      is an error listing the devices, never a fallback. `Capabilities` reports `deviceName`/`deviceType`,
+      and the measurement tests print them. The two differ where it matters: the RTX has 48 KB of workgroup
+      memory against 32 KB and shared float add, but no `VK_EXT_shader_atomic_float2`, so float min/max
+      atomics now run CPU-only by default. **Measured**, same tests, iGPU → RTX:
+
+      | | Intel iGPU | RTX 5070 Ti |
+      |---|---|---|
+      | resident step, 2²⁰ f32 | 0.355 ms | 0.042 ms |
+      | step through `run` (upload + readback) | 35.2 ms | 35.4 ms |
+      | 2²⁰ × 8192 multiply-adds, size 1 / 64, via `run` | 54.4 / 19.7 ms | 186 / 19.0 ms |
+      | sum 2²⁰ i32: global atomics / tree reduction | 0.30 / 0.46 ms | 0.068 / 0.070 ms |
+
+      Through `run` both are bound by host-visible transfers, so the devices look alike; resident, the RTX
+      is 8.5× faster. A workgroup of one costs the RTX 10× (one lane of 32), so step 1's default of 64 matters
+      more there. Same-address atomics are coalesced on both, and the tree reduction only draws level on the
+      RTX.
 - [ ] **3. Subgroup operations.** Reductions and shuffles across the 32/64 lanes that execute together — no
       workgroup memory, no explicit barrier, often the better way to pre-reduce before one global atomic.
-      The CPU backend reuses step 2's phase machinery.
+      The CPU backend reuses step 2's phase machinery. **Measured need (2026-09-24, `vexelray-sim-fluid`
+      fc40ad8, RTX 5070 Ti):** in cell order, the FLIP scatter of 2²⁰ particles is contention-bound. At 4 ppc
+      it takes 0.20 ms direct against 0.07 ms for plain stores, and pre-reducing in workgroup memory only
+      gets it to 0.17 ms, growing with ppc just as the direct one does. Every particle still does an atomic
+      on its cell's slot; the serialisation moved to workgroup memory rather than went away. Sorted particles
+      of one cell sit in neighbouring lanes, so what is wanted is a *segmented* subgroup add keyed by cell (a
+      shuffle-based scan, or a clustered add), then one atomic per node per subgroup. A plain subgroup
+      reduction would not do it.
 
 ## A CPU runtime — decided against building one yet (2026-09-22)
 

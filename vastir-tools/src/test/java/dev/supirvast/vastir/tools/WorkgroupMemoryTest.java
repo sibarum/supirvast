@@ -392,7 +392,8 @@ class WorkgroupMemoryTest {
             assumeGpu(accelerator);
             ResidentBuffer input = accelerator.allocate(I32, n);
             input.write(data);
-            StringBuilder report = new StringBuilder("[workgroup memory] sum of 2^20 i32:");
+            StringBuilder report = new StringBuilder("[workgroup memory] " + accelerator.capabilities().deviceName()
+                    + ", sum of 2^20 i32:");
             for (Object[] variant : new Object[][] {{"global atomics", atomics}, {"tree reduction", reduction}}) {
                 KernelHandle handle = accelerator.register(
                         new KernelSpec((Function) variant[1], columns, size)).orElseThrow();

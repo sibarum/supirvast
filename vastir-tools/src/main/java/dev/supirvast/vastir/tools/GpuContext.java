@@ -107,10 +107,14 @@ public final class GpuContext implements AutoCloseable {
     private final Set<Capability> capabilities;
     private final long maxWorkgroupMemoryBytes;
     private final Set<DeviceFeature> features;
+    private final String deviceName;
+    private final String deviceType;
 
     private GpuContext(VkInstance instance, VkPhysicalDevice physical, VkDevice device, VkQueue[] queues,
             int queueFamily, long commandPool, Set<Capability> capabilities, long maxWorkgroupMemoryBytes,
-            Set<DeviceFeature> features) {
+            Set<DeviceFeature> features, String deviceName, String deviceType) {
+        this.deviceName = deviceName;
+        this.deviceType = deviceType;
         this.instance = instance;
         this.physical = physical;
         this.device = device;
@@ -143,7 +147,12 @@ public final class GpuContext implements AutoCloseable {
         return features;
     }
 
-    /** Whether a Vulkan 1.3 device with a compute queue is usable on this machine. */
+    /**
+     * Whether a Vulkan 1.3 device with a compute queue is usable on this machine.
+     *
+     * @throws IllegalStateException if {@code -Dsupirvast.gpu} names a device that is not there — a request
+     *                               for one GPU is not answered by running on the CPU instead
+     */
     public static boolean isAvailable() {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkInstance instance = createInstance(stack);
@@ -152,9 +161,21 @@ public final class GpuContext implements AutoCloseable {
             } finally {
                 vkDestroyInstance(instance, null);
             }
+        } catch (NoSuchDevice unmatched) {
+            throw unmatched;
         } catch (RuntimeException e) {
             return false;
         }
+    }
+
+    /** The name of the device this context runs on, as the driver reports it. */
+    public String deviceName() {
+        return deviceName;
+    }
+
+    /** The kind of device this context runs on: {@code discrete}, {@code integrated}, {@code virtual}, ... */
+    public String deviceType() {
+        return deviceType;
     }
 
     /** Creates the resident context (instance, device, queue, command pool). Caller must {@link #close()} it. */
@@ -176,7 +197,8 @@ public final class GpuContext implements AutoCloseable {
             vkGetPhysicalDeviceProperties(physical, properties);
             long workgroupMemory = Integer.toUnsignedLong(properties.limits().maxComputeSharedMemorySize());
             return new GpuContext(instance, physical, device, queues, queueFamily, commandPool,
-                    capabilitySet(supported), workgroupMemory, featureSet(supported));
+                    capabilitySet(supported), workgroupMemory, featureSet(supported),
+                    properties.deviceNameString(), DeviceSelection.typeName(properties.deviceType()));
         }
     }
 
@@ -611,13 +633,28 @@ public final class GpuContext implements AutoCloseable {
         }
         PointerBuffer devices = stack.mallocPointer(count.get(0));
         check(vkEnumeratePhysicalDevices(instance, count, devices), "vkEnumeratePhysicalDevices");
+        java.util.List<DeviceSelection.Candidate> candidates = new java.util.ArrayList<>();
+        VkPhysicalDeviceProperties properties = VkPhysicalDeviceProperties.malloc(stack);
         for (int i = 0; i < devices.capacity(); i++) {
             VkPhysicalDevice candidate = new VkPhysicalDevice(devices.get(i), instance);
-            if (findComputeQueueFamily(candidate, stack) >= 0) {
-                return candidate;
-            }
+            vkGetPhysicalDeviceProperties(candidate, properties);
+            candidates.add(new DeviceSelection.Candidate(i, properties.deviceNameString(), properties.deviceType(),
+                    findComputeQueueFamily(candidate, stack) >= 0));
         }
-        return null;
+        int chosen;
+        try {
+            chosen = DeviceSelection.choose(candidates, DeviceSelection.selector());
+        } catch (IllegalStateException unmatched) {
+            throw new NoSuchDevice(unmatched.getMessage());
+        }
+        return chosen < 0 ? null : new VkPhysicalDevice(devices.get(chosen), instance);
+    }
+
+    /** {@code -Dsupirvast.gpu} named a device that is not there; distinct so {@link #isAvailable} passes it on. */
+    private static final class NoSuchDevice extends IllegalStateException {
+        NoSuchDevice(String message) {
+            super(message);
+        }
     }
 
     private static int computeQueueFamily(VkPhysicalDevice device, MemoryStack stack) {

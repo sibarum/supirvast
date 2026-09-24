@@ -196,9 +196,10 @@ class ResidentBufferTest {
             int[] result = a.read();
             double resident = (System.nanoTime() - start) / 1e6;
 
-            System.out.printf("[resident] 2^20 f32, %d steps: round trips %.1f ms (%.2f ms/step), "
+            System.out.printf("[resident] %s, 2^20 f32, %d steps: round trips %.1f ms (%.2f ms/step), "
                             + "resident %.1f ms (%.3f ms/step) including one read%n",
-                    steps, roundTrips, roundTrips / steps, resident, resident / steps);
+                    accelerator.capabilities().deviceName(), steps, roundTrips, roundTrips / steps, resident,
+                    resident / steps);
             // Both converge on the fixed point of x = x/2 + 1.
             assertEquals(2f, Float.intBitsToFloat(result[n / 2]), 1e-3f);
         }

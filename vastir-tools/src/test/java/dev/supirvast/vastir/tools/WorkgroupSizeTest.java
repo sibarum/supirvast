@@ -109,7 +109,8 @@ class WorkgroupSizeTest {
 
         try (Accelerator accelerator = new Accelerator()) {
             assumeGpu(accelerator);
-            StringBuilder report = new StringBuilder("[workgroups] 2^20 invocations x " + iterations + " multiply-adds:");
+            StringBuilder report = new StringBuilder("[workgroups] " + accelerator.capabilities().deviceName()
+                    + ", 2^20 invocations x " + iterations + " multiply-adds:");
             for (int size : new int[] {1, 32, 64, 256}) {
                 KernelHandle handle = accelerator.register(spec.withWorkgroupSize(size)).orElseThrow();
                 int[][] columns = {new int[n]};

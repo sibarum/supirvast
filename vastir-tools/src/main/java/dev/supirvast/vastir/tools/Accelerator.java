@@ -57,9 +57,12 @@ public final class Accelerator implements AutoCloseable {
      *
      * @param maxWorkgroupMemoryBytes the device's {@code maxComputeSharedMemorySize}; 0 without a device
      * @param deviceFeatures          the device features no capability distinguishes; empty without a device
+     * @param deviceName              the GPU the context runs on, as its driver names it; null without one
+     * @param deviceType              {@code discrete}, {@code integrated}, ...; null without a device
      */
     public record Capabilities(boolean gpuAvailable, boolean validationAvailable,
-            Set<Capability> deviceCapabilities, long maxWorkgroupMemoryBytes, Set<DeviceFeature> deviceFeatures) {}
+            Set<Capability> deviceCapabilities, long maxWorkgroupMemoryBytes, Set<DeviceFeature> deviceFeatures,
+            String deviceName, String deviceType) {}
 
     private final NativeTools tools = new NativeTools();
     private final Map<KernelHandle, GpuContext.ResidentKernel> pipelines = new IdentityHashMap<>();
@@ -160,7 +163,9 @@ public final class Accelerator implements AutoCloseable {
         Set<Capability> device = gpuAvailable() ? context().capabilities() : Set.of();
         long workgroupMemory = gpuAvailable() ? context().maxWorkgroupMemoryBytes() : 0;
         Set<DeviceFeature> features = gpuAvailable() ? context().features() : Set.of();
-        return new Capabilities(gpuAvailable(), tools.isAvailable(), device, workgroupMemory, features);
+        String name = gpuAvailable() ? context().deviceName() : null;
+        String type = gpuAvailable() ? context().deviceType() : null;
+        return new Capabilities(gpuAvailable(), tools.isAvailable(), device, workgroupMemory, features, name, type);
     }
 
     /**
