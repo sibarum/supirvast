@@ -68,6 +68,7 @@ public final class Accelerator implements AutoCloseable {
     private final NativeTools tools = new NativeTools();
     private final Map<KernelHandle, GpuContext.ResidentKernel> pipelines = new IdentityHashMap<>();
     private final List<ResidentBuffer> residentBuffers = new ArrayList<>();
+    private final List<DispatchSequence> sequences = new ArrayList<>();
     private final SpirvTarget budget;   // optional caller-imposed capability restriction (#2)
     private Boolean gpuAvailable;       // probed once (probing builds a Vulkan instance — not free)
     private GpuContext context;         // opened lazily on first GPU need, held for this Accelerator's life
@@ -197,12 +198,56 @@ public final class Accelerator implements AutoCloseable {
         return buffer;
     }
 
+    /**
+     * Starts a {@link DispatchSequence}: resident dispatches recorded once and run as one submission. Add the
+     * steps with {@link DispatchSequence.Builder#dispatch}, in the order they are to run, then {@code build()}.
+     */
+    public DispatchSequence.Builder sequence() {
+        return new DispatchSequence.Builder(this);
+    }
+
+    /** Records {@code steps} into one command buffer when all of them can run on the GPU; see the class. */
+    DispatchSequence buildSequence(List<DispatchSequence.Step> steps) {
+        for (DispatchSequence.Step step : steps) {
+            if (step.handle().owner() != this) {
+                throw new IllegalArgumentException("a sequence's kernels must be registered with its accelerator");
+            }
+        }
+        boolean allOnGpu = gpuAvailable() && steps.stream().allMatch(s -> hasPipeline(s.handle())
+                && s.buffers().stream().allMatch(ResidentBuffer::onDevice));
+        GpuContext.RecordedSequence recorded = null;
+        if (allOnGpu) {
+            List<GpuContext.Step> gpuSteps = new ArrayList<>();
+            for (DispatchSequence.Step step : steps) {
+                GpuContext.DeviceBuffer[] devices = step.buffers().stream()
+                        .map(ResidentBuffer::device).toArray(GpuContext.DeviceBuffer[]::new);
+                gpuSteps.add(new GpuContext.Step(pipelines.get(step.handle()), devices, step.invocations()));
+            }
+            recorded = context().record(gpuSteps);
+        }
+        DispatchSequence sequence = new DispatchSequence(this, steps, recorded);
+        sequences.add(sequence);
+        return sequence;
+    }
+
+    /** Submits a recorded sequence's run; called by {@link DispatchSequence#run}. */
+    void submitSequence(GpuContext.RecordedSequence recorded) {
+        context().submit(recorded);
+    }
+
+    /** Stops tracking a sequence its caller has closed. */
+    void forget(DispatchSequence sequence) {
+        sequences.remove(sequence);
+    }
+
     /** Releases resident buffers, pipelines and the context. Safe to call when no GPU was ever used. */
     @Override
     public void close() {
         if (context != null) {
             context.finish();   // nothing may be destroyed under a dispatch still running
         }
+        // Before the buffers and pipelines they record.
+        new ArrayList<>(sequences).forEach(DispatchSequence::close);
         residentBuffers.forEach(ResidentBuffer::close);
         residentBuffers.clear();
         pipelines.values().forEach(GpuContext.ResidentKernel::close);

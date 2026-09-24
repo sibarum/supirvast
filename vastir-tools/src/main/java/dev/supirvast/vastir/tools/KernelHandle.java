@@ -139,6 +139,11 @@ public final class KernelHandle implements Registration, AutoCloseable {
         accelerator.release(this);
     }
 
+    /** The accelerator that registered this kernel, and whose context its pipeline lives in. */
+    Accelerator owner() {
+        return accelerator;
+    }
+
     /** GPU only when a device is present <em>and</em> this kernel's pipeline was preloaded (caps fit). */
     private boolean onGpu() {
         return accelerator.gpuAvailable() && accelerator.hasPipeline(this);
@@ -179,7 +184,7 @@ public final class KernelHandle implements Registration, AutoCloseable {
         return work;
     }
 
-    private void validateResident(List<ResidentBuffer> buffers, int n) {
+    void validateResident(List<ResidentBuffer> buffers, int n) {
         if (buffers == null || buffers.size() != spec.columns().size()) {
             throw new IllegalArgumentException("expected " + spec.columns().size() + " resident buffers ("
                     + spec.columns().stream().map(KernelColumn::name).toList() + "), got "

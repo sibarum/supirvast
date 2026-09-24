@@ -373,7 +373,10 @@ public final class GpuContext implements AutoCloseable {
 
     private final java.util.ArrayDeque<Pending> pending = new java.util.ArrayDeque<>();
 
-    /** A submitted resident command buffer and what to free once its fence signals. */
+    /**
+     * A submitted resident command buffer and what to free once its fence signals — both null/0 for a run of a
+     * {@link RecordedSequence}, which owns them itself.
+     */
     private record Pending(VkCommandBuffer cmd, long fence, long descriptorPool) {}
 
     /**
@@ -539,6 +542,127 @@ public final class GpuContext implements AutoCloseable {
         reclaim();
     }
 
+    /** One dispatch of a {@link RecordedSequence}: a pipeline, its buffers in binding order, and a count. */
+    public record Step(ResidentKernel kernel, DeviceBuffer[] buffers, int invocations) {
+        public Step {
+            if (buffers.length != kernel.bindingCount) {
+                throw new IllegalArgumentException("kernel expects " + kernel.bindingCount + " buffers, got "
+                        + buffers.length);
+            }
+            buffers = buffers.clone();
+        }
+    }
+
+    /**
+     * Records {@code steps} into one command buffer, to be {@link #submit submitted} as often as wanted. Each
+     * step's descriptor set is allocated and written here, once, and its invocation count recorded as its push
+     * constant, so a run costs one queue submission however many dispatches it holds. The command buffer opens
+     * with the resident barrier, as every resident one does, and has the same barrier between consecutive
+     * steps: each dispatch sees everything the previous one wrote, and cannot overwrite what it still reads.
+     *
+     * <p>The buffers and pipelines are referenced, not owned: they must outlive the sequence, and a sequence
+     * must not be submitted after any of them is closed.
+     */
+    public RecordedSequence record(java.util.List<Step> steps) {
+        if (steps.isEmpty()) {
+            throw new IllegalArgumentException("a sequence needs at least one dispatch");
+        }
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            int descriptors = steps.stream().mapToInt(s -> s.kernel().bindingCount).sum();
+            long descriptorPool = createDescriptorPool(device, descriptors, steps.size(), stack);
+            long[] sets = new long[steps.size()];
+            for (int i = 0; i < sets.length; i++) {
+                Step step = steps.get(i);
+                sets[i] = allocateDescriptorSet(device, descriptorPool, step.kernel().setLayout, stack);
+                long[] handles = new long[step.buffers().length];
+                for (int b = 0; b < handles.length; b++) {
+                    handles[b] = step.buffers()[b].handle();
+                }
+                bindBuffers(device, sets[i], handles, stack);
+            }
+
+            PointerBuffer pCmd = stack.mallocPointer(1);
+            check(vkAllocateCommandBuffers(device, VkCommandBufferAllocateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO).commandPool(commandPool)
+                    .level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1), pCmd), "vkAllocateCommandBuffers");
+            VkCommandBuffer cmd = new VkCommandBuffer(pCmd.get(0), device);
+            // Simultaneous use: a run may be submitted again while the last one is still executing. The
+            // descriptor sets are only read, so the runs can share them; the opening barrier orders them.
+            check(vkBeginCommandBuffer(cmd, VkCommandBufferBeginInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+                    .flags(VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT)), "vkBeginCommandBuffer");
+            for (int i = 0; i < sets.length; i++) {
+                Step step = steps.get(i);
+                residentBarrier(cmd, stack);
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, step.kernel().pipeline);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, step.kernel().pipelineLayout, 0,
+                        stack.longs(sets[i]), null);
+                vkCmdPushConstants(cmd, step.kernel().pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                        stack.ints(step.invocations()));
+                vkCmdDispatch(cmd, step.kernel().groupsFor(step.invocations()), 1, 1);
+            }
+            check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
+            return new RecordedSequence(this, cmd, descriptorPool, steps.size());
+        }
+    }
+
+    /**
+     * Submits a recorded sequence's dispatches in one submission, without waiting. Like {@link
+     * #dispatchResident}, it is ordered after all resident work submitted before it and before all after.
+     */
+    public void submit(RecordedSequence sequence) {
+        if (sequence.closed) {
+            throw new IllegalStateException("the sequence is closed");
+        }
+        if (pending.size() >= MAX_PENDING) {
+            retire(pending.removeFirst(), true);
+        }
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            long fence = createFence(device, stack);
+            check(vkQueueSubmit(queues[0], VkSubmitInfo.calloc(stack).sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
+                    .pCommandBuffers(stack.pointers(sequence.cmd)), fence), "vkQueueSubmit");
+            pending.addLast(new Pending(null, fence, VK_NULL_HANDLE));   // the sequence keeps its own
+        }
+        reclaim();
+    }
+
+    /**
+     * Dispatches recorded once into one command buffer, reused for every run: the per-dispatch cost left is
+     * a share of one submission. Must be {@link #close closed} before the context, and before any pipeline or
+     * buffer it records is.
+     */
+    public static final class RecordedSequence implements AutoCloseable {
+        private final GpuContext context;
+        private final VkCommandBuffer cmd;
+        private final long descriptorPool;
+        private final int dispatches;
+        private boolean closed;
+
+        private RecordedSequence(GpuContext context, VkCommandBuffer cmd, long descriptorPool, int dispatches) {
+            this.context = context;
+            this.cmd = cmd;
+            this.descriptorPool = descriptorPool;
+            this.dispatches = dispatches;
+        }
+
+        /** How many dispatches one run submits. */
+        public int dispatches() {
+            return dispatches;
+        }
+
+        /** Waits for every run in flight — the command buffer and sets are in use until then — and frees them. */
+        @Override
+        public void close() {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            context.finish();
+            vkFreeCommandBuffers(context.device, context.commandPool, cmd);
+            vkDestroyDescriptorPool(context.device, descriptorPool, null);
+        }
+    }
+
     /** Blocks until every resident dispatch submitted so far has finished, and frees what they held. */
     public void finish() {
         while (!pending.isEmpty()) {
@@ -560,8 +684,10 @@ public final class GpuContext implements AutoCloseable {
             }
         }
         vkDestroyFence(device, work.fence(), null);
-        vkFreeCommandBuffers(device, commandPool, work.cmd());
-        vkDestroyDescriptorPool(device, work.descriptorPool(), null);
+        if (work.cmd() != null) {   // a recorded sequence's run leaves its command buffer and sets to it
+            vkFreeCommandBuffers(device, commandPool, work.cmd());
+            vkDestroyDescriptorPool(device, work.descriptorPool(), null);
+        }
     }
 
     private VkCommandBuffer beginOneShot(MemoryStack stack) {
@@ -1062,12 +1188,16 @@ public final class GpuContext implements AutoCloseable {
     }
 
     private static long createDescriptorPool(VkDevice device, int descriptorCount, MemoryStack stack) {
+        return createDescriptorPool(device, descriptorCount, 1, stack);
+    }
+
+    private static long createDescriptorPool(VkDevice device, int descriptorCount, int sets, MemoryStack stack) {
         VkDescriptorPoolSize.Buffer size = VkDescriptorPoolSize.calloc(1, stack)
                 .type(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
-                .descriptorCount(descriptorCount);
+                .descriptorCount(Math.max(1, descriptorCount));
         VkDescriptorPoolCreateInfo info = VkDescriptorPoolCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO)
-                .maxSets(1)
+                .maxSets(sets)
                 .pPoolSizes(size);
         LongBuffer pPool = stack.mallocLong(1);
         check(vkCreateDescriptorPool(device, info, null, pPool), "vkCreateDescriptorPool");

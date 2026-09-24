@@ -285,7 +285,28 @@ In this order, and each of the last two only once a kernel is **measured** to ne
       a kernel whose feature the device lacks registers CPU-only. A pre-reducing f32 scatter (the shape
       `vexelray-sim-fluid` needs) is in `WorkgroupMemoryTest`. *Not yet: 2-D/3-D workgroups, and barriers in
       callees.*
-- [ ] **The dispatch floor.** Measured by `vexelray-sim-fluid` (cfec712, `SortTest.dispatchFloor`, RTX): every
+- [x] **Dispatch sequences.** `accelerator.sequence().dispatch(handle, buffers, n)…build()` records the
+      steps into one command buffer, with each step's descriptor set allocated and its count pushed once, and
+      the resident barrier before every step. `DispatchSequence.run()` is one submission that returns
+      without waiting, ordered like any resident dispatch. The command buffer is simultaneous-use, so a run
+      may follow one still executing, and runs share the read-only sets. Where the steps cannot all run on
+      the GPU — no device, a CPU-only kernel, a host buffer, a pipeline released since — a run makes the
+      dispatches one at a time through `KernelHandle.dispatch`: slower, never wrong, never a partial GPU
+      run. `DispatchSequenceTest` checks order within and across runs, with no read between: a three-step
+      affine–reverse–affine chain run 40 times against the host's answer, a counter over 100 runs of three
+      steps (beyond the 64 in flight), and every fallback and refusal. **Measured**, ms per empty dispatch,
+      half a second warm:
+
+      | | one at a time | in sequences of 5 | of 50 |
+      |---|---|---|---|
+      | RTX 5070 Ti | 0.0253 | 0.0036 | 0.0052 |
+      | Intel iGPU | 0.0931 | 0.0218 | 0.0045 |
+
+      7× off the RTX floor. What remains per step is the barrier and the dispatch itself. *Still per call
+      for a single `KernelHandle.dispatch`: its descriptor pool and set, which a cache per buffer tuple would
+      remove; the sequence makes that matter only for one-off passes.*
+- [x] **The dispatch floor** — the measured need the sequences above answer. Measured by `vexelray-sim-fluid`
+      (cfec712, `SortTest.dispatchFloor`, RTX): every
       `KernelHandle.dispatch` costs a fixed ~0.021 ms, even for an empty 256-invocation kernel, over 500
       resident dispatches and one read. It now dominates short passes. The fluid counting sort is five passes
       (count, three scans, permute), each 0.013–0.025 ms whatever its size, so ~0.1 ms of a 0.16 ms sort is
