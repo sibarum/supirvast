@@ -27,13 +27,31 @@ import java.util.Set;
  * reached by everyone, and the fix is to compute the condition from uniform values. Nothing it accepts can
  * diverge, because {@code core} has no {@code break}, no {@code continue} and no {@code goto} — the structure
  * the lowering sees is the control flow that runs.
+ *
+ * <p>A subgroup operation ({@link Statement.SubgroupArithmetic}, {@link Statement.SubgroupShuffle},
+ * {@link Statement.SubgroupVote}) is a barrier for all of this. It combines every lane's value, so every lane
+ * must reach it: a lane that skipped it would leave a hole in a reduction and a shuffle reading from nowhere,
+ * and on the CPU it is a phase boundary exactly as a barrier is. So it stands only where a barrier may, and a
+ * kernel with one runs whole workgroups. Uniform over the workgroup is stronger than a subgroup needs, and
+ * cheaper to prove than the difference is worth.
  */
 public final class Barriers {
 
     private Barriers() {
     }
 
-    /** Whether {@code region} contains a barrier, at any depth. */
+    /** Whether {@code statement} is itself a collective point: a barrier or a subgroup operation. */
+    public static boolean isCollective(Statement statement) {
+        return switch (statement) {
+            case Statement.Barrier ignored -> true;
+            case Statement.SubgroupArithmetic ignored -> true;
+            case Statement.SubgroupShuffle ignored -> true;
+            case Statement.SubgroupVote ignored -> true;
+            default -> false;
+        };
+    }
+
+    /** Whether {@code region} contains a barrier or subgroup operation, at any depth. */
     public static boolean contains(Region region) {
         for (Statement statement : region.statements()) {
             if (contains(statement)) {
@@ -43,20 +61,19 @@ public final class Barriers {
         return false;
     }
 
-    /** Whether {@code statement} is a barrier or contains one. */
+    /** Whether {@code statement} is a barrier or subgroup operation, or contains one. */
     public static boolean contains(Statement statement) {
         return switch (statement) {
-            case Statement.Barrier ignored -> true;
             case Statement.If f -> contains(f.thenRegion()) || contains(f.elseRegion());
             case Statement.While w -> contains(w.body());
-            default -> false;
+            default -> isCollective(statement);
         };
     }
 
     /**
-     * Checks that every barrier in {@code function} is in uniform control flow.
+     * Checks that every barrier and subgroup operation in {@code function} is in uniform control flow.
      *
-     * @throws IllegalArgumentException naming the first barrier that is not, and why
+     * @throws IllegalArgumentException naming the first that is not, and why
      */
     public static void check(Function function) {
         if (!contains(function.body())) {
@@ -72,11 +89,11 @@ public final class Barriers {
         } while (analysis.nonUniform.size() != before);
         analysis.run(function.body(), true);
         if (analysis.violation != null) {
-            throw new IllegalArgumentException("barrier in '" + function.name() + "' is not in uniform control "
-                    + "flow: " + analysis.violation + ". Every invocation of a workgroup must reach the same "
-                    + "barriers, so a barrier can only be under conditions computed from uniform values "
-                    + "(constants, the workgroup id, the invocation count, push constants, and variables "
-                    + "assigned only from those)");
+            throw new IllegalArgumentException(analysis.what + " in '" + function.name() + "' is not in uniform "
+                    + "control flow: " + analysis.violation + ". Every invocation of a workgroup must reach the "
+                    + "same barriers and subgroup operations, so one can only be under conditions computed from "
+                    + "uniform values (constants, the workgroup id, the invocation count, the subgroup size, push "
+                    + "constants, and variables assigned only from those)");
         }
     }
 
@@ -85,12 +102,24 @@ public final class Barriers {
         private boolean diverged;   // some invocations may have returned before this point
         private boolean report;
         String violation;
+        String what;                // "a barrier" or "a subgroup operation", for the report
 
         void run(Region body, boolean report) {
             this.report = report;
             this.diverged = false;
             this.violation = null;
             walk(body, true, null);
+        }
+
+        /** Records the first collective statement found outside uniform control flow. */
+        private void collective(Statement statement, boolean uniformHere, Expr why) {
+            if (report && !uniformHere && violation == null) {
+                what = statement instanceof Statement.Barrier ? "a barrier" : "a subgroup operation";
+                violation = diverged
+                        ? "it follows a return that only some invocations may take"
+                        : "it is under the condition " + why + ", which can differ between invocations of a "
+                                + "workgroup";
+            }
         }
 
         /**
@@ -101,13 +130,19 @@ public final class Barriers {
             for (Statement statement : region.statements()) {
                 boolean uniformHere = uniformControl && !diverged;
                 switch (statement) {
-                    case Statement.Barrier ignored -> {
-                        if (report && !uniformHere && violation == null) {
-                            violation = diverged
-                                    ? "it follows a return that only some invocations may take"
-                                    : "it is under the condition " + why + ", which can differ between "
-                                            + "invocations of a workgroup";
-                        }
+                    case Statement.Barrier b -> collective(b, uniformHere, why);
+                    // A subgroup result differs between subgroups, and a shuffle's between lanes: not uniform.
+                    case Statement.SubgroupArithmetic s -> {
+                        collective(s, uniformHere, why);
+                        markNonUniform(s.result());
+                    }
+                    case Statement.SubgroupShuffle s -> {
+                        collective(s, uniformHere, why);
+                        markNonUniform(s.result());
+                    }
+                    case Statement.SubgroupVote s -> {
+                        collective(s, uniformHere, why);
+                        markNonUniform(s.result());
                     }
                     case Statement.DeclareVar d -> assign(d.variable(), d.initializer(), uniformHere);
                     case Statement.Assign a -> assign(a.variable(), a.value(), uniformHere);
@@ -154,6 +189,8 @@ public final class Barriers {
                 case Expr.ConstBool ignored -> true;
                 case Expr.WorkgroupId ignored -> true;
                 case Expr.InvocationCount ignored -> true;
+                case Expr.SubgroupSize ignored -> true;
+                case Expr.SubgroupInvocationId ignored -> false;
                 case Expr.PushConstantRead ignored -> true;
                 case Expr.Param ignored -> true;
                 case Expr.Read r -> !nonUniform.contains(r.variable());

@@ -47,7 +47,12 @@ import org.lwjgl.vulkan.VkPhysicalDeviceFeatures;
 import org.lwjgl.vulkan.VkPhysicalDeviceFeatures2;
 import org.lwjgl.vulkan.VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT;
 import org.lwjgl.vulkan.VkPhysicalDeviceShaderAtomicFloatFeaturesEXT;
+import org.lwjgl.vulkan.VkPhysicalDeviceProperties2;
+import org.lwjgl.vulkan.VkPhysicalDeviceVulkan11Properties;
 import org.lwjgl.vulkan.VkPhysicalDeviceVulkan12Features;
+import org.lwjgl.vulkan.VkPhysicalDeviceVulkan13Features;
+import org.lwjgl.vulkan.VkPhysicalDeviceVulkan13Properties;
+import org.lwjgl.vulkan.VkPipelineShaderStageRequiredSubgroupSizeCreateInfo;
 import dev.supirvast.vastir.lower.DeviceFeature;
 import dev.supirvast.vastir.spirv.Capability;
 
@@ -109,10 +114,16 @@ public final class GpuContext implements AutoCloseable {
     private final Set<DeviceFeature> features;
     private final String deviceName;
     private final String deviceType;
+    private final int minSubgroupSize;
+    private final int maxSubgroupSize;
+    private final boolean subgroupSizeControl;
 
     private GpuContext(VkInstance instance, VkPhysicalDevice physical, VkDevice device, VkQueue[] queues,
             int queueFamily, long commandPool, Set<Capability> capabilities, long maxWorkgroupMemoryBytes,
-            Set<DeviceFeature> features, String deviceName, String deviceType) {
+            Set<DeviceFeature> features, String deviceName, String deviceType, Supported supported) {
+        this.minSubgroupSize = supported.minSubgroupSize();
+        this.maxSubgroupSize = supported.maxSubgroupSize();
+        this.subgroupSizeControl = supported.subgroupSizeControl();
         this.deviceName = deviceName;
         this.deviceType = deviceType;
         this.instance = instance;
@@ -173,6 +184,16 @@ public final class GpuContext implements AutoCloseable {
         return deviceName;
     }
 
+    /**
+     * Whether a compute pipeline can require full subgroups of exactly {@code size} lanes here: size control
+     * for compute, and a power of two in the device's {@code minSubgroupSize..maxSubgroupSize} (32 only, on
+     * NVIDIA; 8 to 32 on current Intel).
+     */
+    public boolean supportsSubgroupSize(int size) {
+        return subgroupSizeControl && Integer.bitCount(size) == 1 && size >= minSubgroupSize
+                && size <= maxSubgroupSize;
+    }
+
     /** The kind of device this context runs on: {@code discrete}, {@code integrated}, {@code virtual}, ... */
     public String deviceType() {
         return deviceType;
@@ -198,7 +219,7 @@ public final class GpuContext implements AutoCloseable {
             long workgroupMemory = Integer.toUnsignedLong(properties.limits().maxComputeSharedMemorySize());
             return new GpuContext(instance, physical, device, queues, queueFamily, commandPool,
                     capabilitySet(supported), workgroupMemory, featureSet(supported),
-                    properties.deviceNameString(), DeviceSelection.typeName(properties.deviceType()));
+                    properties.deviceNameString(), DeviceSelection.typeName(properties.deviceType()), supported);
         }
     }
 
@@ -219,14 +240,31 @@ public final class GpuContext implements AutoCloseable {
      * which every pipeline's layout declares and every dispatch sets; a shader that never reads it ignores it.
      */
     public ResidentKernel build(byte[] spirv, String entryPoint, int bindingCount, int workgroupSize) {
+        return build(spirv, entryPoint, bindingCount, workgroupSize, 0);
+    }
+
+    /**
+     * As {@link #build(byte[], String, int, int)}, for a kernel with subgroup operations that needs full
+     * subgroups of exactly {@code subgroupSize} lanes — so what they compute is the kernel's to say, not the
+     * device's. 0 asks for nothing, which is right for every kernel without them. The device must {@link
+     * #supportsSubgroupSize support} the size and the workgroup must be a whole number of subgroups.
+     */
+    public ResidentKernel build(byte[] spirv, String entryPoint, int bindingCount, int workgroupSize,
+            int subgroupSize) {
         if (workgroupSize < 1) {
             throw new IllegalArgumentException("workgroup size must be >= 1, got " + workgroupSize);
+        }
+        if (subgroupSize != 0 && (!supportsSubgroupSize(subgroupSize) || workgroupSize % subgroupSize != 0)) {
+            throw new IllegalArgumentException("cannot require full subgroups of " + subgroupSize + " lanes in a "
+                    + "workgroup of " + workgroupSize + " on " + deviceName + " (it offers " + minSubgroupSize
+                    + ".." + maxSubgroupSize + (subgroupSizeControl ? "" : ", without size control") + ")");
         }
         try (MemoryStack stack = MemoryStack.stackPush()) {
             long shaderModule = createShaderModule(device, spirv, stack);
             long setLayout = createSetLayout(device, bindingCount, stack);
             long pipelineLayout = createPipelineLayout(device, setLayout, stack);
-            long pipeline = createComputePipeline(device, pipelineLayout, shaderModule, entryPoint, stack);
+            long pipeline = createComputePipeline(device, pipelineLayout, shaderModule, entryPoint, subgroupSize,
+                    stack);
             // The pipeline/layouts are immutable and safe to share across concurrent dispatches; the
             // mutable binding state (the descriptor set) is allocated PER submission instead, so one
             // pipeline can back several in-flight dispatches at once (see submitAsync).
@@ -701,7 +739,10 @@ public final class GpuContext implements AutoCloseable {
         // etc. is actually licensed). Uses the Features2 pNext chain; pEnabledFeatures must then be null.
         VkPhysicalDeviceVulkan12Features features12 = VkPhysicalDeviceVulkan12Features.calloc(stack)
                 .sType$Default().shaderInt8(supported.int8());
-        long chain = features12.address();
+        // Size control and full subgroups are what let a kernel's subgroups be the ones it was written for.
+        long chain = VkPhysicalDeviceVulkan13Features.calloc(stack).sType$Default().pNext(features12.address())
+                .subgroupSizeControl(supported.subgroupSizeControl())
+                .computeFullSubgroups(supported.subgroupSizeControl()).address();
         // The float-atomic extensions are enabled only when one of their features is, since enabling a feature
         // licenses what the lowering will then emit. float2 extends float, so min/max implies the first.
         java.util.List<String> extensions = new java.util.ArrayList<>();
@@ -743,11 +784,14 @@ public final class GpuContext implements AutoCloseable {
     /**
      * What the physical device supports among the optional capabilities our lowering can emit.
      * {@code floatAtomicAdd}/{@code floatAtomicMinMax} are the storage-buffer features; the {@code shared}
-     * ones license the same instructions on workgroup memory.
+     * ones license the same instructions on workgroup memory. {@code subgroupOperations} is the device's
+     * {@code VkSubgroupFeatureFlags} for compute (0 if compute has none); {@code subgroupSizeControl} is size
+     * control and full subgroups together, for the compute stage.
      */
     private record Supported(boolean int8, boolean int16, boolean int64, boolean float64,
             boolean floatAtomicAdd, boolean floatAtomicMinMax,
-            boolean sharedFloatAtomics, boolean sharedFloatAtomicAdd, boolean sharedFloatAtomicMinMax) {}
+            boolean sharedFloatAtomics, boolean sharedFloatAtomicAdd, boolean sharedFloatAtomicMinMax,
+            int subgroupOperations, int minSubgroupSize, int maxSubgroupSize, boolean subgroupSizeControl) {}
 
     private static Supported querySupported(VkPhysicalDevice physical, MemoryStack stack) {
         Set<String> extensions = deviceExtensions(physical, stack);
@@ -756,7 +800,9 @@ public final class GpuContext implements AutoCloseable {
                 && extensions.contains(EXTShaderAtomicFloat2.VK_EXT_SHADER_ATOMIC_FLOAT_2_EXTENSION_NAME);
 
         VkPhysicalDeviceVulkan12Features features12 = VkPhysicalDeviceVulkan12Features.calloc(stack).sType$Default();
-        long chain = features12.address();
+        VkPhysicalDeviceVulkan13Features features13 = VkPhysicalDeviceVulkan13Features.calloc(stack).sType$Default()
+                .pNext(features12.address());
+        long chain = features13.address();
         // A feature struct is chained only when its extension exists: querying one the driver does not know
         // is harmless in practice and undefined on paper.
         VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomicFloat = null;
@@ -773,12 +819,24 @@ public final class GpuContext implements AutoCloseable {
                 .sType$Default().pNext(chain);
         vkGetPhysicalDeviceFeatures2(physical, features2);
         VkPhysicalDeviceFeatures core = features2.features();
+
+        VkPhysicalDeviceVulkan11Properties properties11 = VkPhysicalDeviceVulkan11Properties.calloc(stack).sType$Default();
+        VkPhysicalDeviceVulkan13Properties properties13 = VkPhysicalDeviceVulkan13Properties.calloc(stack).sType$Default()
+                .pNext(properties11.address());
+        vkGetPhysicalDeviceProperties2(physical,
+                VkPhysicalDeviceProperties2.calloc(stack).sType$Default().pNext(properties13.address()));
+        boolean compute = (properties11.subgroupSupportedStages() & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
+        boolean sizeControl = features13.subgroupSizeControl() && features13.computeFullSubgroups()
+                && (properties13.requiredSubgroupSizeStages() & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
+
         return new Supported(features12.shaderInt8(), core.shaderInt16(), core.shaderInt64(), core.shaderFloat64(),
                 atomicFloat != null && atomicFloat.shaderBufferFloat32AtomicAdd(),
                 atomicFloat2 != null && atomicFloat2.shaderBufferFloat32AtomicMinMax(),
                 atomicFloat != null && atomicFloat.shaderSharedFloat32Atomics(),
                 atomicFloat != null && atomicFloat.shaderSharedFloat32AtomicAdd(),
-                atomicFloat2 != null && atomicFloat2.shaderSharedFloat32AtomicMinMax());
+                atomicFloat2 != null && atomicFloat2.shaderSharedFloat32AtomicMinMax(),
+                compute ? properties11.subgroupSupportedOperations() : 0,
+                properties13.minSubgroupSize(), properties13.maxSubgroupSize(), sizeControl);
     }
 
     /** The device features no capability distinguishes, as the lowering's target names them. */
@@ -829,6 +887,23 @@ public final class GpuContext implements AutoCloseable {
         }
         if (s.float64()) {
             caps.add(Capability.Float64);
+        }
+        // Subgroup operations in compute, by kind; each capability is core Vulkan 1.1 once its bit is set.
+        int ops = s.subgroupOperations();
+        if ((ops & VK_SUBGROUP_FEATURE_BASIC_BIT) != 0) {
+            caps.add(Capability.GroupNonUniform);
+            if ((ops & VK_SUBGROUP_FEATURE_VOTE_BIT) != 0) {
+                caps.add(Capability.GroupNonUniformVote);
+            }
+            if ((ops & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0) {
+                caps.add(Capability.GroupNonUniformArithmetic);
+            }
+            if ((ops & VK_SUBGROUP_FEATURE_SHUFFLE_BIT) != 0) {
+                caps.add(Capability.GroupNonUniformShuffle);
+            }
+            if ((ops & VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT) != 0) {
+                caps.add(Capability.GroupNonUniformShuffleRelative);
+            }
         }
         // One capability for both kinds of memory; which kinds the device licenses is its feature set's to say.
         if (s.floatAtomicAdd() || s.sharedFloatAtomicAdd()) {
@@ -959,13 +1034,24 @@ public final class GpuContext implements AutoCloseable {
         return pLayout.get(0);
     }
 
-    private static long createComputePipeline(
-            VkDevice device, long layout, long shaderModule, String entryPoint, MemoryStack stack) {
+    /** @param subgroupSize full subgroups of exactly this many lanes, or 0 to leave it to the device */
+    private static long createComputePipeline(VkDevice device, long layout, long shaderModule, String entryPoint,
+            int subgroupSize, MemoryStack stack) {
         VkPipelineShaderStageCreateInfo stage = VkPipelineShaderStageCreateInfo.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO)
                 .stage(VK_SHADER_STAGE_COMPUTE_BIT)
                 .module(shaderModule)
                 .pName(stack.UTF8(entryPoint));
+        if (subgroupSize != 0) {
+            // Both halves matter: the size fixes which invocations share a subgroup, and full subgroups mean
+            // none of them is missing a lane — without which a reduction would quietly cover fewer values.
+            VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required =
+                    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo.calloc(stack).sType$Default();
+            // LWJGL 3.3.6 generates this field without a setter; it has the offset, so write it there.
+            MemoryUtil.memPutInt(required.address()
+                    + VkPipelineShaderStageRequiredSubgroupSizeCreateInfo.REQUIREDSUBGROUPSIZE, subgroupSize);
+            stage.flags(VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT).pNext(required.address());
+        }
         VkComputePipelineCreateInfo.Buffer info = VkComputePipelineCreateInfo.calloc(1, stack)
                 .sType(VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO)
                 .stage(stage)

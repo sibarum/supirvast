@@ -165,6 +165,91 @@ public sealed interface Statement {
         }
     }
 
+    // --- subgroup operations ---------------------------------------------------------------------------
+    //
+    // A subgroup is the set of invocations that execute in lockstep: lanes 0..size-1, where the size is the
+    // kernel's (KernelSpec.subgroupSize, required of the device) and lane = local invocation id % size.
+    // Statements, not expressions, and for the same reason atomics are: the result depends on other
+    // invocations, so it is not a function of its operands that a pass may fold, duplicate or drop. And like a
+    // barrier every lane must reach it — Barriers.check holds them to uniform control flow — which is also what
+    // lets the CPU run one as a phase boundary: every lane evaluates its operand, then every lane gets its
+    // result. Each assigns `result`, declaring it if nothing else does.
+
+    /**
+     * Combines {@code value} across the subgroup with {@code op}: the whole subgroup's combination
+     * ({@link Scan#REDUCE}), or each lane's running combination over the lanes up to and including it
+     * ({@link Scan#INCLUSIVE}) or before it ({@link Scan#EXCLUSIVE}, the operation's identity in lane 0).
+     */
+    record SubgroupArithmetic(LocalVar result, SubgroupOp op, Scan scan, Expr value) implements Statement {
+
+        /** SPIR-V's {@code GroupOperation}, the three that need no cluster or partition. */
+        public enum Scan { REDUCE, INCLUSIVE, EXCLUSIVE }
+
+        public SubgroupArithmetic {
+            if (!op.definedOn(value.type())) {
+                throw new IllegalArgumentException("subgroup " + op + " is not defined on " + value.type()
+                        + " (32-bit integers, and f32 for add, mul, min and max)");
+            }
+            requireResult(result, value.type());
+        }
+    }
+
+    /**
+     * Each lane reads {@code value} from another lane: lane {@code lane} ({@link Kind#INDEX}), lane
+     * {@code self ^ lane} ({@link Kind#XOR}), lane {@code self - lane} ({@link Kind#UP}) or lane
+     * {@code self + lane} ({@link Kind#DOWN}). A source outside the subgroup is undefined on the GPU; the CPU
+     * gives the lane its own value, which is what NVIDIA does and one of the answers "undefined" allows — a
+     * kernel should guard it, as a scan does with {@code lane >= delta}.
+     */
+    record SubgroupShuffle(LocalVar result, Kind kind, Expr value, Expr lane) implements Statement {
+
+        public enum Kind { INDEX, XOR, UP, DOWN }
+
+        public SubgroupShuffle {
+            if (!isScalar32(value.type()) && !(value.type() instanceof Type.Bool)) {
+                throw new IllegalArgumentException("a subgroup shuffle moves 32-bit scalars or bools, not "
+                        + value.type());
+            }
+            if (!(lane.type() instanceof Type.Int i && i.width() == 32)) {
+                throw new IllegalArgumentException("a subgroup shuffle's lane is a 32-bit integer, not " + lane.type());
+            }
+            requireResult(result, value.type());
+        }
+    }
+
+    /**
+     * Whether {@code value} is true in every lane ({@link Kind#ALL}), in some lane ({@link Kind#ANY}), or the
+     * same in every lane ({@link Kind#ALL_EQUAL}, which takes any 32-bit scalar or bool).
+     */
+    record SubgroupVote(LocalVar result, Kind kind, Expr value) implements Statement {
+
+        public enum Kind { ALL, ANY, ALL_EQUAL }
+
+        public SubgroupVote {
+            boolean fits = kind == Kind.ALL_EQUAL
+                    ? isScalar32(value.type()) || value.type() instanceof Type.Bool
+                    : value.type() instanceof Type.Bool;
+            if (!fits) {
+                throw new IllegalArgumentException("subgroup vote " + kind + " does not take " + value.type());
+            }
+            requireResult(result, Type.BOOL);
+        }
+    }
+
+    private static boolean isScalar32(Type type) {
+        return type instanceof Type.Int i && i.width() == 32 || type instanceof Type.Float f && f.width() == 32;
+    }
+
+    private static void requireResult(LocalVar result, Type type) {
+        if (result == null) {
+            throw new IllegalArgumentException("a subgroup operation needs a variable for its result");
+        }
+        if (!result.type().equals(type)) {
+            throw new IllegalArgumentException("subgroup result '" + result.name() + "' is " + result.type()
+                    + ", but the operation yields " + type);
+        }
+    }
+
     private static void requireInt32(SharedArray array) {
         if (!(array.element() instanceof Type.Int i && i.width() == 32)) {
             throw new IllegalArgumentException("atomic compare-exchange needs a 32-bit integer array; '"

@@ -80,6 +80,26 @@ public sealed interface Expr {
         }
     }
 
+    /**
+     * This invocation's lane within its subgroup, from 0 to the subgroup size less one — {@code
+     * gl_SubgroupInvocationID}, which with full subgroups of a fixed size is the local invocation id modulo
+     * that size.
+     */
+    record SubgroupInvocationId() implements Expr {
+        @Override
+        public Type type() {
+            return Type.int32();
+        }
+    }
+
+    /** The number of lanes in a subgroup — {@code gl_SubgroupSize}, the kernel's required size. Uniform. */
+    record SubgroupSize() implements Expr {
+        @Override
+        public Type type() {
+            return Type.int32();
+        }
+    }
+
     /** Reads {@code array[index]} — an element of workgroup memory, typed by the array's element type. */
     record SharedLoad(SharedArray array, Expr index) implements Expr {
         @Override

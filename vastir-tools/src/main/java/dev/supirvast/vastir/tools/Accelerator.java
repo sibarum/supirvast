@@ -11,6 +11,7 @@ import dev.supirvast.vastir.core.Expr;
 import dev.supirvast.vastir.core.Function;
 import dev.supirvast.vastir.core.Region;
 import dev.supirvast.vastir.core.Statement;
+import dev.supirvast.vastir.core.Subgroups;
 import dev.supirvast.vastir.core.UnaryOp;
 import dev.supirvast.vastir.lower.CapabilityException;
 import dev.supirvast.vastir.lower.CoreToSpirv;
@@ -100,6 +101,13 @@ public final class Accelerator implements AutoCloseable {
         // exception on both: the tail cannot return before a barrier the rest of its workgroup must reach, so
         // it runs whole workgroups everywhere and bounds itself with Expr.InvocationCount.
         int size = spec.workgroupSize();
+        // A kernel whose meaning depends on its subgroups gets exactly the spec's, or no GPU at all.
+        boolean subgroups = Subgroups.uses(spec.kernel().body());
+        if (subgroups && size % spec.subgroupSize() != 0) {
+            return new Rejection("workgroup is not a whole number of subgroups", "a workgroup of " + size
+                    + " cannot hold full subgroups of " + spec.subgroupSize() + ", which a kernel with subgroup "
+                    + "operations needs on both backends");
+        }
         boolean guard = size > 1 && !Barriers.contains(spec.kernel().body());
         Function gpuKernel = guard ? guarded(spec.kernel()) : spec.kernel();
         CoreModule coreModule = new CoreModule().addEntryPoint(EntryPoint.compute(gpuKernel, size, 1, 1));
@@ -110,7 +118,8 @@ public final class Accelerator implements AutoCloseable {
         boolean preloadable;
         try {
             spirv = new CoreToSpirv().lower(coreModule, target).toByteArray();
-            preloadable = gpu;
+            // A size the device cannot be held to is a limit of the device, like a capability it lacks.
+            preloadable = gpu && (!subgroups || context().supportsSubgroupSize(spec.subgroupSize()));
         } catch (CapabilityException withinDeviceAndBudget) {
             if (!gpu) {
                 return new Rejection("requires a capability outside the target budget",
@@ -142,7 +151,7 @@ public final class Accelerator implements AutoCloseable {
             List<Buffer> buffers = spec.columns().stream()
                     .map(c -> new Buffer(c.name(), c.binding(), c.type()))
                     .toList();
-            cpuTarget = new CoreToTruffle().lowerDispatch(spec.kernel(), buffers, size);
+            cpuTarget = new CoreToTruffle().lowerDispatch(spec.kernel(), buffers, size, spec.subgroupSize());
         } catch (RuntimeException e) {
             return new Rejection("not lowerable to the CPU backend", String.valueOf(e.getMessage()));
         }
@@ -150,7 +159,8 @@ public final class Accelerator implements AutoCloseable {
         KernelHandle handle = new KernelHandle(this, spec, spirv, cpuTarget);
         if (preloadable) {
             try {
-                pipelines.put(handle, context().build(spirv, spec.entryPoint(), spec.columns().size(), size));
+                pipelines.put(handle, context().build(spirv, spec.entryPoint(), spec.columns().size(), size,
+                        subgroups ? spec.subgroupSize() : 0));
             } catch (RuntimeException e) {
                 return new Rejection("GPU pipeline build failed", String.valueOf(e.getMessage()));
             }

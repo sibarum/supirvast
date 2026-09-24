@@ -206,6 +206,22 @@ final class Printer {
                 line(previousName(cx.previous()) + " = " + text);
             }
             case Statement.Barrier ignored -> line("barrier");
+            case Statement.SubgroupArithmetic sa -> {
+                String value = emitToAtom(sa.value());
+                line(previousName(sa.result()) + " = subgroup " + sa.scan().name().toLowerCase(java.util.Locale.ROOT)
+                        + " " + sa.op().name().toLowerCase(java.util.Locale.ROOT) + ", " + value);
+            }
+            case Statement.SubgroupShuffle ss -> {
+                String value = emitToAtom(ss.value());
+                String lane = emitToAtom(ss.lane());
+                line(previousName(ss.result()) + " = subgroup shuffle "
+                        + ss.kind().name().toLowerCase(java.util.Locale.ROOT) + ", " + value + ", " + lane);
+            }
+            case Statement.SubgroupVote sv -> {
+                String value = emitToAtom(sv.value());
+                line(previousName(sv.result()) + " = subgroup vote "
+                        + sv.kind().name().toLowerCase(java.util.Locale.ROOT) + ", " + value);
+            }
             case Statement.BuiltinWrite bw -> line(builtinName(bw.builtin()) + " = " + renderRhs(bw.value()));
             case Statement.InterfaceWrite iw -> line(iw.variable().name() + " = " + renderRhs(iw.value()));
             case Statement.DeclareVar dv -> line(declareName(dv.variable()) + " = " + renderRhs(dv.initializer()));
@@ -283,6 +299,8 @@ final class Printer {
             case Expr.LocalInvocationId ignored -> true;
             case Expr.WorkgroupId ignored -> true;
             case Expr.InvocationCount ignored -> true;
+            case Expr.SubgroupInvocationId ignored -> true;
+            case Expr.SubgroupSize ignored -> true;
             case Expr.PushConstantRead ignored -> true;
             default -> false;
         };
@@ -301,6 +319,8 @@ final class Printer {
             case Expr.LocalInvocationId ignored -> "local_invocation_id";
             case Expr.WorkgroupId ignored -> "workgroup_id";
             case Expr.InvocationCount ignored -> "invocation_count";
+            case Expr.SubgroupInvocationId ignored -> "subgroup_invocation_id";
+            case Expr.SubgroupSize ignored -> "subgroup_size";
             case Expr.PushConstantRead pc -> pc.block().members().get(pc.member()).name();
             default -> throw new IllegalStateException("not an atom: " + e);
         };
@@ -592,6 +612,12 @@ final class Printer {
                 collectExpr(cx.desired(), res);
             }
             case Statement.Barrier ignored -> { /* nothing to collect */ }
+            case Statement.SubgroupArithmetic sa -> collectExpr(sa.value(), res);
+            case Statement.SubgroupShuffle ss -> {
+                collectExpr(ss.value(), res);
+                collectExpr(ss.lane(), res);
+            }
+            case Statement.SubgroupVote sv -> collectExpr(sv.value(), res);
             case Statement.BuiltinWrite bw -> collectExpr(bw.value(), res);
             case Statement.InterfaceWrite iw -> {
                 res.add(iw.variable());

@@ -21,6 +21,7 @@ import dev.supirvast.vastir.core.MathFn;
 import dev.supirvast.vastir.core.Region;
 import dev.supirvast.vastir.core.SharedArray;
 import dev.supirvast.vastir.core.Statement;
+import dev.supirvast.vastir.core.SubgroupOp;
 import dev.supirvast.vastir.core.UnaryOp;
 import dev.supirvast.vastir.type.Type;
 
@@ -64,13 +65,14 @@ public final class CoreToTruffle {
 
     /**
      * Lowering context: local-variable frame slots, buffer slots (kernels), callee targets (calls), shared-array
-     * slots (kernels run by workgroup), and what the frame arguments carry.
+     * slots (kernels run by workgroup), what the frame arguments carry, and the subgroup size (kernels run by
+     * workgroup; 0 otherwise).
      */
     private record Ctx(Map<LocalVar, Integer> slots, Map<Integer, Integer> bufferSlots,
-            Map<Function, CallTarget> targets, Map<SharedArray, Integer> sharedSlots, Args args) {
+            Map<Function, CallTarget> targets, Map<SharedArray, Integer> sharedSlots, Args args, int subgroupSize) {
 
         Ctx(Map<LocalVar, Integer> slots, Map<Integer, Integer> bufferSlots, Map<Function, CallTarget> targets) {
-            this(slots, bufferSlots, targets, Map.of(), Args.PLAIN);
+            this(slots, bufferSlots, targets, Map.of(), Args.PLAIN, 0);
         }
 
         void require(Args needed, String what) {
@@ -120,20 +122,47 @@ public final class CoreToTruffle {
      * arrays belong to the workgroup. That a barrier is in uniform control flow is what makes the phase
      * boundaries the same for every invocation, so {@link Barriers#check} runs first.
      *
-     * @throws IllegalArgumentException if a barrier is not in uniform control flow
+     * <p>A subgroup operation is a phase boundary too: every lane evaluates its operand, the lanes of each
+     * subgroup are combined, and every lane gets its result. Subgroups are {@link #DEFAULT_SUBGROUP_SIZE}
+     * lanes; see the four-argument form.
+     *
+     * @throws IllegalArgumentException if a barrier or subgroup operation is not in uniform control flow
      */
     public CpuKernel lowerDispatch(Function function, List<Buffer> buffers, int workgroupSize) {
+        return lowerDispatch(function, buffers, workgroupSize, DEFAULT_SUBGROUP_SIZE);
+    }
+
+    /** 32: an NVIDIA warp, an AMD RDNA wave32, and a size every current Intel GPU can be asked for. */
+    public static final int DEFAULT_SUBGROUP_SIZE = 32;
+
+    /**
+     * As {@link #lowerDispatch(Function, List, int)}, with subgroups of {@code subgroupSize} lanes: lane
+     * {@code local % subgroupSize} of subgroup {@code local / subgroupSize}, which is how the GPU lays out full
+     * subgroups of a required size in a one-dimensional workgroup. A kernel with subgroup operations needs
+     * the workgroup to be a whole number of subgroups, as the GPU does.
+     *
+     * @throws IllegalArgumentException if a barrier or subgroup operation is not in uniform control flow, or
+     *                                  a kernel with subgroup operations has a partial subgroup
+     */
+    public CpuKernel lowerDispatch(Function function, List<Buffer> buffers, int workgroupSize, int subgroupSize) {
         if (workgroupSize < 1) {
             throw new IllegalArgumentException("workgroup size must be >= 1, got " + workgroupSize);
+        }
+        if (subgroupSize < 1) {
+            throw new IllegalArgumentException("subgroup size must be >= 1, got " + subgroupSize);
         }
         Barriers.check(function);
         WorkgroupScan usage = new WorkgroupScan();
         usage.scan(function.body());
+        if (usage.subgroups && workgroupSize % subgroupSize != 0) {
+            throw new IllegalArgumentException("a workgroup of " + workgroupSize + " is not a whole number of "
+                    + subgroupSize + "-lane subgroups, which a kernel with subgroup operations needs");
+        }
         FrameDescriptor.Builder frame = FrameDescriptor.newBuilder();
         Map<LocalVar, Integer> slots = frameSlots(function, frame);
         FrameDescriptor descriptor = frame.build();
         if (!usage.grouped()) {
-            Ctx ctx = new Ctx(slots, bufferSlots(buffers), Map.of(), Map.of(), Args.COUNTED);
+            Ctx ctx = new Ctx(slots, bufferSlots(buffers), Map.of(), Map.of(), Args.COUNTED, subgroupSize);
             CallTarget target = new ShaderRootNode(descriptor, lowerRegion(function.body(), ctx)).getCallTarget();
             return new CpuKernel(target, false, false, workgroupSize);
         }
@@ -141,11 +170,11 @@ public final class CoreToTruffle {
         for (SharedArray array : usage.arrays) {
             sharedSlots.put(array, sharedSlots.size());
         }
-        Ctx ctx = new Ctx(slots, bufferSlots(buffers), Map.of(), sharedSlots, Args.GROUPED);
+        Ctx ctx = new Ctx(slots, bufferSlots(buffers), Map.of(), sharedSlots, Args.GROUPED, subgroupSize);
         GroupNode[] plan = lowerGroupRegion(function.body(), ctx);
         CallTarget target = new WorkgroupRootNode(descriptor, plan, usage.arrays.toArray(SharedArray[]::new),
                 workgroupSize).getCallTarget();
-        return new CpuKernel(target, true, usage.barrier, workgroupSize);
+        return new CpuKernel(target, true, usage.collective(), workgroupSize);
     }
 
     private static Map<Integer, Integer> bufferSlots(List<Buffer> buffers) {
@@ -192,6 +221,12 @@ public final class CoreToTruffle {
             }
             plan.add(switch (statement) {
                 case Statement.Barrier ignored -> new BarrierNode();
+                case Statement.SubgroupArithmetic s -> new SubgroupArithmeticNode(ctx.slots().get(s.result()),
+                        ctx.subgroupSize(), lowerExpr(s.value(), ctx), s.op(), s.scan(), s.value().type());
+                case Statement.SubgroupShuffle s -> new SubgroupShuffleNode(ctx.slots().get(s.result()),
+                        ctx.subgroupSize(), lowerExpr(s.value(), ctx), s.kind(), lowerExpr(s.lane(), ctx));
+                case Statement.SubgroupVote s -> new SubgroupVoteNode(ctx.slots().get(s.result()),
+                        ctx.subgroupSize(), lowerExpr(s.value(), ctx), s.kind());
                 case Statement.If f -> new GroupIfNode(lowerExpr(f.condition(), ctx),
                         lowerGroupRegion(f.thenRegion(), ctx), lowerGroupRegion(f.elseRegion(), ctx));
                 case Statement.While w -> new GroupWhileNode(lowerExpr(w.condition(), ctx),
@@ -209,16 +244,25 @@ public final class CoreToTruffle {
     private static final class WorkgroupScan {
         final java.util.Set<SharedArray> arrays = new java.util.LinkedHashSet<>();   // identity equality
         boolean barrier;
+        boolean subgroups;
         boolean indices;
 
+        /** Whether the kernel has a point every invocation must reach, so runs whole workgroups. */
+        boolean collective() {
+            return barrier || subgroups;
+        }
+
         boolean grouped() {
-            return barrier || indices || !arrays.isEmpty();
+            return collective() || indices || !arrays.isEmpty();
         }
 
         void scan(Region region) {
             for (Statement statement : region.statements()) {
                 switch (statement) {
                     case Statement.Barrier ignored -> barrier = true;
+                    case Statement.SubgroupArithmetic s -> { subgroups = true; scan(s.value()); }
+                    case Statement.SubgroupShuffle s -> { subgroups = true; scan(s.value()); scan(s.lane()); }
+                    case Statement.SubgroupVote s -> { subgroups = true; scan(s.value()); }
                     case Statement.SharedStore s -> { arrays.add(s.array()); scan(s.index()); scan(s.value()); }
                     case Statement.SharedAtomicUpdate s -> { arrays.add(s.array()); scan(s.index()); scan(s.value()); }
                     case Statement.SharedAtomicCompareExchange s -> {
@@ -247,6 +291,8 @@ public final class CoreToTruffle {
             switch (expr) {
                 case Expr.LocalInvocationId ignored -> indices = true;
                 case Expr.WorkgroupId ignored -> indices = true;
+                case Expr.SubgroupInvocationId ignored -> indices = true;
+                case Expr.SubgroupSize ignored -> indices = true;
                 case Expr.SharedLoad l -> { arrays.add(l.array()); scan(l.index()); }
                 case Expr.BufferLoad l -> scan(l.index());
                 case Expr.Binary b -> { scan(b.lhs()); scan(b.rhs()); }
@@ -303,6 +349,9 @@ public final class CoreToTruffle {
                 ctx.require(Args.GROUPED, "a barrier");
                 throw new IllegalStateException("a barrier outside the workgroup plan");
             }
+            case Statement.SubgroupArithmetic ignored -> subgroupOutsidePlan(ctx);
+            case Statement.SubgroupShuffle ignored -> subgroupOutsidePlan(ctx);
+            case Statement.SubgroupVote ignored -> subgroupOutsidePlan(ctx);
             case Statement.DeclareVar d -> new AssignNode(ctx.slots().get(d.variable()), lowerExpr(d.initializer(), ctx));
             case Statement.Assign a -> new AssignNode(ctx.slots().get(a.variable()), lowerExpr(a.value(), ctx));
             case Statement.If f -> new IfNode(lowerExpr(f.condition(), ctx),
@@ -333,6 +382,14 @@ public final class CoreToTruffle {
                 ctx.require(Args.GROUPED, "the workgroup id");
                 yield new ArgumentNode(ARG_WORKGROUP);
             }
+            case Expr.SubgroupInvocationId ignored -> {
+                ctx.require(Args.GROUPED, "the subgroup invocation id");
+                yield new LaneNode(ctx.subgroupSize());
+            }
+            case Expr.SubgroupSize ignored -> {
+                ctx.require(Args.GROUPED, "the subgroup size");
+                yield new LiteralNode(ctx.subgroupSize());
+            }
             case Expr.SharedLoad l -> new SharedLoadNode(sharedSlot(l.array(), ctx), lowerExpr(l.index(), ctx));
             case Expr.BufferLoad l -> new BufferLoadNode(ctx.bufferSlots().get(l.buffer().binding()),
                     l.buffer().element(), lowerExpr(l.index(), ctx));
@@ -362,6 +419,12 @@ public final class CoreToTruffle {
             case Expr.MatrixTimesVector ignored -> throw new UnsupportedOperationException(
                     "matrix math is graphics-only — no CPU backend yet");
         };
+    }
+
+    /** Like a barrier, a subgroup operation is a node of the workgroup plan, never of an invocation's body. */
+    private static StatementNode subgroupOutsidePlan(Ctx ctx) {
+        ctx.require(Args.GROUPED, "a subgroup operation");
+        throw new IllegalStateException("a subgroup operation outside the workgroup plan");
     }
 
     private static int sharedSlot(SharedArray array, Ctx ctx) {
@@ -474,6 +537,9 @@ public final class CoreToTruffle {
                     }
                 }
                 case Statement.SharedAtomicCompareExchange s -> addOnce(s.previous(), out);
+                case Statement.SubgroupArithmetic s -> addOnce(s.result(), out);
+                case Statement.SubgroupShuffle s -> addOnce(s.result(), out);
+                case Statement.SubgroupVote s -> addOnce(s.result(), out);
                 case Statement.If f -> {
                     collectVariables(f.thenRegion(), out);
                     collectVariables(f.elseRegion(), out);
@@ -942,6 +1008,206 @@ public final class CoreToTruffle {
         @Override
         void execute(Group group) {
             group.proceeds();
+        }
+    }
+
+    /** The lane: the local invocation id modulo the subgroup size. */
+    private static final class LaneNode extends ExprNode {
+        private final int subgroupSize;
+
+        LaneNode(int subgroupSize) {
+            this.subgroupSize = subgroupSize;
+        }
+
+        @Override
+        Object execute(VirtualFrame frame) {
+            return (Integer) frame.getArguments()[ARG_LOCAL] % subgroupSize;
+        }
+    }
+
+    /**
+     * A subgroup operation, which ends a phase as a barrier does: every lane has reached it before any lane
+     * gets its result. Its operand (and a shuffle's lane) is evaluated in every invocation's frame, the lanes of
+     * each subgroup — {@code subgroupSize} consecutive invocations, the workgroup being a whole number of them
+     * — are combined, and each invocation's result variable assigned.
+     */
+    private abstract static class SubgroupNode extends GroupNode {
+        private final int resultSlot;
+        final int subgroupSize;
+        @Child private ExprNode value;
+        @Child private ExprNode argument;   // a shuffle's lane or delta; null for the others
+
+        SubgroupNode(int resultSlot, int subgroupSize, ExprNode value, ExprNode argument) {
+            this.resultSlot = resultSlot;
+            this.subgroupSize = subgroupSize;
+            this.value = value;
+            this.argument = argument;
+        }
+
+        @Override
+        void execute(Group group) {
+            if (!group.proceeds()) {
+                return;
+            }
+            MaterializedFrame[] frames = group.frames;
+            Object[] values = new Object[frames.length];
+            int[] arguments = argument == null ? null : new int[frames.length];
+            for (int i = 0; i < frames.length; i++) {
+                values[i] = value.execute(frames[i]);
+                if (arguments != null) {
+                    arguments[i] = (Integer) argument.execute(frames[i]);
+                }
+            }
+            Object[] results = new Object[frames.length];
+            for (int base = 0; base < frames.length; base += subgroupSize) {
+                combine(values, arguments, results, base);
+            }
+            for (int i = 0; i < frames.length; i++) {
+                frames[i].setObject(resultSlot, results[i]);
+            }
+        }
+
+        /** Fills {@code results[base .. base + subgroupSize)} from the same lanes of {@code values}. */
+        abstract void combine(Object[] values, int[] arguments, Object[] results, int base);
+    }
+
+    /**
+     * Reduce and scans, combining lanes in lane order. For a float add or multiply that order is this
+     * backend's, not the device's, so the two can differ in the last bits unless the values make order moot.
+     */
+    private static final class SubgroupArithmeticNode extends SubgroupNode {
+        private final SubgroupOp op;
+        private final Statement.SubgroupArithmetic.Scan scan;
+        private final boolean isFloat;
+        private final boolean signed;
+
+        SubgroupArithmeticNode(int resultSlot, int subgroupSize, ExprNode value, SubgroupOp op,
+                Statement.SubgroupArithmetic.Scan scan, Type type) {
+            super(resultSlot, subgroupSize, value, null);
+            this.op = op;
+            this.scan = scan;
+            this.isFloat = type instanceof Type.Float;
+            this.signed = type instanceof Type.Int i && i.signed();
+        }
+
+        @Override
+        void combine(Object[] values, int[] arguments, Object[] results, int base) {
+            Object acc = identity();
+            for (int lane = 0; lane < subgroupSize; lane++) {
+                Object before = acc;
+                acc = apply(acc, values[base + lane]);
+                results[base + lane] = scan == Statement.SubgroupArithmetic.Scan.EXCLUSIVE ? before : acc;
+            }
+            if (scan == Statement.SubgroupArithmetic.Scan.REDUCE) {
+                java.util.Arrays.fill(results, base, base + subgroupSize, acc);
+            }
+        }
+
+        /** The value combining with which changes nothing — what an exclusive scan gives lane 0. */
+        private Object identity() {
+            if (isFloat) {
+                return switch (op) {
+                    case ADD -> 0f;
+                    case MUL -> 1f;
+                    case MIN -> Float.POSITIVE_INFINITY;
+                    case MAX -> Float.NEGATIVE_INFINITY;
+                    case AND, OR, XOR -> throw new IllegalStateException("subgroup " + op + " on a float");
+                };
+            }
+            return switch (op) {
+                case ADD, OR, XOR -> 0;
+                case MUL -> 1;
+                case AND -> -1;
+                case MIN -> signed ? Integer.MAX_VALUE : -1;   // -1 is the largest unsigned value
+                case MAX -> signed ? Integer.MIN_VALUE : 0;
+            };
+        }
+
+        private Object apply(Object left, Object right) {
+            if (isFloat) {
+                float a = (Float) left;
+                float b = (Float) right;
+                return switch (op) {
+                    case ADD -> a + b;
+                    case MUL -> a * b;
+                    case MIN -> Math.min(a, b);
+                    case MAX -> Math.max(a, b);
+                    case AND, OR, XOR -> throw new IllegalStateException("subgroup " + op + " on a float");
+                };
+            }
+            int a = (Integer) left;
+            int b = (Integer) right;
+            return switch (op) {
+                case ADD -> a + b;
+                case MUL -> a * b;
+                case MIN -> signed ? Math.min(a, b) : (Integer.compareUnsigned(a, b) <= 0 ? a : b);
+                case MAX -> signed ? Math.max(a, b) : (Integer.compareUnsigned(a, b) >= 0 ? a : b);
+                case AND -> a & b;
+                case OR -> a | b;
+                case XOR -> a ^ b;
+            };
+        }
+    }
+
+    /** Each lane reads another's value; a source outside the subgroup gives the lane its own. */
+    private static final class SubgroupShuffleNode extends SubgroupNode {
+        private final Statement.SubgroupShuffle.Kind kind;
+
+        SubgroupShuffleNode(int resultSlot, int subgroupSize, ExprNode value, Statement.SubgroupShuffle.Kind kind,
+                ExprNode lane) {
+            super(resultSlot, subgroupSize, value, lane);
+            this.kind = kind;
+        }
+
+        @Override
+        void combine(Object[] values, int[] arguments, Object[] results, int base) {
+            for (int lane = 0; lane < subgroupSize; lane++) {
+                int argument = arguments[base + lane];
+                int source = switch (kind) {
+                    case INDEX -> argument;
+                    case XOR -> lane ^ argument;
+                    case UP -> lane - argument;
+                    case DOWN -> lane + argument;
+                };
+                boolean inside = source >= 0 && source < subgroupSize;
+                results[base + lane] = values[base + (inside ? source : lane)];
+            }
+        }
+    }
+
+    private static final class SubgroupVoteNode extends SubgroupNode {
+        private final Statement.SubgroupVote.Kind kind;
+
+        SubgroupVoteNode(int resultSlot, int subgroupSize, ExprNode value, Statement.SubgroupVote.Kind kind) {
+            super(resultSlot, subgroupSize, value, null);
+            this.kind = kind;
+        }
+
+        @Override
+        void combine(Object[] values, int[] arguments, Object[] results, int base) {
+            boolean all = true;
+            boolean any = false;
+            boolean equal = true;
+            for (int lane = 0; lane < subgroupSize; lane++) {
+                Object v = values[base + lane];
+                if (kind == Statement.SubgroupVote.Kind.ALL_EQUAL) {
+                    equal &= same(values[base], v);
+                } else {
+                    all &= (Boolean) v;
+                    any |= (Boolean) v;
+                }
+            }
+            boolean result = switch (kind) {
+                case ALL -> all;
+                case ANY -> any;
+                case ALL_EQUAL -> equal;
+            };
+            java.util.Arrays.fill(results, base, base + subgroupSize, result);
+        }
+
+        /** Floats compare as numbers, so 0 and -0 are equal and a NaN equals nothing, as on the device. */
+        private static boolean same(Object a, Object b) {
+            return a instanceof Float x && b instanceof Float y ? x.floatValue() == y.floatValue() : a.equals(b);
         }
     }
 

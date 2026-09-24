@@ -106,6 +106,9 @@ Introduce a name; emit no instruction. Valid at module level or at the top of a 
 - `atomic OP BUF[INDEX], ATOM` / `NAME = atomic OP BUF[INDEX], ATOM` — `OP` is `add sub min max and or xor
   exchange`; `NAME = atomic cmpxchg BUF[INDEX], EXPECTED, DESIRED`. `BUF` may be a buffer or a shared array.
 - `barrier` — every invocation of the workgroup waits here; only in uniform control flow
+- `NAME = subgroup reduce|inclusive|exclusive OP, ATOM` — `OP` is `add mul min max and or xor`;
+  `NAME = subgroup shuffle index|xor|up|down, ATOM, LANE`; `NAME = subgroup vote all|any|all_equal, ATOM`.
+  Like `barrier`, only in uniform control flow.
 - `ret` / `ret ATOM` — return · `store_result ATOM` — write the kernel result buffer
 - `if COND { … }` / `if COND { … } else { … }`
 - `loop while COND { … }`
@@ -115,7 +118,8 @@ A right-hand side is a single **operation** or a bare **atom**. Operation operan
 no nesting (that is the whole point; everything intermediate is named).
 
 - atoms: `42` (i32), `1.0` (f32), `true`/`false`, a name (param / local / `in` var / push-constant member),
-  `VertexIndex`, `invocation_id`, `local_invocation_id`, `workgroup_id`, `invocation_count`, `BUF[INDEX]`
+  `VertexIndex`, `invocation_id`, `local_invocation_id`, `workgroup_id`, `invocation_count`,
+  `subgroup_invocation_id`, `subgroup_size`, `BUF[INDEX]`
 - typed constants / conversions: `u32 5` (constant), `f32 idx` (conversion); also `convert x, i64`,
   `bitcast x, u32`
 - arithmetic: `add sub mul div mod` · bitwise: `band bor bxor shl shr` · compare: `lt gt eq` ·

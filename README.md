@@ -58,6 +58,8 @@ The `core` language currently supports:
   licenses them on workgroup memory), workgroup and local invocation indices, and a barrier checked to sit in
   uniform control flow. On the CPU a barrier splits the kernel into phases, each run by every invocation of the
   workgroup before the next begins.
+- **Subgroup operations** — reductions and scans, shuffles and votes across the lanes that execute together,
+  at a subgroup size the kernel fixes and the GPU is required to honour, so both backends compute the same.
 - **Validation & tooling:** the official `spirv-val`, `spirv-dis`, `spirv-as`, `spirv-opt`, and `spirv-cross`
   binaries are fetched once from the pinned Vulkan SDK and bundled, so validation, disassembly, and
   cross-compilation work out of the box — no separate install.
@@ -93,8 +95,8 @@ the results are identical.
 **Experimental and early.** The architecture is proven end-to-end — generated SPIR-V vocabulary → `core` IR →
 validated SPIR-V running on a real GPU, *and* the same IR running on the CPU with matching results — but the
 language is intentionally small. Current limits include: memory-based locals (no SSA `OpPhi` yet),
-one-dimensional workgroups, no subgroup operations, and no 64-bit atomics. See [`TODO.md`](TODO.md) for the
-roadmap.
+one-dimensional workgroups, no subgroup ballot or clustered operations, and no 64-bit atomics. See
+[`TODO.md`](TODO.md) for the roadmap.
 
 ## Requirements
 

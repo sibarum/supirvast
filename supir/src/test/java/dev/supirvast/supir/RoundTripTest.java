@@ -13,6 +13,7 @@ import dev.supirvast.vastir.core.Region;
 import dev.supirvast.vastir.core.ShaderStage;
 import dev.supirvast.vastir.core.SharedArray;
 import dev.supirvast.vastir.core.Statement;
+import dev.supirvast.vastir.core.SubgroupOp;
 import dev.supirvast.vastir.core.UnaryOp;
 import dev.supirvast.vastir.lower.CoreToSpirv;
 import dev.supirvast.vastir.type.Type;
@@ -143,6 +144,36 @@ class RoundTripTest {
         assertTrue(text.contains("atomic add tile[0], invocation_count"), text);
         assertTrue(text.contains("old = atomic cmpxchg tile[1], local_invocation_id, local_invocation_id"), text);
         assertTrue(text.contains("result[invocation_id] = tile[local_invocation_id]"), text);
+    }
+
+    /** Every subgroup form, and the two subgroup indices; each result named on the left as an atomic's is. */
+    @Test
+    void subgroupOperationsRoundTrip() {
+        Type.Int i32 = Type.int32();
+        Buffer result = new Buffer("result", 0, i32);
+        LocalVar sum = new LocalVar("sum", i32);
+        LocalVar prefix = new LocalVar("prefix", i32);
+        LocalVar up = new LocalVar("up", i32);
+        LocalVar all = new LocalVar("all", Type.BOOL);
+        Expr lane = new Expr.SubgroupInvocationId();
+        Region body = Region.of(
+                new Statement.SubgroupArithmetic(sum, SubgroupOp.ADD, Statement.SubgroupArithmetic.Scan.REDUCE, lane),
+                new Statement.SubgroupArithmetic(prefix, SubgroupOp.MAX, Statement.SubgroupArithmetic.Scan.EXCLUSIVE,
+                        new Expr.Read(sum)),
+                new Statement.SubgroupShuffle(up, Statement.SubgroupShuffle.Kind.UP, new Expr.Read(prefix),
+                        new Expr.SubgroupSize()),
+                new Statement.SubgroupVote(all, Statement.SubgroupVote.Kind.ALL_EQUAL, new Expr.Read(up)),
+                new Statement.BufferStore(result, new Expr.InvocationId(), new Expr.Read(up)),
+                new Statement.ReturnVoid());
+        Function main = new Function("main", new Type.FunctionType(Type.VOID, List.of()), body);
+        CoreModule module = new CoreModule().addEntryPoint(EntryPoint.compute(main, 64, 1, 1));
+        assertFixpoint(module);
+
+        String text = Supir.print(module);
+        assertTrue(text.contains("sum = subgroup reduce add, subgroup_invocation_id"), text);
+        assertTrue(text.contains("prefix = subgroup exclusive max, sum"), text);
+        assertTrue(text.contains("up = subgroup shuffle up, prefix, subgroup_size"), text);
+        assertTrue(text.contains("all = subgroup vote all_equal, up"), text);
     }
 
     @Test

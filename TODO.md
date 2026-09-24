@@ -285,6 +285,17 @@ In this order, and each of the last two only once a kernel is **measured** to ne
       a kernel whose feature the device lacks registers CPU-only. A pre-reducing f32 scatter (the shape
       `vexelray-sim-fluid` needs) is in `WorkgroupMemoryTest`. *Not yet: 2-D/3-D workgroups, and barriers in
       callees.*
+- [ ] **The dispatch floor.** Measured by `vexelray-sim-fluid` (cfec712, `SortTest.dispatchFloor`, RTX): every
+      `KernelHandle.dispatch` costs a fixed ~0.021 ms, even for an empty 256-invocation kernel, over 500
+      resident dispatches and one read. It now dominates short passes. The fluid counting sort is five passes
+      (count, three scans, permute), each 0.013–0.025 ms whatever its size, so ~0.1 ms of a 0.16 ms sort is
+      floor. The shallow-water step (0.045 ms at 2²⁰ cells) is about half floor, and step 3's segmented
+      scatter (0.032–0.037 ms) probably mostly. At 4 ppc sort + gather costs 0.20 ms against 0.095 direct;
+      without the floor they would be level, and sort + gather would win above 4 ppc. The overhead is
+      step 1½'s deferred note: a descriptor pool and set, a command buffer and a submission, all per
+      dispatch. Two cuts: cache descriptor sets per buffer tuple, and record several dispatches, with
+      barriers between them, into one command buffer submitted once. The second is what a multi-pass step (a
+      sort, a whole FLIP step) wants, and needs an API for a sequence of dispatches.
 - [x] **Pick the discrete GPU.** `GpuContext` took the first device with a compute queue, which on this
       machine is the Intel iGPU, not the RTX 5070 Ti — so **every measurement above was the iGPU's**. Now it
       prefers discrete, then integrated, then anything else (`DeviceSelection`), as VexelRay's renderer does.
@@ -305,16 +316,46 @@ In this order, and each of the last two only once a kernel is **measured** to ne
       is 8.5× faster. A workgroup of one costs the RTX 10× (one lane of 32), so step 1's default of 64 matters
       more there. Same-address atomics are coalesced on both, and the tree reduction only draws level on the
       RTX.
-- [ ] **3. Subgroup operations.** Reductions and shuffles across the 32/64 lanes that execute together — no
-      workgroup memory, no explicit barrier, often the better way to pre-reduce before one global atomic.
-      The CPU backend reuses step 2's phase machinery. **Measured need (2026-09-24, `vexelray-sim-fluid`
-      fc40ad8, RTX 5070 Ti):** in cell order, the FLIP scatter of 2²⁰ particles is contention-bound. At 4 ppc
-      it takes 0.20 ms direct against 0.07 ms for plain stores, and pre-reducing in workgroup memory only
-      gets it to 0.17 ms, growing with ppc just as the direct one does. Every particle still does an atomic
-      on its cell's slot; the serialisation moved to workgroup memory rather than went away. Sorted particles
-      of one cell sit in neighbouring lanes, so what is wanted is a *segmented* subgroup add keyed by cell (a
-      shuffle-based scan, or a clustered add), then one atomic per node per subgroup. A plain subgroup
-      reduction would not do it.
+- [x] **3. Subgroup operations.** `Statement.SubgroupArithmetic` (add, mul, min, max, and, or, xor; reduce,
+      inclusive or exclusive scan; 32-bit ints and f32), `SubgroupShuffle` (by index, xor, up, down) and
+      `SubgroupVote` (all, any, all-equal), plus `Expr.SubgroupInvocationId` and `SubgroupSize`. Statements
+      rather than expressions, as atomics are: the result depends on other lanes. **The subgroup size is the
+      kernel's** (`KernelSpec.subgroupSize`, default 32), since which lanes a reduction combines is part of
+      what it means. The GPU pipeline requires full subgroups of exactly that size (Vulkan 1.3 size control),
+      the CPU runs the same (lane = local id % size), and a device that cannot give the size runs the kernel
+      CPU-only. The workgroup must be a whole number of subgroups, or registration is rejected. Each kind
+      asks for its own `GroupNonUniform*` capability, derived from the device's supported operations and
+      budgeted like any other. A subgroup operation is a collective point, so `Barriers.check` holds it to
+      uniform control flow, a kernel with one runs whole workgroups, and on the CPU it is a phase boundary:
+      every lane evaluates its operand, each subgroup is combined, every lane gets its result. Supir spells
+      it `s = subgroup reduce add, v`, `u = subgroup shuffle up, v, 1`, `a = subgroup vote all, b`. A
+      segmented sum keyed by cell is not a primitive. `SubgroupTest` builds it from these: each lane finds
+      its run's start (an inclusive max over the lanes whose lower neighbour has another key), a Hillis–Steele
+      scan by shuffle-up adds the lane `d` below only when it is at or after that start, and each run's last
+      lane does one atomic. It is checked on both GPUs and the CPU, with every other operation, against known
+      answers. By run, not by key: comparing the key `d` lanes down is right only for sorted input, and double
+      counts `A B A` within a subgroup. Particles after advection are only nearly sorted. That was my first
+      version; `vexelray-sim-fluid` found it (865ec14), and `aSegmentedSumKeepsBrokenRunsApart` now pins it.
+      **Measured** scattering 2²⁰ sorted f32 into cells (ms, one atomic per invocation / segmented, the
+      corrected version):
+
+      | run length | 4 | 16 | 64 |
+      |---|---|---|---|
+      | RTX 5070 Ti | 0.034–0.077, either | 0.033–0.077, either | 0.083–0.087 / 0.031–0.035 |
+      | Intel iGPU | 0.706 / 0.886 | 1.791 / 0.664 | 2.245 / 0.336 |
+
+      The segmented sum is flat in run length while per-invocation atomics grow with it, which is the
+      contention the fluid scatter hit. On the RTX, short runs sit at the ~0.021 ms dispatch floor (above)
+      and swing ±50% between runs, so only the 64 column is a result there: 2.7×. On the iGPU, well above the
+      floor, it pays from 16 per cell, and 6.7× at 64. In the fluid scatter itself (bilinear, 12 values per
+      lane, 865ec14) the segmented mode is flat at 0.058 ms from 4 to 64 ppc, against 0.095–0.62 direct
+      and 0.04–0.27 for a sort-dependent gather. It needs rough cell order, not a sort. **Why it was built (2026-09-24, `vexelray-sim-fluid` fc40ad8):** the FLIP scatter in cell order
+      was contention-bound, and pre-reducing in workgroup memory took only 10–20% off, because every
+      particle still did an atomic on its cell's slot. By a8212c5 that side found a no-atomics gather faster
+      still (4 ppc: 0.05 ms against 0.095 direct), and corrected its earlier low-ppc numbers, which were ~2×
+      slow from GPU idle clocks. So the scatter no longer needs this, but the gather runs short of
+      parallelism in 3D or at high ppc, and its GPU sort's scans are subgroup work. *Not yet: ballot,
+      broadcast, clustered and quad operations; 8-, 16- and 64-bit operands (`shaderSubgroupExtendedTypes`).*
 
 ## A CPU runtime — decided against building one yet (2026-09-22)
 

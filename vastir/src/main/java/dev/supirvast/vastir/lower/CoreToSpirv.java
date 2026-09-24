@@ -20,6 +20,7 @@ import dev.supirvast.vastir.core.Region;
 import dev.supirvast.vastir.core.ShaderStage;
 import dev.supirvast.vastir.core.SharedArray;
 import dev.supirvast.vastir.core.Statement;
+import dev.supirvast.vastir.core.SubgroupOp;
 import dev.supirvast.vastir.core.UnaryOp;
 import dev.supirvast.vastir.spirv.AddressingModel;
 import dev.supirvast.vastir.spirv.BuiltIn;
@@ -28,6 +29,7 @@ import dev.supirvast.vastir.spirv.Decoration;
 import dev.supirvast.vastir.spirv.ExecutionMode;
 import dev.supirvast.vastir.spirv.ExecutionModel;
 import dev.supirvast.vastir.spirv.FunctionControl;
+import dev.supirvast.vastir.spirv.GroupOperation;
 import dev.supirvast.vastir.spirv.LoopControl;
 import dev.supirvast.vastir.spirv.MemoryModel;
 import dev.supirvast.vastir.spirv.MemorySemantics;
@@ -68,6 +70,9 @@ public final class CoreToSpirv {
 
     /** Workgroup scope, for barriers and atomics on workgroup memory. */
     private static final int WORKGROUP_SCOPE = Scope.Workgroup.value();
+
+    /** Subgroup scope, which every {@code OpGroupNonUniform*} instruction names. */
+    private static final int SUBGROUP_SCOPE = Scope.Subgroup.value();
 
     /**
      * What a {@link Statement.Barrier} orders: every write before it, to workgroup <em>and</em> buffer memory,
@@ -178,6 +183,7 @@ public final class CoreToSpirv {
         if (types.usesFloat64()) {
             required.add(Capability.Float64);
         }
+        required.addAll(usage.subgroupCapabilities());
         Set<Capability> atomics = new LinkedHashSet<>();
         Set<DeviceFeature> features = new LinkedHashSet<>();
         for (Function function : module.functions()) {
@@ -449,6 +455,12 @@ public final class CoreToSpirv {
                     collectBuffers(s.desired(), out);
                 }
                 case Statement.Barrier ignored -> { }
+                case Statement.SubgroupArithmetic s -> collectBuffers(s.value(), out);
+                case Statement.SubgroupShuffle s -> {
+                    collectBuffers(s.value(), out);
+                    collectBuffers(s.lane(), out);
+                }
+                case Statement.SubgroupVote s -> collectBuffers(s.value(), out);
                 case Statement.Return r -> collectBuffers(r.value(), out);
                 case Statement.StoreResult s -> collectBuffers(s.value(), out);
                 case Statement.BuiltinWrite s -> collectBuffers(s.value(), out);
@@ -501,6 +513,8 @@ public final class CoreToSpirv {
             case Expr.LocalInvocationId ignored -> { }
             case Expr.WorkgroupId ignored -> { }
             case Expr.InvocationCount ignored -> { }
+            case Expr.SubgroupInvocationId ignored -> { }
+            case Expr.SubgroupSize ignored -> { }
             case Expr.BuiltinRead ignored -> { }
             case Expr.InterfaceRead ignored -> { }
             case Expr.Param ignored -> { }
@@ -509,13 +523,14 @@ public final class CoreToSpirv {
 
     /**
      * The compute-only features a module uses: the invocation-index built-ins (in the order their variables
-     * are declared), its shared arrays, whether it reads the invocation count, and whether it has a barrier.
+     * are declared), its shared arrays, whether it reads the invocation count, whether it has a barrier, and
+     * the {@code GroupNonUniform*} capabilities its subgroup operations and indices need.
      */
     private record KernelUsage(List<BuiltIn> builtins, List<SharedArray> sharedArrays, boolean invocationCount,
-            boolean barrier) {
+            boolean barrier, Set<Capability> subgroupCapabilities) {
         boolean workgroup() {
             return barrier || !sharedArrays.isEmpty() || builtins.contains(BuiltIn.LocalInvocationId)
-                    || builtins.contains(BuiltIn.WorkgroupId);
+                    || builtins.contains(BuiltIn.WorkgroupId) || !subgroupCapabilities.isEmpty();
         }
     }
 
@@ -523,8 +538,14 @@ public final class CoreToSpirv {
     private static final class KernelScan {
         final Set<BuiltIn> builtins = new LinkedHashSet<>();
         final Set<SharedArray> sharedArrays = new LinkedHashSet<>();   // SharedArray equality is identity
+        final Set<Capability> subgroup = new LinkedHashSet<>();
         boolean invocationCount;
         boolean barrier;
+
+        void subgroup(Capability kind) {
+            subgroup.add(Capability.GroupNonUniform);   // every subgroup instruction and builtin needs it
+            subgroup.add(kind);
+        }
     }
 
     private KernelUsage collectKernelUsage(CoreModule module) {
@@ -533,7 +554,7 @@ public final class CoreToSpirv {
             scanKernel(function.body(), scan);
         }
         return new KernelUsage(List.copyOf(scan.builtins), List.copyOf(scan.sharedArrays), scan.invocationCount,
-                scan.barrier);
+                scan.barrier, Set.copyOf(scan.subgroup));
     }
 
     private void scanKernel(Region region, KernelScan scan) {
@@ -546,6 +567,21 @@ public final class CoreToSpirv {
                 case Statement.SharedAtomicUpdate s -> { scan.sharedArrays.add(s.array()); scanKernel(s.index(), scan); scanKernel(s.value(), scan); }
                 case Statement.SharedAtomicCompareExchange s -> { scan.sharedArrays.add(s.array()); scanKernel(s.index(), scan); scanKernel(s.expected(), scan); scanKernel(s.desired(), scan); }
                 case Statement.Barrier ignored -> scan.barrier = true;
+                case Statement.SubgroupArithmetic s -> {
+                    scan.subgroup(Capability.GroupNonUniformArithmetic);
+                    scanKernel(s.value(), scan);
+                }
+                case Statement.SubgroupShuffle s -> {
+                    scan.subgroup(s.kind() == Statement.SubgroupShuffle.Kind.UP
+                            || s.kind() == Statement.SubgroupShuffle.Kind.DOWN
+                            ? Capability.GroupNonUniformShuffleRelative : Capability.GroupNonUniformShuffle);
+                    scanKernel(s.value(), scan);
+                    scanKernel(s.lane(), scan);
+                }
+                case Statement.SubgroupVote s -> {
+                    scan.subgroup(Capability.GroupNonUniformVote);
+                    scanKernel(s.value(), scan);
+                }
                 case Statement.Return r -> scanKernel(r.value(), scan);
                 case Statement.StoreResult s -> scanKernel(s.value(), scan);
                 case Statement.BuiltinWrite s -> scanKernel(s.value(), scan);
@@ -565,6 +601,14 @@ public final class CoreToSpirv {
             case Expr.LocalInvocationId ignored -> scan.builtins.add(BuiltIn.LocalInvocationId);
             case Expr.WorkgroupId ignored -> scan.builtins.add(BuiltIn.WorkgroupId);
             case Expr.InvocationCount ignored -> scan.invocationCount = true;
+            case Expr.SubgroupInvocationId ignored -> {
+                scan.builtins.add(BuiltIn.SubgroupLocalInvocationId);
+                scan.subgroup(Capability.GroupNonUniform);
+            }
+            case Expr.SubgroupSize ignored -> {
+                scan.builtins.add(BuiltIn.SubgroupSize);
+                scan.subgroup(Capability.GroupNonUniform);
+            }
             case Expr.SharedLoad l -> { scan.sharedArrays.add(l.array()); scanKernel(l.index(), scan); }
             case Expr.BufferLoad l -> scanKernel(l.index(), scan);
             case Expr.Binary b -> { scanKernel(b.lhs(), scan); scanKernel(b.rhs(), scan); }
@@ -689,6 +733,12 @@ public final class CoreToSpirv {
                     scanInterface(s.desired(), scan);
                 }
                 case Statement.Barrier ignored -> { }
+                case Statement.SubgroupArithmetic s -> scanInterface(s.value(), scan);
+                case Statement.SubgroupShuffle s -> {
+                    scanInterface(s.value(), scan);
+                    scanInterface(s.lane(), scan);
+                }
+                case Statement.SubgroupVote s -> scanInterface(s.value(), scan);
                 case Statement.Return r -> scanInterface(r.value(), scan);
                 case Statement.StoreResult s -> scanInterface(s.value(), scan);
                 case Statement.DeclareVar d -> scanInterface(d.initializer(), scan);
@@ -741,6 +791,8 @@ public final class CoreToSpirv {
             case Expr.LocalInvocationId ignored -> { }
             case Expr.WorkgroupId ignored -> { }
             case Expr.InvocationCount ignored -> { }
+            case Expr.SubgroupInvocationId ignored -> { }
+            case Expr.SubgroupSize ignored -> { }
             case Expr.Param ignored -> { }
         }
     }
@@ -802,6 +854,20 @@ public final class CoreToSpirv {
                     constants.intConst(Type.uint32(), WORKGROUP_SCOPE);
                     constants.intConst(Type.uint32(), BARRIER_SEMANTICS);
                 }
+                case Statement.SubgroupArithmetic s -> {
+                    prepareSubgroup(s.result(), types, constants);
+                    prepareExpr(s.value(), types, constants);
+                }
+                case Statement.SubgroupShuffle s -> {
+                    prepareSubgroup(s.result(), types, constants);
+                    types.idOf(Type.uint32());   // the lane operand, bitcast if it is signed
+                    prepareExpr(s.value(), types, constants);
+                    prepareExpr(s.lane(), types, constants);
+                }
+                case Statement.SubgroupVote s -> {
+                    prepareSubgroup(s.result(), types, constants);
+                    prepareExpr(s.value(), types, constants);
+                }
                 case Statement.DeclareVar d -> {
                     types.pointerType(StorageClass.Function.value(), d.variable().type());
                     prepareExpr(d.initializer(), types, constants);
@@ -830,6 +896,13 @@ public final class CoreToSpirv {
         constants.intConst(Type.uint32(), MemorySemantics.Relaxed.value());
     }
 
+    /** The result's type and variable, and the subgroup scope every subgroup instruction names. */
+    private void prepareSubgroup(LocalVar result, TypeTable types, ConstantTable constants) {
+        types.idOf(result.type());
+        types.pointerType(StorageClass.Function.value(), result.type());
+        constants.intConst(Type.uint32(), SUBGROUP_SCOPE);
+    }
+
     private void prepareSharedAtomic(SharedArray array, LocalVar previous, TypeTable types,
             ConstantTable constants) {
         types.idOf(array.element());
@@ -849,6 +922,8 @@ public final class CoreToSpirv {
             case Expr.InvocationId ignored -> types.idOf(Type.int32());
             case Expr.LocalInvocationId ignored -> types.idOf(Type.int32());
             case Expr.WorkgroupId ignored -> types.idOf(Type.int32());
+            case Expr.SubgroupInvocationId ignored -> types.idOf(Type.int32());
+            case Expr.SubgroupSize ignored -> types.idOf(Type.int32());
             case Expr.InvocationCount ignored -> {
                 types.idOf(Type.int32());
                 constants.intConst(Type.int32(), 0);   // the access-chain member index
@@ -1111,7 +1186,9 @@ public final class CoreToSpirv {
                 builtinComponentPointer = types.pointerType(StorageClass.Input.value(), Type.uint32());
                 uintZeroConst = constants.intConst(Type.uint32(), 0);
                 for (Map.Entry<BuiltIn, Integer> builtin : builtinVariables.entrySet()) {
-                    b.emit(b.globals, Op.OpVariable).id(builtinPointer).id(builtin.getValue())
+                    // The subgroup builtins are a scalar uint; the invocation indices are a uvec3.
+                    int pointer = isScalar(builtin.getKey()) ? builtinComponentPointer : builtinPointer;
+                    b.emit(b.globals, Op.OpVariable).id(pointer).id(builtin.getValue())
                             .enumValue(StorageClass.Input.value());
                     b.emit(b.annotations, Op.OpDecorate).id(builtin.getValue())
                             .enumValue(Decoration.BuiltIn.value()).enumValue(builtin.getKey().value());
@@ -1119,11 +1196,18 @@ public final class CoreToSpirv {
             }
         }
 
-        /** Loads the x component of an invocation-index builtin (uint) and bitcasts it to a signed int. */
+        private static boolean isScalar(BuiltIn builtin) {
+            return builtin == BuiltIn.SubgroupLocalInvocationId || builtin == BuiltIn.SubgroupSize;
+        }
+
+        /** Loads a builtin's (x component's) uint and bitcasts it to a signed int. */
         int loadBuiltin(Builder b, TypeTable types, BuiltIn builtin) {
-            int pointer = b.allocateId();
-            b.emit(b.functions, Op.OpAccessChain).id(builtinComponentPointer).id(pointer)
-                    .id(builtinVariables.get(builtin)).id(uintZeroConst);
+            int pointer = builtinVariables.get(builtin);
+            if (!isScalar(builtin)) {
+                pointer = b.allocateId();
+                b.emit(b.functions, Op.OpAccessChain).id(builtinComponentPointer).id(pointer)
+                        .id(builtinVariables.get(builtin)).id(uintZeroConst);
+            }
             int loaded = b.allocateId();
             b.emit(b.functions, Op.OpLoad).id(uintType).id(loaded).id(pointer);
             int casted = b.allocateId();
@@ -1632,6 +1716,39 @@ public final class CoreToSpirv {
                 case Statement.Barrier ignored -> b.emit(b.functions, Op.OpControlBarrier)
                         .id(workgroupScope()).id(workgroupScope())
                         .id(constants.intConst(Type.uint32(), BARRIER_SEMANTICS));
+                case Statement.SubgroupArithmetic s -> {
+                    int value = lowerExpr(s.value());
+                    int result = b.allocateId();
+                    b.emit(b.functions, subgroupOp(s.op(), s.value().type()))
+                            .id(types.idOf(s.result().type())).id(result).id(subgroupScope())
+                            .enumValue(groupOperation(s.scan())).id(value);
+                    store(s.result(), result);
+                }
+                case Statement.SubgroupShuffle s -> {
+                    int value = lowerExpr(s.value());
+                    int lane = asUnsigned(s.lane());
+                    int result = b.allocateId();
+                    Op op = switch (s.kind()) {
+                        case INDEX -> Op.OpGroupNonUniformShuffle;
+                        case XOR -> Op.OpGroupNonUniformShuffleXor;
+                        case UP -> Op.OpGroupNonUniformShuffleUp;
+                        case DOWN -> Op.OpGroupNonUniformShuffleDown;
+                    };
+                    b.emit(b.functions, op).id(types.idOf(s.result().type())).id(result).id(subgroupScope())
+                            .id(value).id(lane);
+                    store(s.result(), result);
+                }
+                case Statement.SubgroupVote s -> {
+                    int value = lowerExpr(s.value());
+                    int result = b.allocateId();
+                    Op op = switch (s.kind()) {
+                        case ALL -> Op.OpGroupNonUniformAll;
+                        case ANY -> Op.OpGroupNonUniformAny;
+                        case ALL_EQUAL -> Op.OpGroupNonUniformAllEqual;
+                    };
+                    b.emit(b.functions, op).id(types.idOf(Type.BOOL)).id(result).id(subgroupScope()).id(value);
+                    store(s.result(), result);
+                }
                 case Statement.BuiltinWrite s -> {
                     int value = lowerExpr(s.value());
                     b.emit(b.functions, Op.OpStore).id(interfaceResources.builtinVariable(s.builtin())).id(value);
@@ -1657,6 +1774,52 @@ public final class CoreToSpirv {
 
         private int workgroupScope() {
             return constants.intConst(Type.uint32(), WORKGROUP_SCOPE);
+        }
+
+        private int subgroupScope() {
+            return constants.intConst(Type.uint32(), SUBGROUP_SCOPE);
+        }
+
+        /** A 32-bit integer operand as the {@code uint} a shuffle's lane or delta must be. */
+        private int asUnsigned(Expr value) {
+            int id = lowerExpr(value);
+            if (!((Type.Int) value.type()).signed()) {
+                return id;
+            }
+            int casted = b.allocateId();
+            b.emit(b.functions, Op.OpBitcast).id(types.idOf(Type.uint32())).id(casted).id(id);
+            return casted;
+        }
+
+        private static int groupOperation(Statement.SubgroupArithmetic.Scan scan) {
+            return switch (scan) {
+                case REDUCE -> GroupOperation.Reduce.value();
+                case INCLUSIVE -> GroupOperation.InclusiveScan.value();
+                case EXCLUSIVE -> GroupOperation.ExclusiveScan.value();
+            };
+        }
+
+        /** The instruction for {@code op} on {@code type}; {@link SubgroupOp#definedOn} has vetted the pair. */
+        private static Op subgroupOp(SubgroupOp op, Type type) {
+            if (type instanceof Type.Float) {
+                return switch (op) {
+                    case ADD -> Op.OpGroupNonUniformFAdd;
+                    case MUL -> Op.OpGroupNonUniformFMul;
+                    case MIN -> Op.OpGroupNonUniformFMin;
+                    case MAX -> Op.OpGroupNonUniformFMax;
+                    case AND, OR, XOR -> throw new IllegalStateException("subgroup " + op + " on a float");
+                };
+            }
+            boolean signed = ((Type.Int) type).signed();
+            return switch (op) {
+                case ADD -> Op.OpGroupNonUniformIAdd;
+                case MUL -> Op.OpGroupNonUniformIMul;
+                case MIN -> signed ? Op.OpGroupNonUniformSMin : Op.OpGroupNonUniformUMin;
+                case MAX -> signed ? Op.OpGroupNonUniformSMax : Op.OpGroupNonUniformUMax;
+                case AND -> Op.OpGroupNonUniformBitwiseAnd;
+                case OR -> Op.OpGroupNonUniformBitwiseOr;
+                case XOR -> Op.OpGroupNonUniformBitwiseXor;
+            };
         }
 
         private int relaxed() {
@@ -1779,6 +1942,8 @@ public final class CoreToSpirv {
                 case Expr.InvocationId ignored -> builtin(BuiltIn.GlobalInvocationId);
                 case Expr.LocalInvocationId ignored -> builtin(BuiltIn.LocalInvocationId);
                 case Expr.WorkgroupId ignored -> builtin(BuiltIn.WorkgroupId);
+                case Expr.SubgroupInvocationId ignored -> builtin(BuiltIn.SubgroupLocalInvocationId);
+                case Expr.SubgroupSize ignored -> builtin(BuiltIn.SubgroupSize);
                 case Expr.InvocationCount ignored -> lowerPushConstantRead(pushConstants.block().read(0));
                 case Expr.SharedLoad l -> {
                     int index = lowerExpr(l.index());
@@ -2076,6 +2241,9 @@ public final class CoreToSpirv {
                         }
                     }
                     case Statement.SharedAtomicCompareExchange s -> addOnce(s.previous(), out);
+                    case Statement.SubgroupArithmetic s -> addOnce(s.result(), out);
+                    case Statement.SubgroupShuffle s -> addOnce(s.result(), out);
+                    case Statement.SubgroupVote s -> addOnce(s.result(), out);
                     case Statement.If f -> {
                         collectVariables(f.thenRegion(), out);
                         collectVariables(f.elseRegion(), out);

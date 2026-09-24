@@ -16,6 +16,7 @@ import dev.supirvast.vastir.core.Region;
 import dev.supirvast.vastir.core.ShaderStage;
 import dev.supirvast.vastir.core.SharedArray;
 import dev.supirvast.vastir.core.Statement;
+import dev.supirvast.vastir.core.SubgroupOp;
 import dev.supirvast.vastir.core.Texture;
 import dev.supirvast.vastir.core.UnaryOp;
 import dev.supirvast.vastir.type.Type;
@@ -351,12 +352,87 @@ final class Parser {
     }
 
     private boolean atAtomic() {
+        return atWord("atomic");
+    }
+
+    private boolean atWord(String keyword) {
         String word = identText(peek());
-        if (word != null && word.equals("atomic")) {
+        if (word != null && word.equals(keyword)) {
             advance();
             return true;
         }
         return false;
+    }
+
+    private static final Map<String, SubgroupOp> SUBGROUP_OP = Map.of(
+            "add", SubgroupOp.ADD, "mul", SubgroupOp.MUL, "min", SubgroupOp.MIN, "max", SubgroupOp.MAX,
+            "and", SubgroupOp.AND, "or", SubgroupOp.OR, "xor", SubgroupOp.XOR);
+
+    /**
+     * After {@code subgroup}: {@code reduce|inclusive|exclusive OP, VALUE}, {@code shuffle index|xor|up|down,
+     * VALUE, LANE} or {@code vote all|any|all_equal, VALUE}. The result {@code name} is reassigned if it is
+     * already a local and declared otherwise, bound only after the operands are read — as for an atomic.
+     */
+    private Statement subgroup(Scope scope, String name, Lexer.Token at, Type declared) {
+        Lexer.Token kindToken = peek();
+        String kind = ident("reduce, inclusive, exclusive, shuffle or vote");
+        Lexer.Token modeToken = peek();
+        String mode = ident("a subgroup operation");
+        expect(Lexer.Kind.COMMA, ",");
+        Expr value = atom(scope);
+        try {
+            return switch (kind) {
+                case "reduce", "inclusive", "exclusive" -> {
+                    SubgroupOp op = SUBGROUP_OP.get(mode);
+                    if (op == null) {
+                        throw new SupirParseException(modeToken.span(), "unknown subgroup operation '" + mode + "'");
+                    }
+                    Statement.SubgroupArithmetic.Scan scan = switch (kind) {
+                        case "reduce" -> Statement.SubgroupArithmetic.Scan.REDUCE;
+                        case "inclusive" -> Statement.SubgroupArithmetic.Scan.INCLUSIVE;
+                        default -> Statement.SubgroupArithmetic.Scan.EXCLUSIVE;
+                    };
+                    yield new Statement.SubgroupArithmetic(result(scope, name, at, declared, value.type()), op, scan,
+                            value);
+                }
+                case "shuffle" -> {
+                    Statement.SubgroupShuffle.Kind shuffle = switch (mode) {
+                        case "index" -> Statement.SubgroupShuffle.Kind.INDEX;
+                        case "xor" -> Statement.SubgroupShuffle.Kind.XOR;
+                        case "up" -> Statement.SubgroupShuffle.Kind.UP;
+                        case "down" -> Statement.SubgroupShuffle.Kind.DOWN;
+                        default -> throw new SupirParseException(modeToken.span(), "unknown shuffle '" + mode + "'");
+                    };
+                    expect(Lexer.Kind.COMMA, ",");
+                    Expr lane = atom(scope);
+                    yield new Statement.SubgroupShuffle(result(scope, name, at, declared, value.type()), shuffle,
+                            value, lane);
+                }
+                case "vote" -> {
+                    Statement.SubgroupVote.Kind vote = switch (mode) {
+                        case "all" -> Statement.SubgroupVote.Kind.ALL;
+                        case "any" -> Statement.SubgroupVote.Kind.ANY;
+                        case "all_equal" -> Statement.SubgroupVote.Kind.ALL_EQUAL;
+                        default -> throw new SupirParseException(modeToken.span(), "unknown vote '" + mode + "'");
+                    };
+                    yield new Statement.SubgroupVote(result(scope, name, at, declared, Type.BOOL), vote, value);
+                }
+                default -> throw new SupirParseException(kindToken.span(), "unknown subgroup form '" + kind + "'");
+            };
+        } catch (IllegalArgumentException invalid) {
+            throw new SupirParseException(kindToken.span(), invalid.getMessage());
+        }
+    }
+
+    /** The local a subgroup operation assigns: the existing one of that name, or a new one of {@code type}. */
+    private LocalVar result(Scope scope, String name, Lexer.Token at, Type declared, Type type) {
+        LocalVar existing = scope.local(name);
+        if (existing != null) {
+            return existing;
+        }
+        LocalVar fresh = new LocalVar(name, declared != null ? declared : type);
+        scope.defineLocal(name, fresh, at.span());
+        return fresh;
     }
 
     /** {@code Position = …} / {@code outVar = …} / {@code buf[i] = …} / {@code name[: type] = …}. */
@@ -386,6 +462,9 @@ final class Parser {
             if (atAtomic()) {
                 return atomic(scope, name, lhs, declared);
             }
+            if (atWord("subgroup")) {
+                return subgroup(scope, name, lhs, declared);
+            }
             Expr value = rhs(scope);
             LocalVar var = new LocalVar(name, declared);
             scope.defineLocal(name, var, lhs.span());
@@ -395,6 +474,9 @@ final class Parser {
         expect(Lexer.Kind.EQUALS, "=");
         if (atAtomic()) {
             return atomic(scope, name, lhs, null);
+        }
+        if (atWord("subgroup")) {
+            return subgroup(scope, name, lhs, null);
         }
 
         Builtin builtin = builtinOrNull(name);
@@ -650,6 +732,8 @@ final class Parser {
             case "local_invocation_id" -> { return new Expr.LocalInvocationId(); }
             case "workgroup_id" -> { return new Expr.WorkgroupId(); }
             case "invocation_count" -> { return new Expr.InvocationCount(); }
+            case "subgroup_invocation_id" -> { return new Expr.SubgroupInvocationId(); }
+            case "subgroup_size" -> { return new Expr.SubgroupSize(); }
             default -> { /* fall through to lookups */ }
         }
         Builtin builtin = builtinOrNull(name);
