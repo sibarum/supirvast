@@ -24,6 +24,10 @@
         <module>vastir</module>
         <!-- Executable Truffle AST generated from vastir; depends on Truffle. -->
         <module>vast</module>
+        <!-- The single sanctioned entry to Panama (Ffi) and NativeException. Depends on nothing but the JDK. -->
+        <module>vastir-ffi</module>
+        <!-- The stack's one Panama binding to Vulkan: loader, instance, device. Depends on vastir-ffi. -->
+        <module>vastir-vulkan</module>
         <!-- Bundled native SPIR-V toolchain + differential harness; depends on vastir and vast. -->
         <module>vastir-tools</module>
         <!-- Maven plugin: pre-compiles ShaderSource implementations to SPIR-V classpath resources. -->
@@ -78,6 +82,18 @@
             <dependency>
                 <groupId>dev.supirvast</groupId>
                 <artifactId>vastir</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+
+            <!-- Reactor-internal dependencies: the Panama layer every native binding in the stack is built on. -->
+            <dependency>
+                <groupId>dev.supirvast</groupId>
+                <artifactId>vastir-ffi</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>dev.supirvast</groupId>
+                <artifactId>vastir-vulkan</artifactId>
                 <version>${project.version}</version>
             </dependency>
 

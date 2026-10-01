@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>dev.supirvast</groupId>
+        <artifactId>supir-vast</artifactId>
+        <version>0.2.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>vastir-vulkan</artifactId>
+
+    <name>Supir-Vast :: vastir-vulkan</name>
+    <description>
+        The stack's one Panama binding to Vulkan: the loader, instance, device, debug messenger and the struct
+        layouts they share. Hand-written over vastir-ffi, with no windowing and no rendering — a window system
+        hands it the instance extensions it needs, and whatever draws or computes does so on the device this
+        creates. One binding and one device are what let a simulation and a renderer share a buffer.
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>dev.supirvast</groupId>
+            <artifactId>vastir-ffi</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+    </dependencies>
+</project>
