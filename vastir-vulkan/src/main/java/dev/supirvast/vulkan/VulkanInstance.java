@@ -110,8 +110,18 @@ public final class VulkanInstance implements AutoCloseable {
             JAVA_INT.withName("maxUniformBufferRange"),
             JAVA_INT.withName("maxStorageBufferRange"),
             JAVA_INT.withName("maxPushConstantsSize"),
+            JAVA_INT.withName("maxMemoryAllocationCount"),
+            JAVA_INT.withName("maxSamplerAllocationCount"),
+            // The next two are VkDeviceSize, which wants an 8-byte boundary; the limits so far end 4 short of one.
+            MemoryLayout.paddingLayout(4),
+            JAVA_LONG.withName("bufferImageGranularity"),
+            JAVA_LONG.withName("sparseAddressSpaceSize"),
+            // maxBoundDescriptorSets through maxFragmentCombinedOutputResources: 38 limits this file has no use
+            // for, between the last VkDeviceSize and the one it reads next.
+            MemoryLayout.sequenceLayout(38, JAVA_INT).withName("limitsBetween"),
+            JAVA_INT.withName("maxComputeSharedMemorySize"),
             MemoryLayout.paddingLayout(
-                    1024 - 20 - VK_MAX_PHYSICAL_DEVICE_NAME_SIZE - VK_UUID_SIZE - 4 - 36)
+                    1024 - 20 - VK_MAX_PHYSICAL_DEVICE_NAME_SIZE - VK_UUID_SIZE - 4 - 36 - 8 - 4 - 16 - 38 * 4 - 4)
     ).withName("VkPhysicalDeviceProperties");
 
     /** VkQueueFamilyProperties — 24 bytes; only queueFlags is read here. */
@@ -153,9 +163,13 @@ public final class VulkanInstance implements AutoCloseable {
     private static final VarHandle CI_ppEnabledLayerNames = Ffi.field(INSTANCE_CREATE_INFO, "ppEnabledLayerNames");
 
     private static final VarHandle PDP_deviceType = Ffi.field(PHYSICAL_DEVICE_PROPERTIES, "deviceType");
+    private static final VarHandle PDP_maxComputeSharedMemorySize =
+            Ffi.field(PHYSICAL_DEVICE_PROPERTIES, "maxComputeSharedMemorySize");
     private static final VarHandle PDP_maxPushConstantsSize =
             Ffi.field(PHYSICAL_DEVICE_PROPERTIES, "maxPushConstantsSize");
     private static final VarHandle QFP_queueFlags = Ffi.field(QUEUE_FAMILY_PROPERTIES, "queueFlags");
+    private static final VarHandle QFP_queueCount = Ffi.field(QUEUE_FAMILY_PROPERTIES, "queueCount");
+    private static final int VK_QUEUE_COMPUTE_BIT = 0x0002;
 
     /**
      * A chosen physical device plus a queue family that supports both graphics and presentation to a surface.
@@ -454,6 +468,91 @@ public final class VulkanInstance implements AutoCloseable {
             }
         }
         return Optional.ofNullable(firstMatch);
+    }
+
+    /**
+     * A physical device as a compute caller sees it: enough to choose one, and to make a device on it.
+     *
+     * @param index              its position among {@link #physicalDevices()}
+     * @param type               {@code VkPhysicalDeviceType}: 1 integrated, 2 discrete, 3 virtual, 4 cpu
+     * @param computeQueueFamily the first queue family that can run compute, or -1 if there is none
+     * @param computeQueueCount  how many queues that family offers — the ceiling on how many a device may ask for
+     */
+    public record DeviceInfo(MemorySegment physicalDevice, int index, String name, int type,
+                             int computeQueueFamily, int computeQueueCount) {
+
+        public boolean compute() {
+            return computeQueueFamily >= 0;
+        }
+    }
+
+    /**
+     * Every physical device, described. Choosing among them is the caller's: which GPU to prefer is a policy,
+     * and this layer has no opinion on it.
+     */
+    public List<DeviceInfo> deviceInfos() {
+        List<DeviceInfo> infos = new ArrayList<>();
+        List<MemorySegment> devices = physicalDevices();
+        for (int i = 0; i < devices.size(); i++) {
+            MemorySegment device = devices.get(i);
+            int[] family = computeQueueFamily(device);
+            infos.add(new DeviceInfo(device, i, deviceName(device), deviceType(device), family[0], family[1]));
+        }
+        return infos;
+    }
+
+    /** The selection for a device and its compute queue family — what {@link VulkanDevice} is made from. */
+    public DeviceSelection selectionFor(DeviceInfo info) {
+        if (!info.compute()) {
+            throw new IllegalArgumentException(info.name() + " has no compute queue family");
+        }
+        return new DeviceSelection(info.physicalDevice(), info.computeQueueFamily(), info.name(),
+                maxPushConstantBytes(info.physicalDevice()));
+    }
+
+    /**
+     * The device's {@code maxComputeSharedMemorySize}: the most workgroup memory one compute pipeline may
+     * declare. 16 KB at least; 32 to 64 KB on current desktop hardware.
+     */
+    public long maxComputeSharedMemoryBytes(MemorySegment physicalDevice) {
+        try (Arena temp = Arena.ofConfined()) {
+            MemorySegment props = temp.allocate(PHYSICAL_DEVICE_PROPERTIES);
+            properties(physicalDevice, props);
+            long reported = Integer.toUnsignedLong((int) PDP_maxComputeSharedMemorySize.get(props));
+            // The guaranteed floor, for the reason maxPushConstantBytes states: a number below it means this
+            // file's layout is wrong, not that the device is odd, and a wrong offset otherwise reads as plausible.
+            if (reported < 16384) {
+                throw new NativeException("maxComputeSharedMemorySize read as " + reported + ", below the 16384 "
+                        + "every Vulkan device guarantees; suspect this file's VkPhysicalDeviceProperties layout");
+            }
+            return reported;
+        }
+    }
+
+    /** {@code {family, queueCount}} of the first queue family with compute, or {@code {-1, 0}}. */
+    private int[] computeQueueFamily(MemorySegment device) {
+        try (Arena temp = Arena.ofConfined()) {
+            MemorySegment pCount = temp.allocate(JAVA_INT);
+            try {
+                vkGetPhysicalDeviceQueueFamilyProperties.invokeExact(device, pCount, MemorySegment.NULL);
+            } catch (Throwable t) {
+                throw NativeException.rethrow("vkGetPhysicalDeviceQueueFamilyProperties", t);
+            }
+            int count = pCount.get(JAVA_INT, 0);
+            MemorySegment props = temp.allocate(QUEUE_FAMILY_PROPERTIES, count);
+            try {
+                vkGetPhysicalDeviceQueueFamilyProperties.invokeExact(device, pCount, props);
+            } catch (Throwable t) {
+                throw NativeException.rethrow("vkGetPhysicalDeviceQueueFamilyProperties", t);
+            }
+            for (int f = 0; f < count; f++) {
+                MemorySegment family = props.asSlice(f * QFP_STRIDE, QFP_STRIDE);
+                if (((int) QFP_queueFlags.get(family) & VK_QUEUE_COMPUTE_BIT) != 0) {
+                    return new int[] {f, (int) QFP_queueCount.get(family)};
+                }
+            }
+            return new int[] {-1, 0};
+        }
     }
 
     /** Destroy a surface created for this instance. */

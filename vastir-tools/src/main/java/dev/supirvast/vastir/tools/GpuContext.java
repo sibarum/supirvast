@@ -1,68 +1,16 @@
 package dev.supirvast.vastir.tools;
 
-import org.lwjgl.PointerBuffer;
-import org.lwjgl.system.Configuration;
-import org.lwjgl.system.MemoryStack;
-import org.lwjgl.system.MemoryUtil;
-import org.lwjgl.vulkan.VkApplicationInfo;
-import org.lwjgl.vulkan.VkBufferCopy;
-import org.lwjgl.vulkan.VkBufferCreateInfo;
-import org.lwjgl.vulkan.VkMappedMemoryRange;
-import org.lwjgl.vulkan.VkMemoryBarrier;
-import org.lwjgl.vulkan.VkCommandBuffer;
-import org.lwjgl.vulkan.VkCommandBufferAllocateInfo;
-import org.lwjgl.vulkan.VkCommandBufferBeginInfo;
-import org.lwjgl.vulkan.VkCommandPoolCreateInfo;
-import org.lwjgl.vulkan.VkComputePipelineCreateInfo;
-import org.lwjgl.vulkan.VkDescriptorBufferInfo;
-import org.lwjgl.vulkan.VkDescriptorPoolCreateInfo;
-import org.lwjgl.vulkan.VkDescriptorPoolSize;
-import org.lwjgl.vulkan.VkDescriptorSetAllocateInfo;
-import org.lwjgl.vulkan.VkDescriptorSetLayoutBinding;
-import org.lwjgl.vulkan.VkDescriptorSetLayoutCreateInfo;
-import org.lwjgl.vulkan.VkDevice;
-import org.lwjgl.vulkan.VkDeviceCreateInfo;
-import org.lwjgl.vulkan.VkDeviceQueueCreateInfo;
-import org.lwjgl.vulkan.VkFenceCreateInfo;
-import org.lwjgl.vulkan.VkInstance;
-import org.lwjgl.vulkan.VkInstanceCreateInfo;
-import org.lwjgl.vulkan.VkMemoryAllocateInfo;
-import org.lwjgl.vulkan.VkMemoryRequirements;
-import org.lwjgl.vulkan.VkPhysicalDevice;
-import org.lwjgl.vulkan.VkPhysicalDeviceMemoryProperties;
-import org.lwjgl.vulkan.VkPhysicalDeviceProperties;
-import org.lwjgl.vulkan.VkPipelineLayoutCreateInfo;
-import org.lwjgl.vulkan.VkPipelineShaderStageCreateInfo;
-import org.lwjgl.vulkan.VkPushConstantRange;
-import org.lwjgl.vulkan.VkQueue;
-import org.lwjgl.vulkan.VkQueueFamilyProperties;
-import org.lwjgl.vulkan.VkShaderModuleCreateInfo;
-import org.lwjgl.vulkan.VkSubmitInfo;
-import org.lwjgl.vulkan.VkWriteDescriptorSet;
-
-import org.lwjgl.vulkan.EXTShaderAtomicFloat;
-import org.lwjgl.vulkan.EXTShaderAtomicFloat2;
-import org.lwjgl.vulkan.VkExtensionProperties;
-import org.lwjgl.vulkan.VkPhysicalDeviceFeatures;
-import org.lwjgl.vulkan.VkPhysicalDeviceFeatures2;
-import org.lwjgl.vulkan.VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT;
-import org.lwjgl.vulkan.VkPhysicalDeviceShaderAtomicFloatFeaturesEXT;
-import org.lwjgl.vulkan.VkPhysicalDeviceProperties2;
-import org.lwjgl.vulkan.VkPhysicalDeviceVulkan11Properties;
-import org.lwjgl.vulkan.VkPhysicalDeviceVulkan12Features;
-import org.lwjgl.vulkan.VkPhysicalDeviceVulkan13Features;
-import org.lwjgl.vulkan.VkPhysicalDeviceVulkan13Properties;
-import org.lwjgl.vulkan.VkPipelineShaderStageRequiredSubgroupSizeCreateInfo;
 import dev.supirvast.vastir.lower.DeviceFeature;
 import dev.supirvast.vastir.spirv.Capability;
+import dev.supirvast.vulkan.ComputeSupport;
+import dev.supirvast.vulkan.VulkanDevice;
+import dev.supirvast.vulkan.VulkanInstance;
 
-import java.nio.ByteBuffer;
-import java.nio.IntBuffer;
-import java.nio.LongBuffer;
+import java.lang.foreign.MemorySegment;
+import java.util.ArrayList;
 import java.util.EnumSet;
+import java.util.List;
 import java.util.Set;
-
-import static org.lwjgl.vulkan.VK13.*;
 
 /**
  * A long-lived Vulkan compute context: the expensive-to-create objects (instance, device, queue, command
@@ -73,6 +21,16 @@ import static org.lwjgl.vulkan.VK13.*;
  * <p>Headless compute only; requires Vulkan 1.3 (to consume SPIR-V 1.6). Per-dispatch storage buffers are
  * still allocated and freed each call (persistent/ring buffers are a later, streaming-oriented step); the win
  * here is eliminating instance/device/pipeline rebuild, which dominates the cost.
+ *
+ * <h2>Whose device</h2>
+ *
+ * <p>{@link #open()} makes a device of its own and closes it. {@link #on} runs on one somebody else made — a
+ * window's, so that what a simulation computes and what a renderer draws can be the same buffer, which two
+ * devices cannot share. A borrowed device must have been made with compute support
+ * ({@link VulkanDevice.Request#compute}), because that is what licenses the instructions a kernel emits, and it
+ * is left open when this closes. Either way a {@code VkQueue} must be externally synchronised: this context
+ * submits from its owning thread, so whoever shares the queue does so from that thread too, or under a lock the
+ * two agree on.
  *
  * <p><b>Concurrency.</b> {@link #dispatch} is synchronous (submit then wait). For overlapping work,
  * {@link #submitAsync} records + submits a dispatch against a fence <em>without</em> blocking and returns a
@@ -87,27 +45,18 @@ import static org.lwjgl.vulkan.VK13.*;
  */
 public final class GpuContext implements AutoCloseable {
 
-    static {
-        // LWJGL's VkInstance constructor eagerly builds its capability set by enumerating each physical
-        // device's extensions onto the calling thread's off-heap MemoryStack. VkExtensionProperties is 260
-        // bytes, so a device exposing ~250+ extensions (common on current GPU drivers) needs >64 KB and
-        // overflows LWJGL's default 64 KB stack with "OutOfMemoryError: Out of stack space." — which surfaces
-        // here as a build failure when the GPU tests run. Raise the per-thread stack well above that. This
-        // runs at class initialization, before any static method below materializes a MemoryStack.
-        Configuration.STACK_SIZE.set(512); // KiB per thread; default is 64
-    }
-
-    private static final int RESULT_BYTES = Integer.BYTES;
-
     /** Compute queues to request from the chosen family (capped by what it offers). More ⇒ more overlap. */
     private static final int MAX_QUEUES = 4;
 
-    private final VkInstance instance;
-    private final VkPhysicalDevice physical;
-    private final VkDevice device;
-    private final VkQueue[] queues;
+    private static final String APPLICATION_NAME = "supir-vast";
+
+    /** Null when the device is borrowed: whoever made the instance closes it. */
+    private final VulkanInstance instance;
+    private final VulkanDevice device;
+    private final boolean ownsDevice;
+    private final VkCompute vk;
+    private final List<MemorySegment> queues;
     private int nextQueue;              // round-robin cursor; owning-thread only, no sync needed
-    private final int queueFamily;
     private final long commandPool;
     private final Set<Capability> capabilities;
     private final long maxWorkgroupMemoryBytes;
@@ -118,23 +67,22 @@ public final class GpuContext implements AutoCloseable {
     private final int maxSubgroupSize;
     private final boolean subgroupSizeControl;
 
-    private GpuContext(VkInstance instance, VkPhysicalDevice physical, VkDevice device, VkQueue[] queues,
-            int queueFamily, long commandPool, Set<Capability> capabilities, long maxWorkgroupMemoryBytes,
-            Set<DeviceFeature> features, String deviceName, String deviceType, Supported supported) {
-        this.minSubgroupSize = supported.minSubgroupSize();
-        this.maxSubgroupSize = supported.maxSubgroupSize();
-        this.subgroupSizeControl = supported.subgroupSizeControl();
+    private GpuContext(VulkanInstance instance, VulkanDevice device, boolean ownsDevice, ComputeSupport support,
+            String deviceName, String deviceType) {
+        this.instance = instance;
+        this.device = device;
+        this.ownsDevice = ownsDevice;
+        this.vk = new VkCompute(device);
+        this.queues = device.queues();
+        this.commandPool = vk.createCommandPool(device.queueFamilyIndex());
+        this.capabilities = capabilitySet(support);
+        this.maxWorkgroupMemoryBytes = support.maxWorkgroupMemoryBytes();
+        this.features = featureSet(support);
         this.deviceName = deviceName;
         this.deviceType = deviceType;
-        this.instance = instance;
-        this.physical = physical;
-        this.device = device;
-        this.queues = queues;
-        this.queueFamily = queueFamily;
-        this.commandPool = commandPool;
-        this.capabilities = capabilities;
-        this.maxWorkgroupMemoryBytes = maxWorkgroupMemoryBytes;
-        this.features = features;
+        this.minSubgroupSize = support.minSubgroupSize();
+        this.maxSubgroupSize = support.maxSubgroupSize();
+        this.subgroupSizeControl = support.subgroupSizeControl();
     }
 
     /** The SPIR-V capabilities this device supports (and that have been enabled on the logical device). */
@@ -165,16 +113,12 @@ public final class GpuContext implements AutoCloseable {
      *                               for one GPU is not answered by running on the CPU instead
      */
     public static boolean isAvailable() {
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkInstance instance = createInstance(stack);
-            try {
-                return pickComputeDevice(instance, stack) != null;
-            } finally {
-                vkDestroyInstance(instance, null);
-            }
+        try (VulkanInstance probe = new VulkanInstance(APPLICATION_NAME, List.of())) {
+            return pickComputeDevice(probe) != null;
         } catch (NoSuchDevice unmatched) {
             throw unmatched;
-        } catch (RuntimeException e) {
+        } catch (RuntimeException | LinkageError e) {
+            // No loader, no driver, or an instance that will not make: this machine cannot, which is the answer.
             return false;
         }
     }
@@ -201,26 +145,47 @@ public final class GpuContext implements AutoCloseable {
 
     /** Creates the resident context (instance, device, queue, command pool). Caller must {@link #close()} it. */
     public static GpuContext open() {
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkInstance instance = createInstance(stack);
-            VkPhysicalDevice physical = pickComputeDevice(instance, stack);
-            if (physical == null) {
-                vkDestroyInstance(instance, null);
+        VulkanInstance instance = new VulkanInstance(APPLICATION_NAME, List.of());
+        try {
+            VulkanInstance.DeviceInfo info = pickComputeDevice(instance);
+            if (info == null) {
                 throw new IllegalStateException("no Vulkan compute device available");
             }
-            int queueFamily = computeQueueFamily(physical, stack);
-            int queueCount = Math.min(MAX_QUEUES, familyQueueCount(physical, queueFamily, stack));
-            Supported supported = querySupported(physical, stack);
-            VkDevice device = createDevice(physical, queueFamily, queueCount, supported, stack);
-            VkQueue[] queues = deviceQueues(device, queueFamily, queueCount, stack);
-            long commandPool = createCommandPool(device, queueFamily, stack);
-            VkPhysicalDeviceProperties properties = VkPhysicalDeviceProperties.malloc(stack);
-            vkGetPhysicalDeviceProperties(physical, properties);
-            long workgroupMemory = Integer.toUnsignedLong(properties.limits().maxComputeSharedMemorySize());
-            return new GpuContext(instance, physical, device, queues, queueFamily, commandPool,
-                    capabilitySet(supported), workgroupMemory, featureSet(supported),
-                    properties.deviceNameString(), DeviceSelection.typeName(properties.deviceType()), supported);
+            ComputeSupport support = ComputeSupport.query(instance, info.physicalDevice());
+            int queueCount = Math.min(MAX_QUEUES, info.computeQueueCount());
+            VulkanDevice device = new VulkanDevice(instance.handle(), instance.selectionFor(info),
+                    VulkanDevice.Request.headlessCompute(support, queueCount));
+            try {
+                return new GpuContext(instance, device, true, support, info.name(),
+                        DeviceSelection.typeName(info.type()));
+            } catch (RuntimeException | Error e) {
+                device.close();
+                throw e;
+            }
+        } catch (RuntimeException | Error e) {
+            instance.close();
+            throw e;
         }
+    }
+
+    /**
+     * A context on a device somebody else made, so that what it computes lives where they draw.
+     *
+     * <p>The device must have been made with compute support, and exactly that support is what this context
+     * reports and may use. It is left open by {@link #close()}, and so is {@code instance}: close the context
+     * first, then the device and the instance, as they were made.
+     *
+     * @param instance the instance {@code device} was made from; asked what the device is called and what kind
+     * @throws IllegalArgumentException if the device was made for drawing alone
+     */
+    public static GpuContext on(VulkanInstance instance, VulkanDevice device) {
+        ComputeSupport support = device.computeSupport().orElseThrow(() -> new IllegalArgumentException(
+                "the device was made without compute support, so it is not licensed for the instructions a "
+                        + "kernel emits; make it with VulkanDevice.Request.presentAndCompute"));
+        VulkanInstance.DeviceInfo info = instance.deviceInfos().stream()
+                .filter(d -> d.physicalDevice().equals(device.physicalDevice())).findFirst()
+                .orElseThrow(() -> new IllegalArgumentException("the device is not on that instance"));
+        return new GpuContext(null, device, false, support, info.name(), DeviceSelection.typeName(info.type()));
     }
 
     /**
@@ -259,18 +224,15 @@ public final class GpuContext implements AutoCloseable {
                     + "workgroup of " + workgroupSize + " on " + deviceName + " (it offers " + minSubgroupSize
                     + ".." + maxSubgroupSize + (subgroupSizeControl ? "" : ", without size control") + ")");
         }
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            long shaderModule = createShaderModule(device, spirv, stack);
-            long setLayout = createSetLayout(device, bindingCount, stack);
-            long pipelineLayout = createPipelineLayout(device, setLayout, stack);
-            long pipeline = createComputePipeline(device, pipelineLayout, shaderModule, entryPoint, subgroupSize,
-                    stack);
-            // The pipeline/layouts are immutable and safe to share across concurrent dispatches; the
-            // mutable binding state (the descriptor set) is allocated PER submission instead, so one
-            // pipeline can back several in-flight dispatches at once (see submitAsync).
-            return new ResidentKernel(device, shaderModule, setLayout, pipelineLayout, pipeline, bindingCount,
-                    workgroupSize);
-        }
+        long shaderModule = vk.createShaderModule(spirv);
+        long setLayout = vk.createSetLayout(bindingCount);
+        long pipelineLayout = vk.createPipelineLayout(setLayout);
+        long pipeline = vk.createComputePipeline(pipelineLayout, shaderModule, entryPoint, subgroupSize);
+        // The pipeline/layouts are immutable and safe to share across concurrent dispatches; the
+        // mutable binding state (the descriptor set) is allocated PER submission instead, so one
+        // pipeline can back several in-flight dispatches at once (see submitAsync).
+        return new ResidentKernel(vk, shaderModule, setLayout, pipelineLayout, pipeline, bindingCount,
+                workgroupSize);
     }
 
     /**
@@ -299,29 +261,26 @@ public final class GpuContext implements AutoCloseable {
         long[] bufferHandles = new long[n];
         long[] memoryHandles = new long[n];
         int[] lengths = new int[n];
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            for (int i = 0; i < n; i++) {
-                long size = Math.max(RESULT_BYTES, (long) buffers[i].length * Integer.BYTES);
-                bufferHandles[i] = createBuffer(device, size, stack);
-                memoryHandles[i] = allocateAndBind(physical, device, bufferHandles[i], stack);
-                writeInts(device, memoryHandles[i], buffers[i]);
-                lengths[i] = buffers[i].length;
-            }
-            // A fresh descriptor set PER submission (from a per-submission pool) — the mutable binding
-            // state that must be independent for concurrent dispatches. Freed with its pool in await().
-            long descriptorPool = createDescriptorPool(device, kernel.bindingCount, stack);
-            long descriptorSet = allocateDescriptorSet(device, descriptorPool, kernel.setLayout, stack);
-            bindBuffers(device, descriptorSet, bufferHandles, stack);
-
-            VkCommandBuffer cmd = recordDispatch(device, commandPool, kernel.pipeline, kernel.pipelineLayout,
-                    descriptorSet, kernel, invocations, stack);
-            long fence = createFence(device, stack);
-            VkSubmitInfo submit = VkSubmitInfo.calloc(stack)
-                    .sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
-                    .pCommandBuffers(stack.pointers(cmd));
-            check(vkQueueSubmit(nextQueue(), submit, fence), "vkQueueSubmit");
-            return new Submission(cmd, fence, descriptorPool, bufferHandles, memoryHandles, lengths);
+        for (int i = 0; i < n; i++) {
+            long size = Math.max(Integer.BYTES, (long) buffers[i].length * Integer.BYTES);
+            bufferHandles[i] = vk.createBuffer(size, VkCompute.BUFFER_USAGE_STORAGE);
+            memoryHandles[i] = vk.allocateHostVisible(bufferHandles[i]);
+            vk.writeInts(memoryHandles[i], buffers[i]);
+            lengths[i] = buffers[i].length;
         }
+        // A fresh descriptor set PER submission (from a per-submission pool) — the mutable binding
+        // state that must be independent for concurrent dispatches. Freed with its pool in await().
+        long descriptorPool = vk.createDescriptorPool(kernel.bindingCount, 1);
+        long descriptorSet = vk.allocateDescriptorSet(descriptorPool, kernel.setLayout);
+        vk.bindBuffers(descriptorSet, bufferHandles);
+
+        MemorySegment cmd = vk.beginCommandBuffer(commandPool, VkCompute.COMMAND_BUFFER_ONE_TIME_SUBMIT);
+        vk.recordDispatch(cmd, kernel.pipeline, kernel.pipelineLayout, descriptorSet, invocations,
+                kernel.groupsFor(invocations));
+        vk.endCommandBuffer(cmd);
+        long fence = vk.createFence();
+        vk.submit(nextQueue(), cmd, fence);
+        return new Submission(cmd, fence, descriptorPool, bufferHandles, memoryHandles, lengths);
     }
 
     /**
@@ -333,30 +292,27 @@ public final class GpuContext implements AutoCloseable {
         if (submission.awaited) {
             throw new IllegalStateException("submission already awaited");
         }
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            check(vkWaitForFences(device, stack.longs(submission.fence), true, Long.MAX_VALUE),
-                    "vkWaitForFences");
-        }
+        vk.waitFence(submission.fence);
         int n = submission.bufferHandles.length;
         int[][] results = new int[n][];
         for (int i = 0; i < n; i++) {
-            results[i] = readInts(device, submission.memoryHandles[i], submission.bufferLengths[i]);
+            results[i] = vk.readInts(submission.memoryHandles[i], submission.bufferLengths[i]);
         }
-        vkDestroyFence(device, submission.fence, null);
-        vkFreeCommandBuffers(device, commandPool, submission.cmd);
-        vkDestroyDescriptorPool(device, submission.descriptorPool, null);
+        vk.destroyFence(submission.fence);
+        vk.freeCommandBuffer(commandPool, submission.cmd);
+        vk.destroyDescriptorPool(submission.descriptorPool);
         for (int i = 0; i < n; i++) {
-            vkFreeMemory(device, submission.memoryHandles[i], null);
-            vkDestroyBuffer(device, submission.bufferHandles[i], null);
+            vk.freeMemory(submission.memoryHandles[i]);
+            vk.destroyBuffer(submission.bufferHandles[i]);
         }
         submission.awaited = true;
         return results;
     }
 
     /** Round-robins the compute queues so consecutive submissions can execute on different queues. */
-    private VkQueue nextQueue() {
-        VkQueue q = queues[nextQueue];
-        nextQueue = (nextQueue + 1) % queues.length;
+    private MemorySegment nextQueue() {
+        MemorySegment q = queues.get(nextQueue);
+        nextQueue = (nextQueue + 1) % queues.size();
         return q;
     }
 
@@ -377,7 +333,7 @@ public final class GpuContext implements AutoCloseable {
      * A submitted resident command buffer and what to free once its fence signals — both null/0 for a run of a
      * {@link RecordedSequence}, which owns them itself.
      */
-    private record Pending(VkCommandBuffer cmd, long fence, long descriptorPool) {}
+    private record Pending(MemorySegment cmd, long fence, long descriptorPool) {}
 
     /**
      * A storage buffer in device-local memory that outlives dispatches. Owning-thread only, like the rest of
@@ -407,8 +363,8 @@ public final class GpuContext implements AutoCloseable {
         public void close() {
             if (!closed) {
                 owner.finish();
-                vkDestroyBuffer(owner.device, buffer, null);
-                vkFreeMemory(owner.device, memory, null);
+                owner.vk.destroyBuffer(buffer);
+                owner.vk.freeMemory(memory);
                 closed = true;
             }
         }
@@ -426,15 +382,12 @@ public final class GpuContext implements AutoCloseable {
         if (words < 1) {
             throw new IllegalArgumentException("a device buffer needs at least one word, got " + words);
         }
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            long buffer = createBuffer(device, (long) words * Integer.BYTES,
-                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
-                            | VK_BUFFER_USAGE_TRANSFER_DST_BIT, stack);
-            // Device-local where the implementation has it for this buffer; any allowed type otherwise, which
-            // on an integrated GPU is the same memory anyway.
-            Allocation allocation = allocate(physical, device, buffer, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, stack);
-            return new DeviceBuffer(this, buffer, allocation.memory(), words);
-        }
+        long buffer = vk.createBuffer((long) words * Integer.BYTES, VkCompute.BUFFER_USAGE_STORAGE
+                | VkCompute.BUFFER_USAGE_TRANSFER_SRC | VkCompute.BUFFER_USAGE_TRANSFER_DST);
+        // Device-local where the implementation has it for this buffer; any allowed type otherwise, which
+        // on an integrated GPU is the same memory anyway.
+        VkCompute.Allocation allocation = vk.allocate(buffer, VkCompute.MEMORY_DEVICE_LOCAL, 0);
+        return new DeviceBuffer(this, buffer, allocation.memory(), words);
     }
 
     /** Replaces the start of {@code target} with {@code data}, through a staging buffer. Waits for the copy. */
@@ -446,21 +399,19 @@ public final class GpuContext implements AutoCloseable {
             return;
         }
         long size = (long) data.length * Integer.BYTES;
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            long staging = createBuffer(device, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, stack);
-            Allocation memory = allocate(physical, device, staging, 0,
-                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stack);
-            try {
-                writeInts(device, memory.memory(), data);
-                VkCommandBuffer cmd = beginOneShot(stack);
-                residentBarrier(cmd, stack);
-                vkCmdCopyBuffer(cmd, staging, target.handle(), VkBufferCopy.calloc(1, stack).size(size));
-                check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
-                submitResidentAndWait(cmd, stack);
-            } finally {
-                vkDestroyBuffer(device, staging, null);
-                vkFreeMemory(device, memory.memory(), null);
-            }
+        long staging = vk.createBuffer(size, VkCompute.BUFFER_USAGE_TRANSFER_SRC);
+        VkCompute.Allocation memory = vk.allocate(staging, 0,
+                VkCompute.MEMORY_HOST_VISIBLE | VkCompute.MEMORY_HOST_COHERENT);
+        try {
+            vk.writeInts(memory.memory(), data);
+            MemorySegment cmd = vk.beginCommandBuffer(commandPool, VkCompute.COMMAND_BUFFER_ONE_TIME_SUBMIT);
+            vk.residentBarrier(cmd);
+            vk.recordCopy(cmd, staging, target.handle(), size);
+            vk.endCommandBuffer(cmd);
+            submitResidentAndWait(cmd);
+        } finally {
+            vk.destroyBuffer(staging);
+            vk.freeMemory(memory.memory());
         }
     }
 
@@ -477,29 +428,23 @@ public final class GpuContext implements AutoCloseable {
             return new int[0];
         }
         long size = (long) words * Integer.BYTES;
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            long staging = createBuffer(device, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, stack);
-            Allocation memory = allocate(physical, device, staging, VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
-                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, stack);
-            try {
-                VkCommandBuffer cmd = beginOneShot(stack);
-                residentBarrier(cmd, stack);
-                vkCmdCopyBuffer(cmd, source.handle(), staging, VkBufferCopy.calloc(1, stack).size(size));
-                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
-                        VkMemoryBarrier.calloc(1, stack).sType$Default()
-                                .srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT).dstAccessMask(VK_ACCESS_HOST_READ_BIT),
-                        null, null);
-                check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
-                submitResidentAndWait(cmd, stack);
-                if (!memory.coherent()) {
-                    check(vkInvalidateMappedMemoryRanges(device, VkMappedMemoryRange.calloc(1, stack).sType$Default()
-                            .memory(memory.memory()).offset(0).size(VK_WHOLE_SIZE)), "vkInvalidateMappedMemoryRanges");
-                }
-                return readInts(device, memory.memory(), words);
-            } finally {
-                vkDestroyBuffer(device, staging, null);
-                vkFreeMemory(device, memory.memory(), null);
+        long staging = vk.createBuffer(size, VkCompute.BUFFER_USAGE_TRANSFER_DST);
+        VkCompute.Allocation memory = vk.allocate(staging, VkCompute.MEMORY_HOST_CACHED,
+                VkCompute.MEMORY_HOST_VISIBLE);
+        try {
+            MemorySegment cmd = vk.beginCommandBuffer(commandPool, VkCompute.COMMAND_BUFFER_ONE_TIME_SUBMIT);
+            vk.residentBarrier(cmd);
+            vk.recordCopy(cmd, source.handle(), staging, size);
+            vk.transferToHostBarrier(cmd);
+            vk.endCommandBuffer(cmd);
+            submitResidentAndWait(cmd);
+            if (!memory.coherent()) {
+                vk.invalidate(memory.memory());
             }
+            return vk.readInts(memory.memory(), words);
+        } finally {
+            vk.destroyBuffer(staging);
+            vk.freeMemory(memory.memory());
         }
     }
 
@@ -516,29 +461,23 @@ public final class GpuContext implements AutoCloseable {
         if (pending.size() >= MAX_PENDING) {
             retire(pending.removeFirst(), true);
         }
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            long[] handles = new long[buffers.length];
-            for (int i = 0; i < buffers.length; i++) {
-                handles[i] = buffers[i].handle();
-            }
-            long descriptorPool = createDescriptorPool(device, kernel.bindingCount, stack);
-            long descriptorSet = allocateDescriptorSet(device, descriptorPool, kernel.setLayout, stack);
-            bindBuffers(device, descriptorSet, handles, stack);
-
-            VkCommandBuffer cmd = beginOneShot(stack);
-            residentBarrier(cmd, stack);
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipelineLayout, 0,
-                    stack.longs(descriptorSet), null);
-            vkCmdPushConstants(cmd, kernel.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, stack.ints(invocations));
-            vkCmdDispatch(cmd, kernel.groupsFor(invocations), 1, 1);
-            check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
-
-            long fence = createFence(device, stack);
-            check(vkQueueSubmit(queues[0], VkSubmitInfo.calloc(stack).sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
-                    .pCommandBuffers(stack.pointers(cmd)), fence), "vkQueueSubmit");
-            pending.addLast(new Pending(cmd, fence, descriptorPool));
+        long[] handles = new long[buffers.length];
+        for (int i = 0; i < buffers.length; i++) {
+            handles[i] = buffers[i].handle();
         }
+        long descriptorPool = vk.createDescriptorPool(kernel.bindingCount, 1);
+        long descriptorSet = vk.allocateDescriptorSet(descriptorPool, kernel.setLayout);
+        vk.bindBuffers(descriptorSet, handles);
+
+        MemorySegment cmd = vk.beginCommandBuffer(commandPool, VkCompute.COMMAND_BUFFER_ONE_TIME_SUBMIT);
+        vk.residentBarrier(cmd);
+        vk.recordDispatch(cmd, kernel.pipeline, kernel.pipelineLayout, descriptorSet, invocations,
+                kernel.groupsFor(invocations));
+        vk.endCommandBuffer(cmd);
+
+        long fence = vk.createFence();
+        vk.submit(queues.get(0), cmd, fence);
+        pending.addLast(new Pending(cmd, fence, descriptorPool));
         reclaim();
     }
 
@@ -563,47 +502,34 @@ public final class GpuContext implements AutoCloseable {
      * <p>The buffers and pipelines are referenced, not owned: they must outlive the sequence, and a sequence
      * must not be submitted after any of them is closed.
      */
-    public RecordedSequence record(java.util.List<Step> steps) {
+    public RecordedSequence record(List<Step> steps) {
         if (steps.isEmpty()) {
             throw new IllegalArgumentException("a sequence needs at least one dispatch");
         }
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            int descriptors = steps.stream().mapToInt(s -> s.kernel().bindingCount).sum();
-            long descriptorPool = createDescriptorPool(device, descriptors, steps.size(), stack);
-            long[] sets = new long[steps.size()];
-            for (int i = 0; i < sets.length; i++) {
-                Step step = steps.get(i);
-                sets[i] = allocateDescriptorSet(device, descriptorPool, step.kernel().setLayout, stack);
-                long[] handles = new long[step.buffers().length];
-                for (int b = 0; b < handles.length; b++) {
-                    handles[b] = step.buffers()[b].handle();
-                }
-                bindBuffers(device, sets[i], handles, stack);
+        int descriptors = steps.stream().mapToInt(s -> s.kernel().bindingCount).sum();
+        long descriptorPool = vk.createDescriptorPool(descriptors, steps.size());
+        long[] sets = new long[steps.size()];
+        for (int i = 0; i < sets.length; i++) {
+            Step step = steps.get(i);
+            sets[i] = vk.allocateDescriptorSet(descriptorPool, step.kernel().setLayout);
+            long[] handles = new long[step.buffers().length];
+            for (int b = 0; b < handles.length; b++) {
+                handles[b] = step.buffers()[b].handle();
             }
-
-            PointerBuffer pCmd = stack.mallocPointer(1);
-            check(vkAllocateCommandBuffers(device, VkCommandBufferAllocateInfo.calloc(stack)
-                    .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO).commandPool(commandPool)
-                    .level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1), pCmd), "vkAllocateCommandBuffers");
-            VkCommandBuffer cmd = new VkCommandBuffer(pCmd.get(0), device);
-            // Simultaneous use: a run may be submitted again while the last one is still executing. The
-            // descriptor sets are only read, so the runs can share them; the opening barrier orders them.
-            check(vkBeginCommandBuffer(cmd, VkCommandBufferBeginInfo.calloc(stack)
-                    .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
-                    .flags(VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT)), "vkBeginCommandBuffer");
-            for (int i = 0; i < sets.length; i++) {
-                Step step = steps.get(i);
-                residentBarrier(cmd, stack);
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, step.kernel().pipeline);
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, step.kernel().pipelineLayout, 0,
-                        stack.longs(sets[i]), null);
-                vkCmdPushConstants(cmd, step.kernel().pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                        stack.ints(step.invocations()));
-                vkCmdDispatch(cmd, step.kernel().groupsFor(step.invocations()), 1, 1);
-            }
-            check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
-            return new RecordedSequence(this, cmd, descriptorPool, steps.size());
+            vk.bindBuffers(sets[i], handles);
         }
+
+        // Simultaneous use: a run may be submitted again while the last one is still executing. The
+        // descriptor sets are only read, so the runs can share them; the opening barrier orders them.
+        MemorySegment cmd = vk.beginCommandBuffer(commandPool, VkCompute.COMMAND_BUFFER_SIMULTANEOUS_USE);
+        for (int i = 0; i < sets.length; i++) {
+            Step step = steps.get(i);
+            vk.residentBarrier(cmd);
+            vk.recordDispatch(cmd, step.kernel().pipeline, step.kernel().pipelineLayout, sets[i],
+                    step.invocations(), step.kernel().groupsFor(step.invocations()));
+        }
+        vk.endCommandBuffer(cmd);
+        return new RecordedSequence(this, cmd, descriptorPool, steps.size());
     }
 
     /**
@@ -617,12 +543,9 @@ public final class GpuContext implements AutoCloseable {
         if (pending.size() >= MAX_PENDING) {
             retire(pending.removeFirst(), true);
         }
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            long fence = createFence(device, stack);
-            check(vkQueueSubmit(queues[0], VkSubmitInfo.calloc(stack).sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
-                    .pCommandBuffers(stack.pointers(sequence.cmd)), fence), "vkQueueSubmit");
-            pending.addLast(new Pending(null, fence, VK_NULL_HANDLE));   // the sequence keeps its own
-        }
+        long fence = vk.createFence();
+        vk.submit(queues.get(0), sequence.cmd, fence);
+        pending.addLast(new Pending(null, fence, 0L));   // the sequence keeps its own
         reclaim();
     }
 
@@ -633,12 +556,12 @@ public final class GpuContext implements AutoCloseable {
      */
     public static final class RecordedSequence implements AutoCloseable {
         private final GpuContext context;
-        private final VkCommandBuffer cmd;
+        private final MemorySegment cmd;
         private final long descriptorPool;
         private final int dispatches;
         private boolean closed;
 
-        private RecordedSequence(GpuContext context, VkCommandBuffer cmd, long descriptorPool, int dispatches) {
+        private RecordedSequence(GpuContext context, MemorySegment cmd, long descriptorPool, int dispatches) {
             this.context = context;
             this.cmd = cmd;
             this.descriptorPool = descriptorPool;
@@ -658,8 +581,8 @@ public final class GpuContext implements AutoCloseable {
             }
             closed = true;
             context.finish();
-            vkFreeCommandBuffers(context.device, context.commandPool, cmd);
-            vkDestroyDescriptorPool(context.device, descriptorPool, null);
+            context.vk.freeCommandBuffer(context.commandPool, cmd);
+            context.vk.destroyDescriptorPool(descriptorPool);
         }
     }
 
@@ -672,66 +595,44 @@ public final class GpuContext implements AutoCloseable {
 
     /** Frees the resident work that has already finished, oldest first, without waiting. */
     private void reclaim() {
-        while (!pending.isEmpty() && vkGetFenceStatus(device, pending.peekFirst().fence()) == VK_SUCCESS) {
+        while (!pending.isEmpty() && vk.fenceSignaled(pending.peekFirst().fence())) {
             retire(pending.removeFirst(), false);
         }
     }
 
     private void retire(Pending work, boolean wait) {
         if (wait) {
-            try (MemoryStack stack = MemoryStack.stackPush()) {
-                check(vkWaitForFences(device, stack.longs(work.fence()), true, Long.MAX_VALUE), "vkWaitForFences");
-            }
+            vk.waitFence(work.fence());
         }
-        vkDestroyFence(device, work.fence(), null);
+        vk.destroyFence(work.fence());
         if (work.cmd() != null) {   // a recorded sequence's run leaves its command buffer and sets to it
-            vkFreeCommandBuffers(device, commandPool, work.cmd());
-            vkDestroyDescriptorPool(device, work.descriptorPool(), null);
+            vk.freeCommandBuffer(commandPool, work.cmd());
+            vk.destroyDescriptorPool(work.descriptorPool());
         }
-    }
-
-    private VkCommandBuffer beginOneShot(MemoryStack stack) {
-        PointerBuffer pCmd = stack.mallocPointer(1);
-        check(vkAllocateCommandBuffers(device, VkCommandBufferAllocateInfo.calloc(stack)
-                .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO).commandPool(commandPool)
-                .level(VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1), pCmd), "vkAllocateCommandBuffers");
-        VkCommandBuffer cmd = new VkCommandBuffer(pCmd.get(0), device);
-        check(vkBeginCommandBuffer(cmd, VkCommandBufferBeginInfo.calloc(stack)
-                .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
-                .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)), "vkBeginCommandBuffer");
-        return cmd;
     }
 
     /** Submits a copy on the resident queue — ordered after every pending dispatch — and waits for it. */
-    private void submitResidentAndWait(VkCommandBuffer cmd, MemoryStack stack) {
-        long fence = createFence(device, stack);
-        check(vkQueueSubmit(queues[0], VkSubmitInfo.calloc(stack).sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
-                .pCommandBuffers(stack.pointers(cmd)), fence), "vkQueueSubmit");
-        check(vkWaitForFences(device, stack.longs(fence), true, Long.MAX_VALUE), "vkWaitForFences");
-        vkDestroyFence(device, fence, null);
-        vkFreeCommandBuffers(device, commandPool, cmd);
+    private void submitResidentAndWait(MemorySegment cmd) {
+        long fence = vk.createFence();
+        vk.submit(queues.get(0), cmd, fence);
+        vk.waitFence(fence);
+        vk.destroyFence(fence);
+        vk.freeCommandBuffer(commandPool, cmd);
         reclaim();   // the queue is in order, so everything submitted before this copy has finished too
     }
 
     /**
-     * Every earlier shader or transfer write, made visible to every later shader or transfer access. Coarse on
-     * purpose: one barrier per command buffer is negligible against a dispatch, and a finer one would have to
-     * know which buffers each dispatch touches — which is the kind of bookkeeping that is wrong once.
+     * Waits for this context's work and releases what it made. A borrowed device, and the instance it came
+     * from, are left as they were.
      */
-    private static void residentBarrier(VkCommandBuffer cmd, MemoryStack stack) {
-        int stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
-        vkCmdPipelineBarrier(cmd, stages, stages, 0, VkMemoryBarrier.calloc(1, stack).sType$Default()
-                .srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT)
-                .dstAccessMask(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
-                        | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT), null, null);
-    }
-
     @Override
     public void close() {
         finish();
-        vkDestroyCommandPool(device, commandPool, null);
-        vkDestroyDevice(device, null);
-        vkDestroyInstance(instance, null);
+        vk.destroyCommandPool(commandPool);
+        if (ownsDevice) {
+            device.close();
+            instance.close();
+        }
     }
 
     /**
@@ -741,7 +642,7 @@ public final class GpuContext implements AutoCloseable {
      * allocate those per-submission sets.
      */
     public static final class ResidentKernel implements AutoCloseable {
-        private final VkDevice device;
+        private final VkCompute vk;
         private final long shaderModule;
         private final long setLayout;
         private final long pipelineLayout;
@@ -749,9 +650,9 @@ public final class GpuContext implements AutoCloseable {
         private final int bindingCount;
         private final int workgroupSize;
 
-        ResidentKernel(VkDevice device, long shaderModule, long setLayout, long pipelineLayout, long pipeline,
+        ResidentKernel(VkCompute vk, long shaderModule, long setLayout, long pipelineLayout, long pipeline,
                 int bindingCount, int workgroupSize) {
-            this.device = device;
+            this.vk = vk;
             this.shaderModule = shaderModule;
             this.setLayout = setLayout;
             this.pipelineLayout = pipelineLayout;
@@ -767,43 +668,24 @@ public final class GpuContext implements AutoCloseable {
 
         @Override
         public void close() {
-            vkDestroyPipeline(device, pipeline, null);
-            vkDestroyPipelineLayout(device, pipelineLayout, null);
-            vkDestroyDescriptorSetLayout(device, setLayout, null);
-            vkDestroyShaderModule(device, shaderModule, null);
+            vk.destroyPipeline(pipeline);
+            vk.destroyPipelineLayout(pipelineLayout);
+            vk.destroySetLayout(setLayout);
+            vk.destroyShaderModule(shaderModule);
         }
     }
 
-    // --- Vulkan setup helpers (host-platform compute, no surface/swapchain) ----------------------------
+    // --- device choice and what it supports ------------------------------------------------------------
 
-    private static VkInstance createInstance(MemoryStack stack) {
-        VkApplicationInfo app = VkApplicationInfo.calloc(stack)
-                .sType(VK_STRUCTURE_TYPE_APPLICATION_INFO)
-                .pApplicationName(stack.UTF8("supir-vast"))
-                .apiVersion(VK_API_VERSION_1_3);
-        VkInstanceCreateInfo info = VkInstanceCreateInfo.calloc(stack)
-                .sType(VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO)
-                .pApplicationInfo(app);
-        PointerBuffer pInstance = stack.mallocPointer(1);
-        check(vkCreateInstance(info, null, pInstance), "vkCreateInstance");
-        return new VkInstance(pInstance.get(0), info);
-    }
-
-    private static VkPhysicalDevice pickComputeDevice(VkInstance instance, MemoryStack stack) {
-        IntBuffer count = stack.mallocInt(1);
-        check(vkEnumeratePhysicalDevices(instance, count, null), "vkEnumeratePhysicalDevices");
-        if (count.get(0) == 0) {
+    /** The device to run on, by the one policy ({@link DeviceSelection}); null when there is none to run on. */
+    private static VulkanInstance.DeviceInfo pickComputeDevice(VulkanInstance instance) {
+        List<VulkanInstance.DeviceInfo> infos = instance.deviceInfos();
+        if (infos.isEmpty()) {
             return null;
         }
-        PointerBuffer devices = stack.mallocPointer(count.get(0));
-        check(vkEnumeratePhysicalDevices(instance, count, devices), "vkEnumeratePhysicalDevices");
-        java.util.List<DeviceSelection.Candidate> candidates = new java.util.ArrayList<>();
-        VkPhysicalDeviceProperties properties = VkPhysicalDeviceProperties.malloc(stack);
-        for (int i = 0; i < devices.capacity(); i++) {
-            VkPhysicalDevice candidate = new VkPhysicalDevice(devices.get(i), instance);
-            vkGetPhysicalDeviceProperties(candidate, properties);
-            candidates.add(new DeviceSelection.Candidate(i, properties.deviceNameString(), properties.deviceType(),
-                    findComputeQueueFamily(candidate, stack) >= 0));
+        List<DeviceSelection.Candidate> candidates = new ArrayList<>();
+        for (VulkanInstance.DeviceInfo info : infos) {
+            candidates.add(new DeviceSelection.Candidate(info.index(), info.name(), info.type(), info.compute()));
         }
         int chosen;
         try {
@@ -811,7 +693,7 @@ public final class GpuContext implements AutoCloseable {
         } catch (IllegalStateException unmatched) {
             throw new NoSuchDevice(unmatched.getMessage());
         }
-        return chosen < 0 ? null : new VkPhysicalDevice(devices.get(chosen), instance);
+        return chosen < 0 ? null : infos.get(chosen);
     }
 
     /** {@code -Dsupirvast.gpu} named a device that is not there; distinct so {@link #isAvailable} passes it on. */
@@ -821,152 +703,8 @@ public final class GpuContext implements AutoCloseable {
         }
     }
 
-    private static int computeQueueFamily(VkPhysicalDevice device, MemoryStack stack) {
-        int family = findComputeQueueFamily(device, stack);
-        if (family < 0) {
-            throw new IllegalStateException("device has no compute queue family");
-        }
-        return family;
-    }
-
-    /** How many queues the given family offers (≥ 1) — the ceiling on how much dispatch overlap we can get. */
-    private static int familyQueueCount(VkPhysicalDevice device, int family, MemoryStack stack) {
-        IntBuffer count = stack.mallocInt(1);
-        vkGetPhysicalDeviceQueueFamilyProperties(device, count, null);
-        VkQueueFamilyProperties.Buffer families = VkQueueFamilyProperties.malloc(count.get(0), stack);
-        vkGetPhysicalDeviceQueueFamilyProperties(device, count, families);
-        return families.get(family).queueCount();
-    }
-
-    private static int findComputeQueueFamily(VkPhysicalDevice device, MemoryStack stack) {
-        IntBuffer count = stack.mallocInt(1);
-        vkGetPhysicalDeviceQueueFamilyProperties(device, count, null);
-        VkQueueFamilyProperties.Buffer families = VkQueueFamilyProperties.malloc(count.get(0), stack);
-        vkGetPhysicalDeviceQueueFamilyProperties(device, count, families);
-        for (int i = 0; i < families.capacity(); i++) {
-            if ((families.get(i).queueFlags() & VK_QUEUE_COMPUTE_BIT) != 0) {
-                return i;
-            }
-        }
-        return -1;
-    }
-
-    private static VkDevice createDevice(VkPhysicalDevice physical, int queueFamily, int queueCount,
-            Supported supported, MemoryStack stack) {
-        float[] priorities = new float[queueCount];
-        java.util.Arrays.fill(priorities, 1.0f);
-        // pQueuePriorities(FloatBuffer) also sets queueCount to the buffer's remaining — so this requests
-        // `queueCount` queues from the family (round-robined by submitAsync for overlap).
-        VkDeviceQueueCreateInfo.Buffer queues = VkDeviceQueueCreateInfo.calloc(1, stack)
-                .sType(VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO)
-                .queueFamilyIndex(queueFamily)
-                .pQueuePriorities(stack.floats(priorities));
-        // Enable exactly the supported features we may emit capabilities for (so emitting OpCapability Int64
-        // etc. is actually licensed). Uses the Features2 pNext chain; pEnabledFeatures must then be null.
-        VkPhysicalDeviceVulkan12Features features12 = VkPhysicalDeviceVulkan12Features.calloc(stack)
-                .sType$Default().shaderInt8(supported.int8());
-        // Size control and full subgroups are what let a kernel's subgroups be the ones it was written for.
-        long chain = VkPhysicalDeviceVulkan13Features.calloc(stack).sType$Default().pNext(features12.address())
-                .subgroupSizeControl(supported.subgroupSizeControl())
-                .computeFullSubgroups(supported.subgroupSizeControl()).address();
-        // The float-atomic extensions are enabled only when one of their features is, since enabling a feature
-        // licenses what the lowering will then emit. float2 extends float, so min/max implies the first.
-        java.util.List<String> extensions = new java.util.ArrayList<>();
-        boolean float2 = supported.floatAtomicMinMax() || supported.sharedFloatAtomicMinMax();
-        if (float2 || supported.floatAtomicAdd() || supported.sharedFloatAtomics() || supported.sharedFloatAtomicAdd()) {
-            extensions.add(EXTShaderAtomicFloat.VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
-            chain = VkPhysicalDeviceShaderAtomicFloatFeaturesEXT.calloc(stack).sType$Default().pNext(chain)
-                    .shaderBufferFloat32AtomicAdd(supported.floatAtomicAdd())
-                    .shaderSharedFloat32Atomics(supported.sharedFloatAtomics())
-                    .shaderSharedFloat32AtomicAdd(supported.sharedFloatAtomicAdd()).address();
-        }
-        if (float2) {
-            extensions.add(EXTShaderAtomicFloat2.VK_EXT_SHADER_ATOMIC_FLOAT_2_EXTENSION_NAME);
-            chain = VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT.calloc(stack).sType$Default().pNext(chain)
-                    .shaderBufferFloat32AtomicMinMax(supported.floatAtomicMinMax())
-                    .shaderSharedFloat32AtomicMinMax(supported.sharedFloatAtomicMinMax()).address();
-        }
-        VkPhysicalDeviceFeatures2 features2 = VkPhysicalDeviceFeatures2.calloc(stack)
-                .sType$Default().pNext(chain);
-        features2.features()
-                .shaderInt16(supported.int16())
-                .shaderInt64(supported.int64())
-                .shaderFloat64(supported.float64());
-        PointerBuffer extensionNames = stack.mallocPointer(extensions.size());
-        for (String extension : extensions) {
-            extensionNames.put(stack.UTF8(extension));
-        }
-        extensionNames.flip();
-        VkDeviceCreateInfo info = VkDeviceCreateInfo.calloc(stack)
-                .sType(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO)
-                .pNext(features2.address())
-                .pQueueCreateInfos(queues)
-                .ppEnabledExtensionNames(extensionNames);
-        PointerBuffer pDevice = stack.mallocPointer(1);
-        check(vkCreateDevice(physical, info, null, pDevice), "vkCreateDevice");
-        return new VkDevice(pDevice.get(0), physical, info);
-    }
-
-    /**
-     * What the physical device supports among the optional capabilities our lowering can emit.
-     * {@code floatAtomicAdd}/{@code floatAtomicMinMax} are the storage-buffer features; the {@code shared}
-     * ones license the same instructions on workgroup memory. {@code subgroupOperations} is the device's
-     * {@code VkSubgroupFeatureFlags} for compute (0 if compute has none); {@code subgroupSizeControl} is size
-     * control and full subgroups together, for the compute stage.
-     */
-    private record Supported(boolean int8, boolean int16, boolean int64, boolean float64,
-            boolean floatAtomicAdd, boolean floatAtomicMinMax,
-            boolean sharedFloatAtomics, boolean sharedFloatAtomicAdd, boolean sharedFloatAtomicMinMax,
-            int subgroupOperations, int minSubgroupSize, int maxSubgroupSize, boolean subgroupSizeControl) {}
-
-    private static Supported querySupported(VkPhysicalDevice physical, MemoryStack stack) {
-        Set<String> extensions = deviceExtensions(physical, stack);
-        boolean hasFloat = extensions.contains(EXTShaderAtomicFloat.VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
-        boolean hasFloat2 = hasFloat
-                && extensions.contains(EXTShaderAtomicFloat2.VK_EXT_SHADER_ATOMIC_FLOAT_2_EXTENSION_NAME);
-
-        VkPhysicalDeviceVulkan12Features features12 = VkPhysicalDeviceVulkan12Features.calloc(stack).sType$Default();
-        VkPhysicalDeviceVulkan13Features features13 = VkPhysicalDeviceVulkan13Features.calloc(stack).sType$Default()
-                .pNext(features12.address());
-        long chain = features13.address();
-        // A feature struct is chained only when its extension exists: querying one the driver does not know
-        // is harmless in practice and undefined on paper.
-        VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomicFloat = null;
-        if (hasFloat) {
-            atomicFloat = VkPhysicalDeviceShaderAtomicFloatFeaturesEXT.calloc(stack).sType$Default().pNext(chain);
-            chain = atomicFloat.address();
-        }
-        VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT atomicFloat2 = null;
-        if (hasFloat2) {
-            atomicFloat2 = VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT.calloc(stack).sType$Default().pNext(chain);
-            chain = atomicFloat2.address();
-        }
-        VkPhysicalDeviceFeatures2 features2 = VkPhysicalDeviceFeatures2.calloc(stack)
-                .sType$Default().pNext(chain);
-        vkGetPhysicalDeviceFeatures2(physical, features2);
-        VkPhysicalDeviceFeatures core = features2.features();
-
-        VkPhysicalDeviceVulkan11Properties properties11 = VkPhysicalDeviceVulkan11Properties.calloc(stack).sType$Default();
-        VkPhysicalDeviceVulkan13Properties properties13 = VkPhysicalDeviceVulkan13Properties.calloc(stack).sType$Default()
-                .pNext(properties11.address());
-        vkGetPhysicalDeviceProperties2(physical,
-                VkPhysicalDeviceProperties2.calloc(stack).sType$Default().pNext(properties13.address()));
-        boolean compute = (properties11.subgroupSupportedStages() & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
-        boolean sizeControl = features13.subgroupSizeControl() && features13.computeFullSubgroups()
-                && (properties13.requiredSubgroupSizeStages() & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
-
-        return new Supported(features12.shaderInt8(), core.shaderInt16(), core.shaderInt64(), core.shaderFloat64(),
-                atomicFloat != null && atomicFloat.shaderBufferFloat32AtomicAdd(),
-                atomicFloat2 != null && atomicFloat2.shaderBufferFloat32AtomicMinMax(),
-                atomicFloat != null && atomicFloat.shaderSharedFloat32Atomics(),
-                atomicFloat != null && atomicFloat.shaderSharedFloat32AtomicAdd(),
-                atomicFloat2 != null && atomicFloat2.shaderSharedFloat32AtomicMinMax(),
-                compute ? properties11.subgroupSupportedOperations() : 0,
-                properties13.minSubgroupSize(), properties13.maxSubgroupSize(), sizeControl);
-    }
-
     /** The device features no capability distinguishes, as the lowering's target names them. */
-    private static Set<DeviceFeature> featureSet(Supported s) {
+    private static Set<DeviceFeature> featureSet(ComputeSupport s) {
         EnumSet<DeviceFeature> features = EnumSet.noneOf(DeviceFeature.class);
         if (s.floatAtomicAdd()) {
             features.add(DeviceFeature.BUFFER_FLOAT32_ATOMIC_ADD);
@@ -986,21 +724,7 @@ public final class GpuContext implements AutoCloseable {
         return Set.copyOf(features);
     }
 
-    private static Set<String> deviceExtensions(VkPhysicalDevice physical, MemoryStack stack) {
-        IntBuffer count = stack.mallocInt(1);
-        check(vkEnumerateDeviceExtensionProperties(physical, (String) null, count, null),
-                "vkEnumerateDeviceExtensionProperties");
-        VkExtensionProperties.Buffer properties = VkExtensionProperties.malloc(count.get(0), stack);
-        check(vkEnumerateDeviceExtensionProperties(physical, (String) null, count, properties),
-                "vkEnumerateDeviceExtensionProperties");
-        Set<String> names = new java.util.HashSet<>();
-        for (int i = 0; i < properties.capacity(); i++) {
-            names.add(properties.get(i).extensionNameString());
-        }
-        return names;
-    }
-
-    private static Set<Capability> capabilitySet(Supported s) {
+    private static Set<Capability> capabilitySet(ComputeSupport s) {
         EnumSet<Capability> caps = EnumSet.of(Capability.Shader);
         if (s.int8()) {
             caps.add(Capability.Int8);
@@ -1016,18 +740,18 @@ public final class GpuContext implements AutoCloseable {
         }
         // Subgroup operations in compute, by kind; each capability is core Vulkan 1.1 once its bit is set.
         int ops = s.subgroupOperations();
-        if ((ops & VK_SUBGROUP_FEATURE_BASIC_BIT) != 0) {
+        if ((ops & ComputeSupport.SUBGROUP_BASIC) != 0) {
             caps.add(Capability.GroupNonUniform);
-            if ((ops & VK_SUBGROUP_FEATURE_VOTE_BIT) != 0) {
+            if ((ops & ComputeSupport.SUBGROUP_VOTE) != 0) {
                 caps.add(Capability.GroupNonUniformVote);
             }
-            if ((ops & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0) {
+            if ((ops & ComputeSupport.SUBGROUP_ARITHMETIC) != 0) {
                 caps.add(Capability.GroupNonUniformArithmetic);
             }
-            if ((ops & VK_SUBGROUP_FEATURE_SHUFFLE_BIT) != 0) {
+            if ((ops & ComputeSupport.SUBGROUP_SHUFFLE) != 0) {
                 caps.add(Capability.GroupNonUniformShuffle);
             }
-            if ((ops & VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT) != 0) {
+            if ((ops & ComputeSupport.SUBGROUP_SHUFFLE_RELATIVE) != 0) {
                 caps.add(Capability.GroupNonUniformShuffleRelative);
             }
         }
@@ -1039,264 +763,5 @@ public final class GpuContext implements AutoCloseable {
             caps.add(Capability.AtomicFloat32MinMaxEXT);
         }
         return Set.copyOf(caps);
-    }
-
-    private static VkQueue[] deviceQueues(VkDevice device, int queueFamily, int queueCount, MemoryStack stack) {
-        VkQueue[] queues = new VkQueue[queueCount];
-        PointerBuffer pQueue = stack.mallocPointer(1);
-        for (int i = 0; i < queueCount; i++) {
-            vkGetDeviceQueue(device, queueFamily, i, pQueue);
-            queues[i] = new VkQueue(pQueue.get(0), device);
-        }
-        return queues;
-    }
-
-    private static long createBuffer(VkDevice device, long sizeBytes, MemoryStack stack) {
-        return createBuffer(device, sizeBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, stack);
-    }
-
-    private static long createBuffer(VkDevice device, long sizeBytes, int usage, MemoryStack stack) {
-        VkBufferCreateInfo info = VkBufferCreateInfo.calloc(stack)
-                .sType(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO)
-                .size(sizeBytes)
-                .usage(usage)
-                .sharingMode(VK_SHARING_MODE_EXCLUSIVE);
-        LongBuffer pBuffer = stack.mallocLong(1);
-        check(vkCreateBuffer(device, info, null, pBuffer), "vkCreateBuffer");
-        return pBuffer.get(0);
-    }
-
-    private static long allocateAndBind(VkPhysicalDevice physical, VkDevice device, long buffer, MemoryStack stack) {
-        return allocate(physical, device, buffer, 0,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stack).memory();
-    }
-
-    /** Bound device memory, and whether host writes and reads of it need no flush or invalidate. */
-    private record Allocation(long memory, boolean coherent) {}
-
-    /**
-     * Allocates and binds memory for {@code buffer} from a type that has every {@code required} property,
-     * preferring one that also has every {@code preferred} property.
-     */
-    private static Allocation allocate(VkPhysicalDevice physical, VkDevice device, long buffer, int preferred,
-            int required, MemoryStack stack) {
-        VkMemoryRequirements requirements = VkMemoryRequirements.malloc(stack);
-        vkGetBufferMemoryRequirements(device, buffer, requirements);
-
-        VkPhysicalDeviceMemoryProperties memProps = VkPhysicalDeviceMemoryProperties.malloc(stack);
-        vkGetPhysicalDeviceMemoryProperties(physical, memProps);
-        int typeIndex = memoryType(memProps, requirements.memoryTypeBits(), required | preferred);
-        if (typeIndex < 0) {
-            typeIndex = memoryType(memProps, requirements.memoryTypeBits(), required);
-        }
-        if (typeIndex < 0) {
-            throw new IllegalStateException("no memory type with properties 0x" + Integer.toHexString(required)
-                    + " for the buffer");
-        }
-
-        VkMemoryAllocateInfo info = VkMemoryAllocateInfo.calloc(stack)
-                .sType(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO)
-                .allocationSize(requirements.size())
-                .memoryTypeIndex(typeIndex);
-        LongBuffer pMemory = stack.mallocLong(1);
-        check(vkAllocateMemory(device, info, null, pMemory), "vkAllocateMemory");
-        long memory = pMemory.get(0);
-        check(vkBindBufferMemory(device, buffer, memory, 0), "vkBindBufferMemory");
-        boolean coherent = (memProps.memoryTypes(typeIndex).propertyFlags() & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
-        return new Allocation(memory, coherent);
-    }
-
-    private static int memoryType(VkPhysicalDeviceMemoryProperties memProps, int allowedTypes, int properties) {
-        for (int i = 0; i < memProps.memoryTypeCount(); i++) {
-            boolean allowed = (allowedTypes & (1 << i)) != 0;
-            if (allowed && (memProps.memoryTypes(i).propertyFlags() & properties) == properties) {
-                return i;
-            }
-        }
-        return -1;
-    }
-
-    private static long createShaderModule(VkDevice device, byte[] spirv, MemoryStack stack) {
-        ByteBuffer code = MemoryUtil.memAlloc(spirv.length).put(spirv);
-        code.flip();
-        try {
-            VkShaderModuleCreateInfo info = VkShaderModuleCreateInfo.calloc(stack)
-                    .sType(VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO)
-                    .pCode(code);
-            LongBuffer pModule = stack.mallocLong(1);
-            check(vkCreateShaderModule(device, info, null, pModule), "vkCreateShaderModule");
-            return pModule.get(0);
-        } finally {
-            MemoryUtil.memFree(code);
-        }
-    }
-
-    private static long createSetLayout(VkDevice device, int bindingCount, MemoryStack stack) {
-        VkDescriptorSetLayoutBinding.Buffer bindings = VkDescriptorSetLayoutBinding.calloc(bindingCount, stack);
-        for (int i = 0; i < bindingCount; i++) {
-            bindings.get(i)
-                    .binding(i)
-                    .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
-                    .descriptorCount(1)
-                    .stageFlags(VK_SHADER_STAGE_COMPUTE_BIT);
-        }
-        VkDescriptorSetLayoutCreateInfo info = VkDescriptorSetLayoutCreateInfo.calloc(stack)
-                .sType(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO)
-                .pBindings(bindings);
-        LongBuffer pLayout = stack.mallocLong(1);
-        check(vkCreateDescriptorSetLayout(device, info, null, pLayout), "vkCreateDescriptorSetLayout");
-        return pLayout.get(0);
-    }
-
-    /** Set 0, and the 4-byte invocation count at push-constant offset 0 that every dispatch sets. */
-    private static long createPipelineLayout(VkDevice device, long setLayout, MemoryStack stack) {
-        VkPipelineLayoutCreateInfo info = VkPipelineLayoutCreateInfo.calloc(stack)
-                .sType(VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO)
-                .pSetLayouts(stack.longs(setLayout))
-                .pPushConstantRanges(VkPushConstantRange.calloc(1, stack)
-                        .stageFlags(VK_SHADER_STAGE_COMPUTE_BIT).offset(0).size(Integer.BYTES));
-        LongBuffer pLayout = stack.mallocLong(1);
-        check(vkCreatePipelineLayout(device, info, null, pLayout), "vkCreatePipelineLayout");
-        return pLayout.get(0);
-    }
-
-    /** @param subgroupSize full subgroups of exactly this many lanes, or 0 to leave it to the device */
-    private static long createComputePipeline(VkDevice device, long layout, long shaderModule, String entryPoint,
-            int subgroupSize, MemoryStack stack) {
-        VkPipelineShaderStageCreateInfo stage = VkPipelineShaderStageCreateInfo.calloc(stack)
-                .sType(VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO)
-                .stage(VK_SHADER_STAGE_COMPUTE_BIT)
-                .module(shaderModule)
-                .pName(stack.UTF8(entryPoint));
-        if (subgroupSize != 0) {
-            // Both halves matter: the size fixes which invocations share a subgroup, and full subgroups mean
-            // none of them is missing a lane — without which a reduction would quietly cover fewer values.
-            VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required =
-                    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo.calloc(stack).sType$Default();
-            // LWJGL 3.3.6 generates this field without a setter; it has the offset, so write it there.
-            MemoryUtil.memPutInt(required.address()
-                    + VkPipelineShaderStageRequiredSubgroupSizeCreateInfo.REQUIREDSUBGROUPSIZE, subgroupSize);
-            stage.flags(VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT).pNext(required.address());
-        }
-        VkComputePipelineCreateInfo.Buffer info = VkComputePipelineCreateInfo.calloc(1, stack)
-                .sType(VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO)
-                .stage(stage)
-                .layout(layout);
-        LongBuffer pPipeline = stack.mallocLong(1);
-        check(vkCreateComputePipelines(device, VK_NULL_HANDLE, info, null, pPipeline), "vkCreateComputePipelines");
-        return pPipeline.get(0);
-    }
-
-    private static long createDescriptorPool(VkDevice device, int descriptorCount, MemoryStack stack) {
-        return createDescriptorPool(device, descriptorCount, 1, stack);
-    }
-
-    private static long createDescriptorPool(VkDevice device, int descriptorCount, int sets, MemoryStack stack) {
-        VkDescriptorPoolSize.Buffer size = VkDescriptorPoolSize.calloc(1, stack)
-                .type(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
-                .descriptorCount(Math.max(1, descriptorCount));
-        VkDescriptorPoolCreateInfo info = VkDescriptorPoolCreateInfo.calloc(stack)
-                .sType(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO)
-                .maxSets(sets)
-                .pPoolSizes(size);
-        LongBuffer pPool = stack.mallocLong(1);
-        check(vkCreateDescriptorPool(device, info, null, pPool), "vkCreateDescriptorPool");
-        return pPool.get(0);
-    }
-
-    private static long allocateDescriptorSet(VkDevice device, long pool, long setLayout, MemoryStack stack) {
-        VkDescriptorSetAllocateInfo info = VkDescriptorSetAllocateInfo.calloc(stack)
-                .sType(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO)
-                .descriptorPool(pool)
-                .pSetLayouts(stack.longs(setLayout));
-        LongBuffer pSet = stack.mallocLong(1);
-        check(vkAllocateDescriptorSets(device, info, pSet), "vkAllocateDescriptorSets");
-        return pSet.get(0);
-    }
-
-    private static void bindBuffers(VkDevice device, long descriptorSet, long[] buffers, MemoryStack stack) {
-        VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(buffers.length, stack);
-        for (int i = 0; i < buffers.length; i++) {
-            VkDescriptorBufferInfo.Buffer info = VkDescriptorBufferInfo.calloc(1, stack)
-                    .buffer(buffers[i]).offset(0).range(VK_WHOLE_SIZE);
-            writes.get(i)
-                    .sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET)
-                    .dstSet(descriptorSet)
-                    .dstBinding(i)
-                    .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
-                    .descriptorCount(1)
-                    .pBufferInfo(info);
-        }
-        vkUpdateDescriptorSets(device, writes, null);
-    }
-
-    private static void writeInts(VkDevice device, long memory, int[] data) {
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            long size = Math.max(RESULT_BYTES, (long) data.length * Integer.BYTES);
-            PointerBuffer pData = stack.mallocPointer(1);
-            check(vkMapMemory(device, memory, 0, size, 0, pData), "vkMapMemory");
-            MemoryUtil.memByteBuffer(pData.get(0), (int) size).asIntBuffer().put(data);
-            vkUnmapMemory(device, memory);
-        }
-    }
-
-    private static int[] readInts(VkDevice device, long memory, int length) {
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            long size = Math.max(RESULT_BYTES, (long) length * Integer.BYTES);
-            PointerBuffer pData = stack.mallocPointer(1);
-            check(vkMapMemory(device, memory, 0, size, 0, pData), "vkMapMemory");
-            int[] out = new int[length];
-            MemoryUtil.memByteBuffer(pData.get(0), (int) size).asIntBuffer().get(out);
-            vkUnmapMemory(device, memory);
-            return out;
-        }
-    }
-
-    private static long createCommandPool(VkDevice device, int queueFamily, MemoryStack stack) {
-        VkCommandPoolCreateInfo info = VkCommandPoolCreateInfo.calloc(stack)
-                .sType(VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO)
-                .flags(VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT)
-                .queueFamilyIndex(queueFamily);
-        LongBuffer pPool = stack.mallocLong(1);
-        check(vkCreateCommandPool(device, info, null, pPool), "vkCreateCommandPool");
-        return pPool.get(0);
-    }
-
-    private static VkCommandBuffer recordDispatch(
-            VkDevice device, long commandPool, long pipeline, long pipelineLayout, long descriptorSet,
-            ResidentKernel kernel, int invocations, MemoryStack stack) {
-        VkCommandBufferAllocateInfo allocInfo = VkCommandBufferAllocateInfo.calloc(stack)
-                .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO)
-                .commandPool(commandPool)
-                .level(VK_COMMAND_BUFFER_LEVEL_PRIMARY)
-                .commandBufferCount(1);
-        PointerBuffer pCmd = stack.mallocPointer(1);
-        check(vkAllocateCommandBuffers(device, allocInfo, pCmd), "vkAllocateCommandBuffers");
-        VkCommandBuffer cmd = new VkCommandBuffer(pCmd.get(0), device);
-
-        VkCommandBufferBeginInfo begin = VkCommandBufferBeginInfo.calloc(stack)
-                .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
-                .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
-        check(vkBeginCommandBuffer(cmd, begin), "vkBeginCommandBuffer");
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0,
-                stack.longs(descriptorSet), null);
-        vkCmdPushConstants(cmd, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, stack.ints(invocations));
-        vkCmdDispatch(cmd, kernel.groupsFor(invocations), 1, 1);
-        check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
-        return cmd;
-    }
-
-    private static long createFence(VkDevice device, MemoryStack stack) {
-        VkFenceCreateInfo info = VkFenceCreateInfo.calloc(stack).sType(VK_STRUCTURE_TYPE_FENCE_CREATE_INFO);
-        LongBuffer pFence = stack.mallocLong(1);
-        check(vkCreateFence(device, info, null, pFence), "vkCreateFence");
-        return pFence.get(0);
-    }
-
-    private static void check(int result, String operation) {
-        if (result != VK_SUCCESS) {
-            throw new IllegalStateException(operation + " failed: VkResult " + result);
-        }
     }
 }

@@ -1,6 +1,6 @@
 package dev.supirvast.vastir.tools;
 
-import org.lwjgl.vulkan.VkCommandBuffer;
+import java.lang.foreign.MemorySegment;
 
 /**
  * A GPU dispatch in flight — the opaque handle returned by {@link KernelHandle#submitAsync} (and, beneath
@@ -14,7 +14,7 @@ import org.lwjgl.vulkan.VkCommandBuffer;
  */
 public final class Submission {
 
-    final VkCommandBuffer cmd;
+    final MemorySegment cmd;
     final long fence;
     final long descriptorPool;   // this submission's own pool (+ set) — freed in await
     final long[] bufferHandles;
@@ -22,7 +22,7 @@ public final class Submission {
     final int[] bufferLengths;
     boolean awaited;
 
-    Submission(VkCommandBuffer cmd, long fence, long descriptorPool, long[] bufferHandles,
+    Submission(MemorySegment cmd, long fence, long descriptorPool, long[] bufferHandles,
             long[] memoryHandles, int[] bufferLengths) {
         this.cmd = cmd;
         this.fence = fence;

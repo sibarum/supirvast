@@ -39,21 +39,11 @@
             <version>${project.version}</version>
         </dependency>
 
-        <!-- Vulkan compute dispatch to execute our SPIR-V on the GPU. -->
+        <!-- Vulkan compute dispatch to execute our SPIR-V on the GPU: the stack's one Panama binding, so that a
+             context can run on a device somebody else made and share its buffers with whatever draws. -->
         <dependency>
-            <groupId>org.lwjgl</groupId>
-            <artifactId>lwjgl</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.lwjgl</groupId>
-            <artifactId>lwjgl-vulkan</artifactId>
-        </dependency>
-        <!-- lwjgl-vulkan dlopens the system Vulkan loader, so only the core natives are needed. -->
-        <dependency>
-            <groupId>org.lwjgl</groupId>
-            <artifactId>lwjgl</artifactId>
-            <classifier>natives-windows</classifier>
-            <scope>runtime</scope>
+            <groupId>dev.supirvast</groupId>
+            <artifactId>vastir-vulkan</artifactId>
         </dependency>
     </dependencies>
 
