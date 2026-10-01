@@ -24,13 +24,34 @@
     <dependencies>
         <!--
           vastir-tools brings the GraphicsPipelineSpec contract and the native SPIR-V toolchain
-          (NativeTools.validate, to gate a loaded .spv before pipeline build), and transitively the
-          vastir IR + LWJGL core + lwjgl-vulkan used to build the graphics pipeline.
+          (NativeTools.validate, to gate a loaded .spv before pipeline build), and transitively the vastir IR.
         -->
         <dependency>
             <groupId>dev.supirvast</groupId>
             <artifactId>vastir-tools</artifactId>
             <version>${project.version}</version>
+        </dependency>
+
+        <!--
+          LWJGL's Vulkan, which this previewer builds its graphics pipeline with. vastir-tools used to bring it
+          along, because its compute context was on LWJGL; that is on the stack's own Panama binding now
+          (vastir-vulkan), so this declares what it uses. This module is where LWJGL still is, and the window
+          below it — GLFW, which the stack's own windowing replaces — is what porting it off would start with.
+        -->
+        <dependency>
+            <groupId>org.lwjgl</groupId>
+            <artifactId>lwjgl</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.lwjgl</groupId>
+            <artifactId>lwjgl-vulkan</artifactId>
+        </dependency>
+        <!-- lwjgl-vulkan dlopens the system Vulkan loader, so only the core natives are needed. -->
+        <dependency>
+            <groupId>org.lwjgl</groupId>
+            <artifactId>lwjgl</artifactId>
+            <classifier>natives-windows</classifier>
+            <scope>runtime</scope>
         </dependency>
 
         <!-- Windowing + surface creation for the swapchain (the headless compute path needs none of this). -->

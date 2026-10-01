@@ -72,10 +72,34 @@ public final class Accelerator implements AutoCloseable {
     private final SpirvTarget budget;   // optional caller-imposed capability restriction (#2)
     private Boolean gpuAvailable;       // probed once (probing builds a Vulkan instance — not free)
     private GpuContext context;         // opened lazily on first GPU need, held for this Accelerator's life
+    private boolean ownsContext = true; // false when the context was lent: whoever made it closes it
 
     /** An accelerator with no capability restriction — emit whatever a kernel requires. */
     public Accelerator() {
         this(SpirvTarget.unconstrained());
+    }
+
+    /**
+     * An accelerator that runs on a context somebody else made — typically one on an application's own device,
+     * so that the buffers it computes into are ones a picture of them can read without a copy. The GPU is taken
+     * as present, since it is the one the context is on.
+     *
+     * <p><b>The context is left open</b> by {@link #close()}, which releases only what this accelerator made:
+     * its pipelines, its resident buffers and its sequences, after waiting for the context's work. Close the
+     * accelerator first, then the context, as they were made. The same owning-thread rule applies as ever, and it
+     * is the context's thread: whatever else submits to the device's queue does so from there.
+     */
+    public static Accelerator on(GpuContext context) {
+        return on(context, SpirvTarget.unconstrained());
+    }
+
+    /** As {@link #on(GpuContext)}, refusing any capability outside {@code budget}. */
+    public static Accelerator on(GpuContext context, SpirvTarget budget) {
+        Accelerator accelerator = new Accelerator(budget);
+        accelerator.context = context;
+        accelerator.ownsContext = false;
+        accelerator.gpuAvailable = true;
+        return accelerator;
     }
 
     /**
@@ -240,6 +264,22 @@ public final class Accelerator implements AutoCloseable {
         sequences.remove(sequence);
     }
 
+    /**
+     * Blocks until every resident dispatch and sequence run submitted so far has finished. A no-op when nothing
+     * has used the GPU.
+     *
+     * <p>What a caller needs before something else reads what the kernels wrote: a picture that draws from a
+     * {@linkplain ResidentBuffer#vkBuffer() resident buffer} on the same device calls this first, because the
+     * wait is the dependency between the compute work and the draw. A host {@link ResidentBuffer#read read}
+     * waits too, but only as the cost of copying the whole buffer back — which is exactly what sharing the
+     * device is for avoiding.
+     */
+    public void finish() {
+        if (context != null) {
+            context.finish();
+        }
+    }
+
     /** Releases resident buffers, pipelines and the context. Safe to call when no GPU was ever used. */
     @Override
     public void close() {
@@ -253,7 +293,9 @@ public final class Accelerator implements AutoCloseable {
         pipelines.values().forEach(GpuContext.ResidentKernel::close);
         pipelines.clear();
         if (context != null) {
-            context.close();
+            if (ownsContext) {
+                context.close();
+            }
             context = null;
         }
     }

@@ -185,6 +185,13 @@ public final class GpuContext implements AutoCloseable {
         VulkanInstance.DeviceInfo info = instance.deviceInfos().stream()
                 .filter(d -> d.physicalDevice().equals(device.physicalDevice())).findFirst()
                 .orElseThrow(() -> new IllegalArgumentException("the device is not on that instance"));
+        // The queue the device was made with is the one every dispatch goes to, so it is that family that has to
+        // run compute — not merely some family of the device.
+        if (!instance.queueFamilySupports(device.physicalDevice(), device.queueFamilyIndex(),
+                VulkanInstance.QUEUE_COMPUTE)) {
+            throw new IllegalArgumentException("the device's queue family " + device.queueFamilyIndex()
+                    + " on " + info.name() + " cannot run compute, so kernels cannot be dispatched to its queue");
+        }
         return new GpuContext(null, device, false, support, info.name(), DeviceSelection.typeName(info.type()));
     }
 
@@ -356,6 +363,18 @@ public final class GpuContext implements AutoCloseable {
         /** Capacity in 32-bit words. */
         public int words() {
             return words;
+        }
+
+        /**
+         * The {@code VkBuffer}, so that something drawing on the same device can bind it and read what the
+         * kernels wrote where it already is. Made with storage-buffer usage.
+         *
+         * <p>Still this buffer's: it is freed by {@link #close()}, and whatever binds it must be done first.
+         * Ordering the kernels that write it against a draw that reads it is the caller's: wait for the context's
+         * work ({@link GpuContext#finish}) before submitting the draw.
+         */
+        public long vkBuffer() {
+            return handle();
         }
 
         /** Waits for resident work that may still use it, then frees it. Idempotent. */

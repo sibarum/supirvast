@@ -56,6 +56,24 @@ public final class ResidentBuffer implements AutoCloseable {
         return device != null;
     }
 
+    /**
+     * The {@code VkBuffer} behind it, for something drawing on the same device to read what kernels wrote here
+     * without a copy. Only a buffer that {@linkplain #onDevice lives on the device} has one.
+     *
+     * <p>Still this buffer's, freed by {@link #close()}; whatever binds it must be done first. Call
+     * {@link Accelerator#finish()} before submitting a draw that reads it, so the kernels that write it are done.
+     *
+     * @throws IllegalStateException if it is host-resident, as it is when no GPU was available
+     */
+    public long vkBuffer() {
+        requireOpen();
+        if (device == null) {
+            throw new IllegalStateException("a host-resident buffer has no VkBuffer: it lives in an array the CPU "
+                    + "backend runs over, because no GPU was available");
+        }
+        return device.vkBuffer();
+    }
+
     /** Replaces the start of the buffer with {@code words}. */
     public void write(int[] words) {
         requireOpen();

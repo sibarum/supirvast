@@ -529,6 +529,33 @@ public final class VulkanInstance implements AutoCloseable {
         }
     }
 
+    /** Whether queue family {@code family} of {@code physicalDevice} has every bit of {@code flags} ({@code VK_QUEUE_*}). */
+    public boolean queueFamilySupports(MemorySegment physicalDevice, int family, int flags) {
+        try (Arena temp = Arena.ofConfined()) {
+            MemorySegment pCount = temp.allocate(JAVA_INT);
+            try {
+                vkGetPhysicalDeviceQueueFamilyProperties.invokeExact(physicalDevice, pCount, MemorySegment.NULL);
+            } catch (Throwable t) {
+                throw NativeException.rethrow("vkGetPhysicalDeviceQueueFamilyProperties", t);
+            }
+            int count = pCount.get(JAVA_INT, 0);
+            if (family < 0 || family >= count) {
+                return false;
+            }
+            MemorySegment props = temp.allocate(QUEUE_FAMILY_PROPERTIES, count);
+            try {
+                vkGetPhysicalDeviceQueueFamilyProperties.invokeExact(physicalDevice, pCount, props);
+            } catch (Throwable t) {
+                throw NativeException.rethrow("vkGetPhysicalDeviceQueueFamilyProperties", t);
+            }
+            int have = (int) QFP_queueFlags.get(props.asSlice(family * QFP_STRIDE, QFP_STRIDE));
+            return (have & flags) == flags;
+        }
+    }
+
+    /** {@code VK_QUEUE_COMPUTE_BIT}, for {@link #queueFamilySupports}. */
+    public static final int QUEUE_COMPUTE = VK_QUEUE_COMPUTE_BIT;
+
     /** {@code {family, queueCount}} of the first queue family with compute, or {@code {-1, 0}}. */
     private int[] computeQueueFamily(MemorySegment device) {
         try (Arena temp = Arena.ofConfined()) {
