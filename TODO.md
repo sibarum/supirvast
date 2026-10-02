@@ -419,7 +419,8 @@ invocation, single-threaded, no vectorisation. Whether it should become one was 
       (subexpressions → named temps, canonical `p0`/`t0` names), so `print` is a normal form
       (`print(parse(print(m))) == print(m)`, verified by `RoundTripTest`). Grammar in `supir/README.md`.
       The infix "modernized shader language" idea belongs at a higher authoring layer that lowers *to* this IR.
-- [x] Wire `supir` into supir-studio (Phase 2): editor (Supir) → `Supir.parseModule` → `core` → `CoreToSpirv`
+- [x] Wire `supir` into supir-studio (Phase 2) — *since deleted: dasum is deprecated, and a GUI tool over Supir
+      is built on the VexelRay framework instead.* Editor (Supir) → `Supir.parseModule` → `core` → `CoreToSpirv`
       → spirv-val → spirv-cross GLSL 330 → `ShaderUtil.buildProgram` → render (`SupirShaderCompiler`). Added a
       GLSL version target to `NativeTools.crossCompile` (`--version 330 --no-es --separate-shader-objects`) so
       varyings carry explicit locations on a 3.3 context. Errors surface in the status bar; last good program

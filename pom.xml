@@ -38,8 +38,6 @@
         <module>vastir-pbr</module>
         <!-- Supir: the textual form of the core IR (flat assembly), parsed/printed two-way. Depends on vastir. -->
         <module>supir</module>
-        <!-- Live shader-playground GUI (dasumGUIshi/OpenGL): edit a shader, compile, preview a model. -->
-        <module>supir-studio</module>
     </modules>
 
     <properties>
@@ -49,9 +47,6 @@
         <!-- Matches the installed GraalVM for JDK 25.0.1; Truffle artifacts share that version line. -->
         <truffle.version>25.0.1</truffle.version>
         <junit.version>5.11.4</junit.version>
-        <!-- Vulkan compute dispatch (GPU execution) lives in vastir-tools; the windowed previewer
-             (vastir-preview) adds GLFW + stb on top of the same LWJGL line. -->
-        <lwjgl.version>3.3.6</lwjgl.version>
         <!-- Pure-Java matrix/vector math for the previewer's MVP transform (no natives). -->
         <joml.version>1.10.7</joml.version>
     </properties>
@@ -97,7 +92,7 @@
                 <version>${project.version}</version>
             </dependency>
 
-            <!-- Reactor-internal dependency: the Supir front end (and, later, supir-studio) consumes supir. -->
+            <!-- Reactor-internal dependency: the Supir front end consumes supir. -->
             <dependency>
                 <groupId>dev.supirvast</groupId>
                 <artifactId>supir</artifactId>
@@ -109,15 +104,6 @@
                 <groupId>org.junit</groupId>
                 <artifactId>junit-bom</artifactId>
                 <version>${junit.version}</version>
-                <type>pom</type>
-                <scope>import</scope>
-            </dependency>
-
-            <!-- LWJGL: manages lwjgl + lwjgl-vulkan + lwjgl-glfw + lwjgl-stb + native classifiers together. -->
-            <dependency>
-                <groupId>org.lwjgl</groupId>
-                <artifactId>lwjgl-bom</artifactId>
-                <version>${lwjgl.version}</version>
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>

@@ -21,6 +21,27 @@
         cross-compiled, never drawn.
     </description>
 
+    <properties>
+        <!-- The only LWJGL in SupirVast. Applications must never depend on this module (it is not installed or
+             deployed: see the skip flags), so LWJGL cannot reach one — the framework's builder bans it too. -->
+        <lwjgl.version>3.3.6</lwjgl.version>
+        <maven.install.skip>true</maven.install.skip>
+        <maven.deploy.skip>true</maven.deploy.skip>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- Manages lwjgl + lwjgl-vulkan + lwjgl-glfw + lwjgl-stb and their native classifiers together. -->
+            <dependency>
+                <groupId>org.lwjgl</groupId>
+                <artifactId>lwjgl-bom</artifactId>
+                <version>${lwjgl.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
     <dependencies>
         <!--
           vastir-tools brings the GraphicsPipelineSpec contract and the native SPIR-V toolchain

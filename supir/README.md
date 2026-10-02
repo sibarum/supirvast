@@ -149,6 +149,5 @@ sufficient; a deeper condition would need hoisting, which a loop header cannot d
 
 ## Scope
 
-A leaf module depending only on `vastir`; no native dependencies, fully tested headlessly. Wiring it into
-supir-studio (editor → `Supir.parseModule` → `core` → spirv-cross 330 → GL) is the next step, tracked in the
-studio README.
+A leaf module depending only on `vastir`; no native dependencies, fully tested headlessly. A tool that wants a
+GUI over it is built on the VexelRay framework, not here (supir-studio, its dasum-based editor, was removed).
