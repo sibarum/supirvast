@@ -13,8 +13,9 @@ import dev.supirvast.vastir.type.Type;
  * point, since code written against resident buffers must still run where there is no device.
  *
  * <p>Data rides the same {@code int[]} wire as {@link KernelHandle#run}: one word per 32-bit element, two per
- * 64-bit element, low word first. Owning-thread only; close before the {@link Accelerator}, or let it close
- * whatever is left.
+ * 64-bit element, low word first. {@linkplain Accelerator#allocate Allocated} on any thread, and the owning
+ * thread's from then on: written, read, dispatched against and closed there. Close it before the {@link
+ * Accelerator}, or let it close whatever is left.
  */
 public final class ResidentBuffer implements AutoCloseable {
 

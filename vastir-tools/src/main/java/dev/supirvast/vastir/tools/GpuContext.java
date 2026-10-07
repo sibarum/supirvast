@@ -42,6 +42,18 @@ import java.util.Set;
  * A given kernel has a single descriptor set, so it may have only <em>one</em> submission in flight at a
  * time — {@code submitAsync} throws if a second targets an already-pending kernel (distinct kernels run
  * concurrently freely). That is exactly enough for "launch N different kernels, then await all N".
+ *
+ * <h2>Threads</h2>
+ *
+ * <p>Two calls are not the owning thread's: {@link #build} and {@link #allocateBuffer} may be made from any
+ * thread, at the same time as each other and as the owning thread's work. They only make objects, and Vulkan
+ * does not ask for that to be synchronised; what does need it — the command pool, the queue and the record of
+ * work in flight — they never touch. They are the slow part of setting up: a pipeline is the driver compiling a
+ * shader, and an application that shares its device with a window cannot afford that on the thread that draws.
+ * A kernel or buffer made elsewhere is handed to the owning thread before it is dispatched, written, read or
+ * closed, and from then on is the owning thread's like any other.
+ *
+ * <p>Everything else — every dispatch, recording, submission, copy and wait — is the owning thread's.
  */
 public final class GpuContext implements AutoCloseable {
 
@@ -199,6 +211,8 @@ public final class GpuContext implements AutoCloseable {
      * Builds a resident pipeline for {@code spirv}'s {@code entryPoint} over {@code bindingCount} storage
      * buffers (descriptor set 0, bindings {@code 0..bindingCount-1}). Returned handle is reusable across many
      * dispatches and must be {@link ResidentKernel#close() closed} (before this context).
+     *
+     * <p>Any thread may build, at once with any other; see the class.
      */
     public ResidentKernel build(byte[] spirv, String entryPoint, int bindingCount) {
         return build(spirv, entryPoint, bindingCount, 1);
@@ -343,8 +357,8 @@ public final class GpuContext implements AutoCloseable {
     private record Pending(MemorySegment cmd, long fence, long descriptorPool) {}
 
     /**
-     * A storage buffer in device-local memory that outlives dispatches. Owning-thread only, like the rest of
-     * this context; close it before the context.
+     * A storage buffer in device-local memory that outlives dispatches. {@linkplain #allocateBuffer Made} on any
+     * thread, and from then on the owning thread's, like the rest of this context; close it before the context.
      */
     public static final class DeviceBuffer implements AutoCloseable {
         private final GpuContext owner;
@@ -396,7 +410,10 @@ public final class GpuContext implements AutoCloseable {
         }
     }
 
-    /** A device-local buffer of {@code words} 32-bit words, contents undefined until written. */
+    /**
+     * A device-local buffer of {@code words} 32-bit words, contents undefined until written or {@linkplain #clear
+     * cleared}. Any thread may allocate; see the class.
+     */
     public DeviceBuffer allocateBuffer(int words) {
         if (words < 1) {
             throw new IllegalArgumentException("a device buffer needs at least one word, got " + words);
@@ -432,6 +449,25 @@ public final class GpuContext implements AutoCloseable {
             vk.destroyBuffer(staging);
             vk.freeMemory(memory.memory());
         }
+    }
+
+    /**
+     * Sets every word of every one of {@code targets} to zero, in one submission, and waits for it: what a fresh
+     * buffer is when its kernels count on starting from nothing. Nothing comes from the host, so it costs what the
+     * device takes to write the memory, where {@link #write} of zeros would stage a buffer as large and copy it.
+     * Ordered after every dispatch submitted before it, like a write.
+     */
+    public void clear(List<DeviceBuffer> targets) {
+        if (targets.isEmpty()) {
+            return;
+        }
+        MemorySegment cmd = vk.beginCommandBuffer(commandPool, VkCompute.COMMAND_BUFFER_ONE_TIME_SUBMIT);
+        vk.residentBarrier(cmd);
+        for (DeviceBuffer target : targets) {
+            vk.recordFill(cmd, target.handle(), 0);
+        }
+        vk.endCommandBuffer(cmd);
+        submitResidentAndWait(cmd);
     }
 
     /**

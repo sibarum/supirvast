@@ -33,6 +33,12 @@ import static java.lang.foreign.ValueLayout.JAVA_LONG;
  * <p><b>Nothing here is synchronised, and a {@code VkQueue} must be.</b> A caller that shares the device with
  * something that draws submits from the same thread, or under a lock both agree on.
  *
+ * <p>What Vulkan does not ask to be synchronised is safe from any thread: making and destroying buffers,
+ * memory, shader modules, layouts and pipelines, each call over objects of its own. Every call here builds its
+ * structs in an arena of its own and the command handles are fixed at construction, so this class adds no
+ * shared state to that. A command pool, and every command buffer allocated from it, is another matter: Vulkan
+ * requires those to be externally synchronised, and so does a queue.
+ *
  * <p>Failures are {@link IllegalStateException}s naming the call and the {@code VkResult}, as they have
  * always been from this context: callers distinguish "this machine cannot" from a bug by that type.
  */
@@ -251,6 +257,7 @@ final class VkCompute {
     private final MethodHandle vkCmdDispatch;
     private final MethodHandle vkCmdPipelineBarrier;
     private final MethodHandle vkCmdCopyBuffer;
+    private final MethodHandle vkCmdFillBuffer;
     private final MethodHandle vkCreateFence;
     private final MethodHandle vkDestroyFence;
     private final MethodHandle vkWaitForFences;
@@ -311,6 +318,8 @@ final class VkCompute {
                         ADDRESS, JAVA_INT, ADDRESS));
         vkCmdCopyBuffer = device.command("vkCmdCopyBuffer",
                 FunctionDescriptor.ofVoid(ADDRESS, JAVA_LONG, JAVA_LONG, JAVA_INT, ADDRESS));
+        vkCmdFillBuffer = device.command("vkCmdFillBuffer",
+                FunctionDescriptor.ofVoid(ADDRESS, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT));
         vkCreateFence = device.command("vkCreateFence", CREATE);
         vkDestroyFence = device.command("vkDestroyFence", DESTROY);
         vkWaitForFences = device.command("vkWaitForFences",
@@ -693,6 +702,11 @@ final class VkCompute {
             sl(region, BUFFER_COPY, "size", sizeBytes);
             invokeVoid(vkCmdCopyBuffer, cmd, source, target, 1, region);
         }
+    }
+
+    /** Every word of {@code target} set to {@code word}, on the device: nothing is staged or copied from the host. */
+    void recordFill(MemorySegment cmd, long target, int word) {
+        invokeVoid(vkCmdFillBuffer, cmd, target, 0L, WHOLE_SIZE, word);
     }
 
     // --- fences and queues -----------------------------------------------------------------------------

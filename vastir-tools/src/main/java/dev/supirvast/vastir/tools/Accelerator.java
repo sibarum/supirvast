@@ -22,10 +22,11 @@ import dev.supirvast.vastir.tools.NativeTools.ValidationResult;
 import dev.supirvast.vastir.type.Type;
 
 import java.util.ArrayList;
-import java.util.IdentityHashMap;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 /**
@@ -50,6 +51,19 @@ import java.util.stream.Collectors;
  * <p>Validation is treated as living requirements: lowering failures and {@code spirv-val} rejections become
  * concrete witnesses at registration, input/ABI mismatches fail closed at {@link KernelHandle#run}, and
  * equivalence is checkable on demand via {@link KernelHandle#verify}.
+ *
+ * <h2>Threads</h2>
+ *
+ * <p>{@link #register} and {@link #allocate} may be called from any thread, several at once, while the owning
+ * thread goes on dispatching. They are where setting up costs: a registration lowers the kernel twice, runs
+ * {@code spirv-val} as a process and has the driver compile a pipeline, and a program of a few dozen kernels
+ * takes long enough that a window drawing on the owning thread visibly stops. So an application builds its
+ * kernels and buffers on a worker, hands the handles to the owning thread, and pays only for what has to be
+ * there: {@link #clear clearing} the buffers, {@link #sequence recording} the dispatches and submitting them.
+ *
+ * <p>Everything else is the owning thread's — the context's, for an accelerator {@linkplain #on lent} one:
+ * sequences, dispatches, runs, reads, writes, {@link #finish}, {@link #release} and {@link #close}. A handle or
+ * buffer made on a worker is the owning thread's once handed over, and must be handed over before any of those.
  */
 public final class Accelerator implements AutoCloseable {
 
@@ -65,13 +79,20 @@ public final class Accelerator implements AutoCloseable {
             Set<Capability> deviceCapabilities, long maxWorkgroupMemoryBytes, Set<DeviceFeature> deviceFeatures,
             String deviceName, String deviceType) {}
 
-    private final NativeTools tools = new NativeTools();
-    private final Map<KernelHandle, GpuContext.ResidentKernel> pipelines = new IdentityHashMap<>();
-    private final List<ResidentBuffer> residentBuffers = new ArrayList<>();
+    /**
+     * One for the process: the tools are extracted from the jar to a directory on first use, and one for each
+     * accelerator would extract them again for every accelerator made — every simulation started, say.
+     */
+    private static final NativeTools TOOLS = new NativeTools();
+
+    // Registered and allocated into from any thread; see the class. A handle is its own identity.
+    private final Map<KernelHandle, GpuContext.ResidentKernel> pipelines = new ConcurrentHashMap<>();
+    private final List<ResidentBuffer> residentBuffers = Collections.synchronizedList(new ArrayList<>());
     private final List<DispatchSequence> sequences = new ArrayList<>();
     private final SpirvTarget budget;   // optional caller-imposed capability restriction (#2)
-    private Boolean gpuAvailable;       // probed once (probing builds a Vulkan instance — not free)
-    private GpuContext context;         // opened lazily on first GPU need, held for this Accelerator's life
+    private final Object opening = new Object();   // the probe and the context are made once, by whoever asks first
+    private volatile Boolean gpuAvailable;  // probed once (probing builds a Vulkan instance — not free)
+    private volatile GpuContext context;    // opened lazily on first GPU need, held for this Accelerator's life
     private boolean ownsContext = true; // false when the context was lent: whoever made it closes it
 
     /** An accelerator with no capability restriction — emit whatever a kernel requires. */
@@ -114,6 +135,8 @@ public final class Accelerator implements AutoCloseable {
      * Validates and lowers a kernel, returning a runnable handle on success or a {@link Rejection} witness on
      * failure. On success with a GPU present, the kernel's pipeline is preloaded. Never throws for an
      * unacceptable kernel — the failure is data the caller can render.
+     *
+     * <p>Any thread may register, at once with others and with the owning thread's work; see the class.
      */
     public Registration register(KernelSpec spec) {
         Rejection abiError = checkAbi(spec.columns());
@@ -164,8 +187,8 @@ public final class Accelerator implements AutoCloseable {
             return new Rejection("not lowerable to SPIR-V", String.valueOf(e.getMessage()));
         }
 
-        if (tools.isAvailable()) {
-            ValidationResult validation = tools.validate(spirv);
+        if (TOOLS.isAvailable()) {
+            ValidationResult validation = TOOLS.validate(spirv);
             if (!validation.valid()) {
                 return new Rejection("spirv-val rejected the kernel", validation.output());
             }
@@ -200,13 +223,16 @@ public final class Accelerator implements AutoCloseable {
         Set<DeviceFeature> features = gpuAvailable() ? context().features() : Set.of();
         String name = gpuAvailable() ? context().deviceName() : null;
         String type = gpuAvailable() ? context().deviceType() : null;
-        return new Capabilities(gpuAvailable(), tools.isAvailable(), device, workgroupMemory, features, name, type);
+        return new Capabilities(gpuAvailable(), TOOLS.isAvailable(), device, workgroupMemory, features, name, type);
     }
 
     /**
      * A {@link ResidentBuffer} of {@code elements} elements of {@code element}: device-local memory when a GPU
      * is present, a host array the CPU backend runs over in place when not. Its contents are undefined on the
-     * device and zero on the host until written. Closed by {@link #close} if the caller has not.
+     * device and zero on the host until written or {@linkplain #clear cleared}. Closed by {@link #close} if the
+     * caller has not.
+     *
+     * <p>Any thread may allocate, at once with others and with the owning thread's work; see the class.
      */
     public ResidentBuffer allocate(Type element, int elements) {
         if (!isSupportedColumnType(element)) {
@@ -220,6 +246,26 @@ public final class Accelerator implements AutoCloseable {
                 : ResidentBuffer.onHost(element, elements);
         residentBuffers.add(buffer);
         return buffer;
+    }
+
+    /**
+     * Sets every element of every one of {@code buffers} to zero: on the device, all of them in one submission
+     * that writes the memory where it is, which a {@link ResidentBuffer#write write} of zeros would stage on the
+     * host and copy over, a buffer at a time. What a newly allocated program's buffers need before a kernel that
+     * counts on starting from nothing reads them. Ordered after every dispatch submitted before it.
+     */
+    public void clear(List<ResidentBuffer> buffers) {
+        List<GpuContext.DeviceBuffer> onDevice = new ArrayList<>();
+        for (ResidentBuffer buffer : buffers) {
+            if (buffer.onDevice()) {
+                onDevice.add(buffer.device());
+            } else {
+                java.util.Arrays.fill(buffer.hostArray(), 0);
+            }
+        }
+        if (!onDevice.isEmpty()) {
+            context().clear(onDevice);
+        }
     }
 
     /**
@@ -376,17 +422,30 @@ public final class Accelerator implements AutoCloseable {
     boolean gpuAvailable() {
         Boolean cached = gpuAvailable;
         if (cached == null) {
-            cached = GpuContext.isAvailable();
-            gpuAvailable = cached;
+            synchronized (opening) {
+                cached = gpuAvailable;
+                if (cached == null) {
+                    cached = GpuContext.isAvailable();
+                    gpuAvailable = cached;
+                }
+            }
         }
         return cached;
     }
 
     private GpuContext context() {
-        if (context == null) {
-            context = GpuContext.open();
+        GpuContext opened = context;
+        if (opened == null) {
+            // Two workers registering at once must not each open a device, and leak one.
+            synchronized (opening) {
+                opened = context;
+                if (opened == null) {
+                    opened = GpuContext.open();
+                    context = opened;
+                }
+            }
         }
-        return context;
+        return opened;
     }
 
     /**
