@@ -103,13 +103,35 @@ public final class VulkanDevice implements AutoCloseable {
      * @param queueCount how many queues to take from the family, at least one. The caller caps it at what the
      *                   family offers. More queues let submissions overlap on the device; they do not make a
      *                   queue safe to use from two threads
+     * @param extraExtensions   device extensions to enable besides the ones the other fields imply — for a
+     *                          caller that shares memory or semaphores with another API. The caller checks they
+     *                          are supported; asking for one that is not fails {@code vkCreateDevice}
+     * @param timelineSemaphore enable the {@code timelineSemaphore} feature (core since 1.2, and required there)
      */
-    public record Request(boolean swapchain, ComputeSupport compute, int queueCount) {
+    public record Request(boolean swapchain, ComputeSupport compute, int queueCount,
+                          java.util.List<String> extraExtensions, boolean timelineSemaphore) {
 
         public Request {
             if (queueCount < 1) {
                 throw new IllegalArgumentException("a device needs at least one queue, got " + queueCount);
             }
+            extraExtensions = extraExtensions == null ? java.util.List.of() : java.util.List.copyOf(extraExtensions);
+        }
+
+        public Request(boolean swapchain, ComputeSupport compute, int queueCount) {
+            this(swapchain, compute, queueCount, java.util.List.of(), false);
+        }
+
+        /** This request, also enabling {@code extensions}. */
+        public Request withExtensions(java.util.List<String> extensions) {
+            java.util.List<String> all = new java.util.ArrayList<>(extraExtensions);
+            all.addAll(extensions);
+            return new Request(swapchain, compute, queueCount, all, timelineSemaphore);
+        }
+
+        /** This request, also enabling timeline semaphores. */
+        public Request withTimelineSemaphore() {
+            return new Request(swapchain, compute, queueCount, extraExtensions, true);
         }
 
         /** A device that can present, and draws: what a windowed run needs. */
@@ -182,9 +204,16 @@ public final class VulkanDevice implements AutoCloseable {
             // alternatives, and naming both is a validation error.
             MemorySegment features = MemorySegment.NULL;
             if (compute != null) {
-                ComputeSupport.Enabled enabled = compute.enable(temp);
+                ComputeSupport.Enabled enabled = compute.enable(temp, request.timelineSemaphore());
                 features = enabled.features2();
                 extensions.addAll(enabled.extensions());
+            } else if (request.timelineSemaphore()) {
+                features = ComputeSupport.timelineOnly(temp).features2();
+            }
+            for (String extension : request.extraExtensions()) {
+                if (!extensions.contains(extension)) {
+                    extensions.add(extension);
+                }
             }
 
             // Not a ternary at the set() below: VarHandle.set is signature-polymorphic and reads the static

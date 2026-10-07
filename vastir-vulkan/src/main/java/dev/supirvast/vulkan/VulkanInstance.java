@@ -501,6 +501,15 @@ public final class VulkanInstance implements AutoCloseable {
         return infos;
     }
 
+    /**
+     * The Windows adapter LUID of {@code physicalDevice}, as a little-endian long, or empty when the driver reports
+     * none (it is valid only on Windows). Another graphics API finds the same GPU by it, which is what presenting a
+     * Vulkan-drawn image through DXGI needs.
+     */
+    public java.util.OptionalLong adapterLuid(MemorySegment physicalDevice) {
+        return ComputeSupport.adapterLuid(this, physicalDevice);
+    }
+
     /** The selection for a device and its compute queue family — what {@link VulkanDevice} is made from. */
     public DeviceSelection selectionFor(DeviceInfo info) {
         if (!info.compute()) {

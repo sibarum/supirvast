@@ -127,11 +127,26 @@ public record ComputeSupport(boolean int8, boolean int16, boolean int64, boolean
                     JAVA_INT.withName("shaderInt16")).withName("features")
     ).withName("VkPhysicalDeviceFeatures2");
 
-    /** Through {@code shaderInt8}, the ninth of the 1.2 features. */
+    /**
+     * Through {@code timelineSemaphore}, the 38th of the 1.2 features. Every field up to it is named because the
+     * offset is what matters: the two read or written are {@code shaderInt8} and {@code timelineSemaphore}.
+     */
     private static final GroupLayout VULKAN_1_2_FEATURES = bools("VkPhysicalDeviceVulkan12Features",
             "samplerMirrorClampToEdge", "drawIndirectCount", "storageBuffer8BitAccess",
             "uniformAndStorageBuffer8BitAccess", "storagePushConstant8", "shaderBufferInt64Atomics",
-            "shaderSharedInt64Atomics", "shaderFloat16", "shaderInt8");
+            "shaderSharedInt64Atomics", "shaderFloat16", "shaderInt8", "descriptorIndexing",
+            "shaderInputAttachmentArrayDynamicIndexing", "shaderUniformTexelBufferArrayDynamicIndexing",
+            "shaderStorageTexelBufferArrayDynamicIndexing", "shaderUniformBufferArrayNonUniformIndexing",
+            "shaderSampledImageArrayNonUniformIndexing", "shaderStorageBufferArrayNonUniformIndexing",
+            "shaderStorageImageArrayNonUniformIndexing", "shaderInputAttachmentArrayNonUniformIndexing",
+            "shaderUniformTexelBufferArrayNonUniformIndexing", "shaderStorageTexelBufferArrayNonUniformIndexing",
+            "descriptorBindingUniformBufferUpdateAfterBind", "descriptorBindingSampledImageUpdateAfterBind",
+            "descriptorBindingStorageImageUpdateAfterBind", "descriptorBindingStorageBufferUpdateAfterBind",
+            "descriptorBindingUniformTexelBufferUpdateAfterBind", "descriptorBindingStorageTexelBufferUpdateAfterBind",
+            "descriptorBindingUpdateUnusedWhilePending", "descriptorBindingPartiallyBound",
+            "descriptorBindingVariableDescriptorCount", "runtimeDescriptorArray", "samplerFilterMinmax",
+            "scalarBlockLayout", "imagelessFramebuffer", "uniformBufferStandardLayout",
+            "shaderSubgroupExtendedTypes", "separateDepthStencilLayouts", "hostQueryReset", "timelineSemaphore");
 
     /** Through {@code computeFullSubgroups}, the ninth of the 1.3 features. */
     private static final GroupLayout VULKAN_1_3_FEATURES = bools("VkPhysicalDeviceVulkan13Features",
@@ -267,8 +282,17 @@ public record ComputeSupport(boolean int8, boolean int16, boolean int64, boolean
      * @param arena owns the structs; they must outlive the {@code vkCreateDevice} call this is for
      */
     Enabled enable(Arena arena) {
+        return enable(arena, false);
+    }
+
+    /**
+     * As {@link #enable(Arena)}, also switching on {@code timelineSemaphore} when asked. It has to go in this same
+     * 1.2 struct: chaining a separate {@code VkPhysicalDeviceTimelineSemaphoreFeatures} beside it is invalid.
+     */
+    Enabled enable(Arena arena, boolean timelineSemaphore) {
         MemorySegment features12 = whole(arena, STYPE_VULKAN_1_2_FEATURES);
         Ffm.si(features12, VULKAN_1_2_FEATURES, "shaderInt8", int8 ? 1 : 0);
+        Ffm.si(features12, VULKAN_1_2_FEATURES, "timelineSemaphore", timelineSemaphore ? 1 : 0);
         // Size control and full subgroups are what let a kernel's subgroups be the ones it was written for.
         MemorySegment features13 = whole(arena, STYPE_VULKAN_1_3_FEATURES);
         Ffm.sa(features13, VULKAN_1_3_FEATURES, "pNext", features12);
@@ -304,6 +328,40 @@ public record ComputeSupport(boolean int8, boolean int16, boolean int64, boolean
         features2.set(JAVA_INT, F_SHADER_INT64, int64 ? 1 : 0);
         features2.set(JAVA_INT, F_SHADER_FLOAT64, float64 ? 1 : 0);
         return new Enabled(features2, List.copyOf(extensions));
+    }
+
+    /**
+     * The features chain for a device that runs no kernels but needs timeline semaphores: a {@code
+     * VkPhysicalDeviceFeatures2} with nothing on, over a 1.2 struct with only {@code timelineSemaphore} on.
+     */
+    static Enabled timelineOnly(Arena arena) {
+        MemorySegment features12 = whole(arena, STYPE_VULKAN_1_2_FEATURES);
+        Ffm.si(features12, VULKAN_1_2_FEATURES, "timelineSemaphore", 1);
+        MemorySegment features2 = whole(arena, STYPE_FEATURES_2);
+        F2_pNext.set(features2, features12);
+        return new Enabled(features2, List.of());
+    }
+
+    /**
+     * The adapter LUID of {@code physicalDevice} — the 8 bytes Windows names the adapter by, read as one
+     * little-endian long, which is the in-memory form of a Win32 {@code LUID} — or empty when the driver says it is
+     * not valid. This is how another API on the same machine (DXGI's {@code EnumAdapterByLuid}) finds the same GPU.
+     */
+    static java.util.OptionalLong adapterLuid(VulkanInstance instance, MemorySegment physicalDevice) {
+        MethodHandle getProperties2 = VkLoader.instanceCommand(instance.handle(), "vkGetPhysicalDeviceProperties2",
+                FunctionDescriptor.ofVoid(ADDRESS, ADDRESS));
+        try (Arena temp = Arena.ofConfined()) {
+            MemorySegment properties11 = whole(temp, STYPE_VULKAN_1_1_PROPERTIES);
+            MemorySegment properties2 = whole(temp, STYPE_PROPERTIES_2);
+            F2_pNext.set(properties2, properties11);
+            Ffm.invokeVoid(getProperties2, physicalDevice, properties2);
+            if (Ffm.gi(properties11, VULKAN_1_1_PROPERTIES, "deviceLUIDValid") == 0) {
+                return java.util.OptionalLong.empty();
+            }
+            long offset = VULKAN_1_1_PROPERTIES.byteOffset(MemoryLayout.PathElement.groupElement("deviceLUID"));
+            return java.util.OptionalLong.of(properties11.get(java.lang.foreign.ValueLayout.JAVA_LONG_UNALIGNED,
+                    offset));
+        }
     }
 
     /** A zeroed, whole-sized struct with its {@code sType} set. */
