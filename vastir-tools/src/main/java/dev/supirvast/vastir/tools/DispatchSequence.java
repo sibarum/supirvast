@@ -76,6 +76,16 @@ public final class DispatchSequence implements AutoCloseable {
      * finished when it returns.
      */
     public Completion run() {
+        return run(List.of(), List.of());
+    }
+
+    /**
+     * As {@link #run()}, starting only once every timeline of {@code waits} has reached its value, and setting every
+     * timeline of {@code signals} to its value once the run has finished: so a run on one queue can follow work on
+     * another, or be followed by it, with no wait on the host. Where the steps run one at a time, the waits and the
+     * signals are made from the host instead, around them.
+     */
+    public Completion run(List<GpuContext.Point> waits, List<GpuContext.Point> signals) {
         if (closed) {
             throw new IllegalStateException("the sequence is closed");
         }
@@ -87,10 +97,16 @@ public final class DispatchSequence implements AutoCloseable {
             }
         }
         if (recorded()) {
-            return accelerator.submitSequence(recorded);
+            return accelerator.submitSequence(recorded, waits, signals);
+        }
+        for (GpuContext.Point wait : waits) {
+            wait.timeline().await(wait.value(), Long.MAX_VALUE);
         }
         for (Step step : steps) {
             step.handle().dispatch(step.buffers(), step.invocations());
+        }
+        for (GpuContext.Point signal : signals) {
+            signal.timeline().signal(signal.value());
         }
         return Completion.DONE;
     }

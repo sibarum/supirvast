@@ -32,6 +32,27 @@ highest-value next proof; **P1** deepens the language; **P2** broadens targets; 
       vexelray-sim-rigid's grid broad phase. `CountingSortTest`: 70 001 keys, so the block sums take two chunks,
       against the host on each backend, and a second sort on the counts the first left at zero.
       Second: vexelray-sim-fluid's `FlipStep`, keyed by cell in `Scatter.sortCount`, and its own `Sort` deleted.
+- [x] Work on a queue of its own, and ordered against another's inside the GPU (2026-10-08), for
+      vexelray-sim-rigid's physics timing (`docs/physics-timing.md` there): a simulation on a second queue that
+      the frame never waits for on the host.
+      - **When work is done.** `DispatchSequence.run()` and `PassRunner.run()` return a `Completion`, polled or
+        awaited, on the fences the context already keeps; resident work runs on one queue, in order, so a
+        completion covers everything before it.
+      - **A device per context.** `GpuContext.open(selector)` and `Accelerator.onDevice(selector)` choose as
+        `-Dsupirvast.gpu` does, for one context: one process computes on the Intel GPU and on the RTX at once.
+      - **Queues of more than one family.** `VulkanInstance.queueFamilies` and `computeOnlyQueueFamily`;
+        `VulkanDevice.Request.withQueues(family, count, priority)`; `GpuContext.on(instance, device, family)`.
+        A device with queues of several families makes every buffer with concurrent sharing, so either queue
+        may use it with no ownership transfer.
+      - **Timeline semaphores.** `GpuContext.timeline(initial)`: value, host wait, host signal, the handle for
+        another API; `DispatchSequence.run(waits, signals)`. Headless contexts now make their device with the
+        feature. Where a sequence runs step by step, the waits and signals are made from the host instead.
+      - `TwoQueuesTest`, on each device with a compute-only family (the Intel GPU's family 1, the RTX's 2): a
+        kernel on the compute-only queue, a copy of its output on the device's own, all four rounds submitted up
+        front and ordered only by the timeline. Without the copy's wait it reads the buffer before the kernel
+        has written it. Clean under `VK_LAYER_KHRONOS_validation`, which the SDK SupirVast caches for its tools
+        provides (`VK_ADD_LAYER_PATH` to its `Bin`, `-Dvexelray.vulkan.validation=true`).
+      *Still TODO:* GPU timestamps, to measure what a step costs on the device.
 
 ---
 

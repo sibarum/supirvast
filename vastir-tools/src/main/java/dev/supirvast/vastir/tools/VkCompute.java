@@ -62,6 +62,11 @@ final class VkCompute {
     private static final int STYPE_COMMAND_BUFFER_ALLOCATE_INFO = 40;
     private static final int STYPE_COMMAND_BUFFER_BEGIN_INFO = 42;
     private static final int STYPE_MEMORY_BARRIER = 46;
+    private static final int STYPE_SEMAPHORE_CREATE_INFO = 9;
+    private static final int STYPE_SEMAPHORE_TYPE_CREATE_INFO = 1000207002;
+    private static final int STYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO = 1000207003;
+    private static final int STYPE_SEMAPHORE_WAIT_INFO = 1000207004;
+    private static final int STYPE_SEMAPHORE_SIGNAL_INFO = 1000207005;
     private static final int STYPE_REQUIRED_SUBGROUP_SIZE = 1000225001;
 
     static final int BUFFER_USAGE_TRANSFER_SRC = 0x01;
@@ -91,6 +96,10 @@ final class VkCompute {
     private static final int COMMAND_POOL_RESET_COMMAND_BUFFER = 0x02;
     private static final int COMMAND_BUFFER_LEVEL_PRIMARY = 0;
     private static final int SHARING_MODE_EXCLUSIVE = 0;
+    private static final int SHARING_MODE_CONCURRENT = 1;
+    private static final int SEMAPHORE_TYPE_TIMELINE = 1;
+    private static final int PIPELINE_STAGE_ALL_COMMANDS = 0x10000;
+    private static final int VK_TIMEOUT = 2;
     private static final long WHOLE_SIZE = ~0L;
     private static final int VK_SUCCESS = 0;
     private static final int RESULT_BYTES = Integer.BYTES;
@@ -217,6 +226,31 @@ final class VkCompute {
             JAVA_INT.withName("signalSemaphoreCount"), MemoryLayout.paddingLayout(4),
             ADDRESS.withName("pSignalSemaphores")).withName("VkSubmitInfo");
 
+    private static final GroupLayout SEMAPHORE_CREATE_INFO = MemoryLayout.structLayout(
+            JAVA_INT.withName("sType"), MemoryLayout.paddingLayout(4), ADDRESS.withName("pNext"),
+            JAVA_INT.withName("flags"), MemoryLayout.paddingLayout(4)).withName("VkSemaphoreCreateInfo");
+
+    private static final GroupLayout SEMAPHORE_TYPE_CREATE_INFO = MemoryLayout.structLayout(
+            JAVA_INT.withName("sType"), MemoryLayout.paddingLayout(4), ADDRESS.withName("pNext"),
+            JAVA_INT.withName("semaphoreType"), MemoryLayout.paddingLayout(4), JAVA_LONG.withName("initialValue")
+    ).withName("VkSemaphoreTypeCreateInfo");
+
+    private static final GroupLayout SEMAPHORE_WAIT_INFO = MemoryLayout.structLayout(
+            JAVA_INT.withName("sType"), MemoryLayout.paddingLayout(4), ADDRESS.withName("pNext"),
+            JAVA_INT.withName("flags"), JAVA_INT.withName("semaphoreCount"), ADDRESS.withName("pSemaphores"),
+            ADDRESS.withName("pValues")).withName("VkSemaphoreWaitInfo");
+
+    private static final GroupLayout SEMAPHORE_SIGNAL_INFO = MemoryLayout.structLayout(
+            JAVA_INT.withName("sType"), MemoryLayout.paddingLayout(4), ADDRESS.withName("pNext"),
+            JAVA_LONG.withName("semaphore"), JAVA_LONG.withName("value")).withName("VkSemaphoreSignalInfo");
+
+    private static final GroupLayout TIMELINE_SEMAPHORE_SUBMIT_INFO = MemoryLayout.structLayout(
+            JAVA_INT.withName("sType"), MemoryLayout.paddingLayout(4), ADDRESS.withName("pNext"),
+            JAVA_INT.withName("waitSemaphoreValueCount"), MemoryLayout.paddingLayout(4),
+            ADDRESS.withName("pWaitSemaphoreValues"), JAVA_INT.withName("signalSemaphoreValueCount"),
+            MemoryLayout.paddingLayout(4), ADDRESS.withName("pSignalSemaphoreValues")
+    ).withName("VkTimelineSemaphoreSubmitInfo");
+
     private static final FunctionDescriptor CREATE =
             FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS);
     private static final FunctionDescriptor DESTROY = FunctionDescriptor.ofVoid(ADDRESS, JAVA_LONG, ADDRESS);
@@ -263,6 +297,13 @@ final class VkCompute {
     private final MethodHandle vkWaitForFences;
     private final MethodHandle vkGetFenceStatus;
     private final MethodHandle vkQueueSubmit;
+    private final MethodHandle vkCreateSemaphore;
+    private final MethodHandle vkDestroySemaphore;
+    private final MethodHandle vkGetSemaphoreCounterValue;
+    private final MethodHandle vkWaitSemaphores;
+    private final MethodHandle vkSignalSemaphore;
+    /** The device's queue families, when there is more than one, for buffers every one of them may use; else null. */
+    private final int[] sharingFamilies;
 
     VkCompute(VulkanDevice device) {
         this.device = device;
@@ -328,6 +369,17 @@ final class VkCompute {
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_LONG));
         vkQueueSubmit = device.command("vkQueueSubmit",
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, JAVA_LONG));
+        // Core since 1.2, so always resolvable on the 1.3 devices this runs on; usable only where the device was
+        // made with the timeline feature, which the context checks before it makes one.
+        vkCreateSemaphore = device.command("vkCreateSemaphore", CREATE);
+        vkDestroySemaphore = device.command("vkDestroySemaphore", DESTROY);
+        vkGetSemaphoreCounterValue = device.command("vkGetSemaphoreCounterValue",
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_LONG, ADDRESS));
+        vkWaitSemaphores = device.command("vkWaitSemaphores",
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG));
+        vkSignalSemaphore = device.command("vkSignalSemaphore", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS));
+        java.util.List<Integer> families = device.queueFamilies();
+        sharingFamilies = families.size() > 1 ? families.stream().mapToInt(Integer::intValue).toArray() : null;
     }
 
     // --- buffers and memory ----------------------------------------------------------------------------
@@ -336,13 +388,24 @@ final class VkCompute {
     record Allocation(long memory, boolean coherent) {
     }
 
+    /**
+     * A buffer of {@code sizeBytes}. On a device with queues of several families, every one of them may use it
+     * (concurrent sharing), so a buffer one queue computes into can be read on another without an ownership
+     * transfer; the waits between their work are the caller's, by semaphore.
+     */
     long createBuffer(long sizeBytes, int usage) {
         try (Arena a = Arena.ofConfined()) {
             MemorySegment info = a.allocate(BUFFER_CREATE_INFO);
             si(info, BUFFER_CREATE_INFO, "sType", STYPE_BUFFER_CREATE_INFO);
             sl(info, BUFFER_CREATE_INFO, "size", sizeBytes);
             si(info, BUFFER_CREATE_INFO, "usage", usage);
-            si(info, BUFFER_CREATE_INFO, "sharingMode", SHARING_MODE_EXCLUSIVE);
+            if (sharingFamilies == null) {
+                si(info, BUFFER_CREATE_INFO, "sharingMode", SHARING_MODE_EXCLUSIVE);
+            } else {
+                si(info, BUFFER_CREATE_INFO, "sharingMode", SHARING_MODE_CONCURRENT);
+                si(info, BUFFER_CREATE_INFO, "queueFamilyIndexCount", sharingFamilies.length);
+                sa(info, BUFFER_CREATE_INFO, "pQueueFamilyIndices", a.allocateFrom(JAVA_INT, sharingFamilies));
+            }
             MemorySegment out = a.allocate(JAVA_LONG);
             check(invoke(vkCreateBuffer, dev, info, MemorySegment.NULL, out), "vkCreateBuffer");
             return out.get(JAVA_LONG, 0);
@@ -738,6 +801,16 @@ final class VkCompute {
     }
 
     void submit(MemorySegment queue, MemorySegment cmd, long fence) {
+        submit(queue, cmd, fence, new long[0], new long[0], new long[0], new long[0]);
+    }
+
+    /**
+     * {@code cmd} submitted to {@code queue}, signalling {@code fence}, after every timeline semaphore of
+     * {@code waits} reaches its value of {@code waitValues}, and setting each of {@code signals} to its value of
+     * {@code signalValues} once it has finished. A wait holds back every command of the submission.
+     */
+    void submit(MemorySegment queue, MemorySegment cmd, long fence, long[] waits, long[] waitValues, long[] signals,
+                long[] signalValues) {
         try (Arena a = Arena.ofConfined()) {
             MemorySegment cmds = a.allocate(ADDRESS);
             cmds.set(ADDRESS, 0, cmd);
@@ -745,7 +818,88 @@ final class VkCompute {
             si(info, SUBMIT_INFO, "sType", STYPE_SUBMIT_INFO);
             si(info, SUBMIT_INFO, "commandBufferCount", 1);
             sa(info, SUBMIT_INFO, "pCommandBuffers", cmds);
+            if (waits.length + signals.length > 0) {
+                MemorySegment timeline = a.allocate(TIMELINE_SEMAPHORE_SUBMIT_INFO);
+                si(timeline, TIMELINE_SEMAPHORE_SUBMIT_INFO, "sType", STYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO);
+                if (waits.length > 0) {
+                    int[] stages = new int[waits.length];
+                    java.util.Arrays.fill(stages, PIPELINE_STAGE_ALL_COMMANDS);
+                    si(info, SUBMIT_INFO, "waitSemaphoreCount", waits.length);
+                    sa(info, SUBMIT_INFO, "pWaitSemaphores", a.allocateFrom(JAVA_LONG, waits));
+                    sa(info, SUBMIT_INFO, "pWaitDstStageMask", a.allocateFrom(JAVA_INT, stages));
+                    si(timeline, TIMELINE_SEMAPHORE_SUBMIT_INFO, "waitSemaphoreValueCount", waits.length);
+                    sa(timeline, TIMELINE_SEMAPHORE_SUBMIT_INFO, "pWaitSemaphoreValues",
+                            a.allocateFrom(JAVA_LONG, waitValues));
+                }
+                if (signals.length > 0) {
+                    si(info, SUBMIT_INFO, "signalSemaphoreCount", signals.length);
+                    sa(info, SUBMIT_INFO, "pSignalSemaphores", a.allocateFrom(JAVA_LONG, signals));
+                    si(timeline, TIMELINE_SEMAPHORE_SUBMIT_INFO, "signalSemaphoreValueCount", signals.length);
+                    sa(timeline, TIMELINE_SEMAPHORE_SUBMIT_INFO, "pSignalSemaphoreValues",
+                            a.allocateFrom(JAVA_LONG, signalValues));
+                }
+                sa(info, SUBMIT_INFO, "pNext", timeline);
+            }
             check(invoke(vkQueueSubmit, queue, 1, info, fence), "vkQueueSubmit");
+        }
+    }
+
+    // --- timeline semaphores ---------------------------------------------------------------------------
+
+    /** A timeline semaphore starting at {@code initial}. The device must have been made with the feature. */
+    long createTimeline(long initial) {
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment type = a.allocate(SEMAPHORE_TYPE_CREATE_INFO);
+            si(type, SEMAPHORE_TYPE_CREATE_INFO, "sType", STYPE_SEMAPHORE_TYPE_CREATE_INFO);
+            si(type, SEMAPHORE_TYPE_CREATE_INFO, "semaphoreType", SEMAPHORE_TYPE_TIMELINE);
+            sl(type, SEMAPHORE_TYPE_CREATE_INFO, "initialValue", initial);
+            MemorySegment info = a.allocate(SEMAPHORE_CREATE_INFO);
+            si(info, SEMAPHORE_CREATE_INFO, "sType", STYPE_SEMAPHORE_CREATE_INFO);
+            sa(info, SEMAPHORE_CREATE_INFO, "pNext", type);
+            MemorySegment out = a.allocate(JAVA_LONG);
+            check(invoke(vkCreateSemaphore, dev, info, MemorySegment.NULL, out), "vkCreateSemaphore");
+            return out.get(JAVA_LONG, 0);
+        }
+    }
+
+    void destroySemaphore(long semaphore) {
+        invokeVoid(vkDestroySemaphore, dev, semaphore, MemorySegment.NULL);
+    }
+
+    /** The timeline's value now. */
+    long timelineValue(long semaphore) {
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment out = a.allocate(JAVA_LONG);
+            check(invoke(vkGetSemaphoreCounterValue, dev, semaphore, out), "vkGetSemaphoreCounterValue");
+            return out.get(JAVA_LONG, 0);
+        }
+    }
+
+    /** Blocks until the timeline reaches {@code value}, or {@code timeoutNanos} pass; whether it reached it. */
+    boolean waitTimeline(long semaphore, long value, long timeoutNanos) {
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment info = a.allocate(SEMAPHORE_WAIT_INFO);
+            si(info, SEMAPHORE_WAIT_INFO, "sType", STYPE_SEMAPHORE_WAIT_INFO);
+            si(info, SEMAPHORE_WAIT_INFO, "semaphoreCount", 1);
+            sa(info, SEMAPHORE_WAIT_INFO, "pSemaphores", a.allocateFrom(JAVA_LONG, semaphore));
+            sa(info, SEMAPHORE_WAIT_INFO, "pValues", a.allocateFrom(JAVA_LONG, value));
+            int result = invoke(vkWaitSemaphores, dev, info, timeoutNanos);
+            if (result == VK_TIMEOUT) {
+                return false;
+            }
+            check(result, "vkWaitSemaphores");
+            return true;
+        }
+    }
+
+    /** Sets the timeline to {@code value} from the host. It may only move forward. */
+    void signalTimeline(long semaphore, long value) {
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment info = a.allocate(SEMAPHORE_SIGNAL_INFO);
+            si(info, SEMAPHORE_SIGNAL_INFO, "sType", STYPE_SEMAPHORE_SIGNAL_INFO);
+            sl(info, SEMAPHORE_SIGNAL_INFO, "semaphore", semaphore);
+            sl(info, SEMAPHORE_SIGNAL_INFO, "value", value);
+            check(invoke(vkSignalSemaphore, dev, info), "vkSignalSemaphore");
         }
     }
 

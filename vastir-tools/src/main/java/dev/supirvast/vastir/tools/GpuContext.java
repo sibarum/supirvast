@@ -67,6 +67,8 @@ public final class GpuContext implements AutoCloseable {
     private final VulkanDevice device;
     private final boolean ownsDevice;
     private final VkCompute vk;
+    /** The queue family this context submits to: the device's own, or another it was made with. */
+    private final int family;
     private final List<MemorySegment> queues;
     private int nextQueue;              // round-robin cursor; owning-thread only, no sync needed
     private final long commandPool;
@@ -79,14 +81,15 @@ public final class GpuContext implements AutoCloseable {
     private final int maxSubgroupSize;
     private final boolean subgroupSizeControl;
 
-    private GpuContext(VulkanInstance instance, VulkanDevice device, boolean ownsDevice, ComputeSupport support,
-            String deviceName, String deviceType) {
+    private GpuContext(VulkanInstance instance, VulkanDevice device, int family, boolean ownsDevice,
+            ComputeSupport support, String deviceName, String deviceType) {
         this.instance = instance;
         this.device = device;
         this.ownsDevice = ownsDevice;
         this.vk = new VkCompute(device);
-        this.queues = device.queues();
-        this.commandPool = vk.createCommandPool(device.queueFamilyIndex());
+        this.family = family;
+        this.queues = device.queues(family);
+        this.commandPool = vk.createCommandPool(family);
         this.capabilities = capabilitySet(support);
         this.maxWorkgroupMemoryBytes = support.maxWorkgroupMemoryBytes();
         this.features = featureSet(support);
@@ -180,9 +183,9 @@ public final class GpuContext implements AutoCloseable {
             ComputeSupport support = ComputeSupport.query(instance, info.physicalDevice());
             int queueCount = Math.min(MAX_QUEUES, info.computeQueueCount());
             VulkanDevice device = new VulkanDevice(instance.handle(), instance.selectionFor(info),
-                    VulkanDevice.Request.headlessCompute(support, queueCount));
+                    VulkanDevice.Request.headlessCompute(support, queueCount).withTimelineSemaphore());
             try {
-                return new GpuContext(instance, device, true, support, info.name(),
+                return new GpuContext(instance, device, info.computeQueueFamily(), true, support, info.name(),
                         DeviceSelection.typeName(info.type()));
             } catch (RuntimeException | Error e) {
                 device.close();
@@ -205,21 +208,111 @@ public final class GpuContext implements AutoCloseable {
      * @throws IllegalArgumentException if the device was made for drawing alone
      */
     public static GpuContext on(VulkanInstance instance, VulkanDevice device) {
+        return on(instance, device, device.queueFamilyIndex());
+    }
+
+    /**
+     * As {@link #on(VulkanInstance, VulkanDevice)}, submitting to the device's queues of {@code family} rather than
+     * its own: a compute-only family the device was also made with ({@link VulkanDevice.Request#withQueues}), so
+     * that work here runs alongside whatever the device's own queue draws, rather than in line with it.
+     *
+     * <p>Buffers this context makes may be used from every family the device has, so what it computes can be read
+     * where the device draws. Ordering the two is the caller's: a {@link Timeline} this context signals, waited on
+     * by the submission that reads.
+     *
+     * @throws IllegalArgumentException if the device was made for drawing alone, has no queues of {@code family},
+     *                                  or that family cannot run compute
+     */
+    public static GpuContext on(VulkanInstance instance, VulkanDevice device, int family) {
         ComputeSupport support = device.computeSupport().orElseThrow(() -> new IllegalArgumentException(
                 "the device was made without compute support, so it is not licensed for the instructions a "
                         + "kernel emits; make it with VulkanDevice.Request.presentAndCompute"));
         VulkanInstance.DeviceInfo info = instance.deviceInfos().stream()
                 .filter(d -> d.physicalDevice().equals(device.physicalDevice())).findFirst()
                 .orElseThrow(() -> new IllegalArgumentException("the device is not on that instance"));
-        // The queue the device was made with is the one every dispatch goes to, so it is that family that has to
+        device.queues(family);   // throws if the device has none of that family
+        // The queue this context submits to is the one every dispatch goes to, so it is that family that has to
         // run compute — not merely some family of the device.
-        if (!instance.queueFamilySupports(device.physicalDevice(), device.queueFamilyIndex(),
-                VulkanInstance.QUEUE_COMPUTE)) {
-            throw new IllegalArgumentException("the device's queue family " + device.queueFamilyIndex()
-                    + " on " + info.name() + " cannot run compute, so kernels cannot be dispatched to its queue");
+        if (!instance.queueFamilySupports(device.physicalDevice(), family, VulkanInstance.QUEUE_COMPUTE)) {
+            throw new IllegalArgumentException("queue family " + family + " on " + info.name()
+                    + " cannot run compute, so kernels cannot be dispatched to its queue");
         }
-        return new GpuContext(null, device, false, support, info.name(), DeviceSelection.typeName(info.type()));
+        return new GpuContext(null, device, family, false, support, info.name(),
+                DeviceSelection.typeName(info.type()));
     }
+
+    /** The queue family this context submits to. */
+    public int queueFamily() {
+        return family;
+    }
+
+    // --- timelines -------------------------------------------------------------------------------------
+
+    /**
+     * A timeline semaphore on this context's device: a 64-bit count that submissions advance when they finish
+     * and wait for before they start, on this queue or another of the same device — which is how work on one
+     * queue is ordered after work on another inside the GPU, with no wait on the host. Made at {@code initial}.
+     *
+     * @throws IllegalStateException if the device was made without timeline semaphores
+     */
+    public Timeline timeline(long initial) {
+        if (!device.timelineSemaphore()) {
+            throw new IllegalStateException("the device was made without timeline semaphores; make it with "
+                    + "VulkanDevice.Request.withTimelineSemaphore");
+        }
+        return new Timeline(this, vk.createTimeline(initial));
+    }
+
+    /**
+     * A timeline semaphore, and a value of it. Any thread may read its value or wait on it; Vulkan asks no
+     * synchronisation of either. Close it after every submission that waits on or signals it has finished.
+     */
+    public static final class Timeline implements AutoCloseable {
+        private final GpuContext context;
+        private final long semaphore;
+        private boolean closed;
+
+        private Timeline(GpuContext context, long semaphore) {
+            this.context = context;
+            this.semaphore = semaphore;
+        }
+
+        /** The {@code VkSemaphore}, for a submission elsewhere on the same device to wait on or signal. */
+        public long handle() {
+            return semaphore;
+        }
+
+        /** The count now. */
+        public long value() {
+            return context.vk.timelineValue(semaphore);
+        }
+
+        /** Blocks until the count reaches {@code value}, or {@code timeoutNanos} pass; whether it reached it. */
+        public boolean await(long value, long timeoutNanos) {
+            return context.vk.waitTimeline(semaphore, value, timeoutNanos);
+        }
+
+        /** Sets the count to {@code value} from the host. A timeline only moves forward. */
+        public void signal(long value) {
+            context.vk.signalTimeline(semaphore, value);
+        }
+
+        /** This timeline at {@code value}: something to wait for, or to signal. */
+        public Point at(long value) {
+            return new Point(this, value);
+        }
+
+        @Override
+        public void close() {
+            if (!closed) {
+                closed = true;
+                context.vk.destroySemaphore(semaphore);
+            }
+        }
+    }
+
+    /** A timeline and a value of it. */
+    public record Point(Timeline timeline, long value) {}
 
     /**
      * Builds a resident pipeline for {@code spirv}'s {@code entryPoint} over {@code bindingCount} storage
@@ -616,6 +709,15 @@ public final class GpuContext implements AutoCloseable {
      * @return the run's serial, for {@link #done} and {@link #await}
      */
     public long submit(RecordedSequence sequence) {
+        return submit(sequence, List.of(), List.of());
+    }
+
+    /**
+     * As {@link #submit(RecordedSequence)}, starting only once every timeline of {@code waits} has reached its
+     * value, and setting every timeline of {@code signals} to its value once it has finished. The timelines may be
+     * any on the same device, signalled from any queue or from the host.
+     */
+    public long submit(RecordedSequence sequence, List<Point> waits, List<Point> signals) {
         if (sequence.closed) {
             throw new IllegalStateException("the sequence is closed");
         }
@@ -623,11 +725,20 @@ public final class GpuContext implements AutoCloseable {
             retire(pending.removeFirst(), true);
         }
         long fence = vk.createFence();
-        vk.submit(queues.get(0), sequence.cmd, fence);
+        vk.submit(queues.get(0), sequence.cmd, fence, handles(waits), values(waits), handles(signals),
+                values(signals));
         long serial = ++submitted;
         pending.addLast(new Pending(serial, null, fence, 0L));   // the sequence keeps its own
         reclaim();
         return serial;
+    }
+
+    private static long[] handles(List<Point> points) {
+        return points.stream().mapToLong(p -> p.timeline().handle()).toArray();
+    }
+
+    private static long[] values(List<Point> points) {
+        return points.stream().mapToLong(Point::value).toArray();
     }
 
     /**

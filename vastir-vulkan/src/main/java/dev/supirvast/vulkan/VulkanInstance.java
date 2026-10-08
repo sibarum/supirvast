@@ -124,7 +124,7 @@ public final class VulkanInstance implements AutoCloseable {
                     1024 - 20 - VK_MAX_PHYSICAL_DEVICE_NAME_SIZE - VK_UUID_SIZE - 4 - 36 - 8 - 4 - 16 - 38 * 4 - 4)
     ).withName("VkPhysicalDeviceProperties");
 
-    /** VkQueueFamilyProperties — 24 bytes; only queueFlags is read here. */
+    /** VkQueueFamilyProperties — 24 bytes; the granularity is not read here. */
     private static final GroupLayout QUEUE_FAMILY_PROPERTIES = MemoryLayout.structLayout(
             JAVA_INT.withName("queueFlags"),
             JAVA_INT.withName("queueCount"),
@@ -169,6 +169,7 @@ public final class VulkanInstance implements AutoCloseable {
             Ffi.field(PHYSICAL_DEVICE_PROPERTIES, "maxPushConstantsSize");
     private static final VarHandle QFP_queueFlags = Ffi.field(QUEUE_FAMILY_PROPERTIES, "queueFlags");
     private static final VarHandle QFP_queueCount = Ffi.field(QUEUE_FAMILY_PROPERTIES, "queueCount");
+    private static final VarHandle QFP_timestampValidBits = Ffi.field(QUEUE_FAMILY_PROPERTIES, "timestampValidBits");
     private static final int VK_QUEUE_COMPUTE_BIT = 0x0002;
 
     /**
@@ -564,6 +565,64 @@ public final class VulkanInstance implements AutoCloseable {
 
     /** {@code VK_QUEUE_COMPUTE_BIT}, for {@link #queueFamilySupports}. */
     public static final int QUEUE_COMPUTE = VK_QUEUE_COMPUTE_BIT;
+
+    /** {@code VK_QUEUE_GRAPHICS_BIT}, for {@link #queueFamilySupports}. */
+    public static final int QUEUE_GRAPHICS = VK_QUEUE_GRAPHICS_BIT;
+
+    /**
+     * A queue family of a physical device, as {@code vkGetPhysicalDeviceQueueFamilyProperties} reports it.
+     *
+     * @param flags              its {@code VK_QUEUE_*} bits
+     * @param queueCount         how many queues it offers
+     * @param timestampValidBits how many bits of a timestamp written on its queues are meaningful; 0 for none
+     */
+    public record QueueFamily(int index, int flags, int queueCount, int timestampValidBits) {
+
+        /** Whether it has every one of {@code bits}. */
+        public boolean has(int bits) {
+            return (flags & bits) == bits;
+        }
+    }
+
+    /** Every queue family of {@code physicalDevice}, in index order. */
+    public List<QueueFamily> queueFamilies(MemorySegment physicalDevice) {
+        try (Arena temp = Arena.ofConfined()) {
+            MemorySegment pCount = temp.allocate(JAVA_INT);
+            try {
+                vkGetPhysicalDeviceQueueFamilyProperties.invokeExact(physicalDevice, pCount, MemorySegment.NULL);
+            } catch (Throwable t) {
+                throw NativeException.rethrow("vkGetPhysicalDeviceQueueFamilyProperties", t);
+            }
+            int count = pCount.get(JAVA_INT, 0);
+            MemorySegment props = temp.allocate(QUEUE_FAMILY_PROPERTIES, count);
+            try {
+                vkGetPhysicalDeviceQueueFamilyProperties.invokeExact(physicalDevice, pCount, props);
+            } catch (Throwable t) {
+                throw NativeException.rethrow("vkGetPhysicalDeviceQueueFamilyProperties", t);
+            }
+            List<QueueFamily> families = new ArrayList<>();
+            for (int f = 0; f < count; f++) {
+                MemorySegment family = props.asSlice(f * QFP_STRIDE, QFP_STRIDE);
+                families.add(new QueueFamily(f, (int) QFP_queueFlags.get(family), (int) QFP_queueCount.get(family),
+                        (int) QFP_timestampValidBits.get(family)));
+            }
+            return List.copyOf(families);
+        }
+    }
+
+    /**
+     * The first queue family of {@code physicalDevice} that runs compute and not graphics, or -1 if it has none.
+     * What a device has for asynchronous compute: its queues run alongside the graphics queue's work rather than
+     * in line with it, which is the point of giving a simulation one.
+     */
+    public int computeOnlyQueueFamily(MemorySegment physicalDevice) {
+        for (QueueFamily family : queueFamilies(physicalDevice)) {
+            if (family.has(VK_QUEUE_COMPUTE_BIT) && !family.has(VK_QUEUE_GRAPHICS_BIT)) {
+                return family.index();
+            }
+        }
+        return -1;
+    }
 
     /** {@code {family, queueCount}} of the first queue family with compute, or {@code {-1, 0}}. */
     private int[] computeQueueFamily(MemorySegment device) {

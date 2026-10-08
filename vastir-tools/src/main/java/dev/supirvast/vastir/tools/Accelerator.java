@@ -291,6 +291,19 @@ public final class Accelerator implements AutoCloseable {
         return new DispatchSequence.Builder(this);
     }
 
+    /**
+     * A timeline semaphore on this accelerator's device, at {@code initial}: what a {@link DispatchSequence#run(List,
+     * List) run} waits for or signals, to be ordered against work on another queue of the same device.
+     *
+     * @throws IllegalStateException with no GPU, or on a device made without timeline semaphores
+     */
+    public GpuContext.Timeline timeline(long initial) {
+        if (!gpuAvailable()) {
+            throw new IllegalStateException("no GPU, so no timeline semaphore");
+        }
+        return context().timeline(initial);
+    }
+
     /** Records {@code steps} into one command buffer when all of them can run on the GPU; see the class. */
     DispatchSequence buildSequence(List<DispatchSequence.Step> steps) {
         for (DispatchSequence.Step step : steps) {
@@ -316,9 +329,10 @@ public final class Accelerator implements AutoCloseable {
     }
 
     /** Submits a recorded sequence's run; called by {@link DispatchSequence#run}. Returns without waiting. */
-    Completion submitSequence(GpuContext.RecordedSequence recorded) {
+    Completion submitSequence(GpuContext.RecordedSequence recorded, List<GpuContext.Point> waits,
+                              List<GpuContext.Point> signals) {
         GpuContext opened = context();
-        return new Completion(opened, opened.submit(recorded));
+        return new Completion(opened, opened.submit(recorded, waits, signals));
     }
 
     /** Stops tracking a sequence its caller has closed. */

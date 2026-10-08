@@ -107,15 +107,28 @@ public final class VulkanDevice implements AutoCloseable {
      *                          caller that shares memory or semaphores with another API. The caller checks they
      *                          are supported; asking for one that is not fails {@code vkCreateDevice}
      * @param timelineSemaphore enable the {@code timelineSemaphore} feature (core since 1.2, and required there)
+     * @param moreQueues        queues from families besides the selection's — a compute-only family, say, so that a
+     *                          simulation has a queue of its own beside the one that draws. Each family once, and
+     *                          not the selection's own
      */
     public record Request(boolean swapchain, ComputeSupport compute, int queueCount,
-                          java.util.List<String> extraExtensions, boolean timelineSemaphore) {
+                          java.util.List<String> extraExtensions, boolean timelineSemaphore,
+                          java.util.List<Queues> moreQueues) {
 
         public Request {
             if (queueCount < 1) {
                 throw new IllegalArgumentException("a device needs at least one queue, got " + queueCount);
             }
             extraExtensions = extraExtensions == null ? java.util.List.of() : java.util.List.copyOf(extraExtensions);
+            moreQueues = moreQueues == null ? java.util.List.of() : java.util.List.copyOf(moreQueues);
+            if (moreQueues.stream().map(Queues::family).distinct().count() != moreQueues.size()) {
+                throw new IllegalArgumentException("each family once, got " + moreQueues);
+            }
+        }
+
+        public Request(boolean swapchain, ComputeSupport compute, int queueCount,
+                       java.util.List<String> extraExtensions, boolean timelineSemaphore) {
+            this(swapchain, compute, queueCount, extraExtensions, timelineSemaphore, java.util.List.of());
         }
 
         public Request(boolean swapchain, ComputeSupport compute, int queueCount) {
@@ -126,12 +139,19 @@ public final class VulkanDevice implements AutoCloseable {
         public Request withExtensions(java.util.List<String> extensions) {
             java.util.List<String> all = new java.util.ArrayList<>(extraExtensions);
             all.addAll(extensions);
-            return new Request(swapchain, compute, queueCount, all, timelineSemaphore);
+            return new Request(swapchain, compute, queueCount, all, timelineSemaphore, moreQueues);
         }
 
         /** This request, also enabling timeline semaphores. */
         public Request withTimelineSemaphore() {
-            return new Request(swapchain, compute, queueCount, extraExtensions, true);
+            return new Request(swapchain, compute, queueCount, extraExtensions, true, moreQueues);
+        }
+
+        /** This request, also taking {@code count} queues of {@code family} at {@code priority}. */
+        public Request withQueues(int family, int count, float priority) {
+            java.util.List<Queues> all = new java.util.ArrayList<>(moreQueues);
+            all.add(new Queues(family, count, priority));
+            return new Request(swapchain, compute, queueCount, extraExtensions, timelineSemaphore, all);
         }
 
         /** A device that can present, and draws: what a windowed run needs. */
@@ -150,9 +170,29 @@ public final class VulkanDevice implements AutoCloseable {
         }
     }
 
+    /**
+     * Queues to take from one family.
+     *
+     * @param priority between 0 and 1, relative to the device's other queues: a hint to the driver of whose work
+     *                 to favour when both have some, which the selection's queues have at 1. Drivers are free to
+     *                 ignore it, and some do
+     */
+    public record Queues(int family, int count, float priority) {
+
+        public Queues {
+            if (family < 0 || count < 1 || !(priority >= 0) || !(priority <= 1)) {
+                throw new IllegalArgumentException("a family, at least one queue, and a priority in [0, 1]; got "
+                        + family + ", " + count + ", " + priority);
+            }
+        }
+    }
+
     private final MemorySegment handle;
     private final MemorySegment physicalDevice;
     private final java.util.List<MemorySegment> queues;
+    /** Every family's queues, the selection's first. */
+    private final java.util.Map<Integer, java.util.List<MemorySegment>> familyQueues;
+    private final boolean timelineSemaphore;
     private final ComputeSupport compute;
     private final int queueFamilyIndex;
     private final int maxPushConstantBytes;
@@ -176,6 +216,13 @@ public final class VulkanDevice implements AutoCloseable {
         this.queueFamilyIndex = selection.queueFamilyIndex();
         this.maxPushConstantBytes = selection.maxPushConstantBytes();
         this.compute = request.compute();
+        this.timelineSemaphore = request.timelineSemaphore();
+        for (Queues more : request.moreQueues()) {
+            if (more.family() == queueFamilyIndex) {
+                throw new IllegalArgumentException("family " + more.family() + " is the selection's own; ask for "
+                        + "more of its queues with queueCount");
+            }
+        }
 
         MethodHandle vkCreateDevice = VkLoader.instanceCommand(instance, "vkCreateDevice",
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS));
@@ -184,17 +231,25 @@ public final class VulkanDevice implements AutoCloseable {
         this.vkGetPhysicalDeviceMemoryProperties = VkLoader.instanceCommand(instance,
                 "vkGetPhysicalDeviceMemoryProperties", FunctionDescriptor.ofVoid(ADDRESS, ADDRESS));
 
+        // The selection's family first, at full priority, then each family more queues were asked of.
+        java.util.List<Queues> asked = new java.util.ArrayList<>();
+        asked.add(new Queues(queueFamilyIndex, request.queueCount(), 1.0f));
+        asked.addAll(request.moreQueues());
         try (Arena temp = Arena.ofConfined()) {
-            int queueCount = request.queueCount();
-            MemorySegment queueInfo = temp.allocate(DEVICE_QUEUE_CREATE_INFO);
-            QCI_sType.set(queueInfo, VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO);
-            QCI_queueFamilyIndex.set(queueInfo, queueFamilyIndex);
-            QCI_queueCount.set(queueInfo, queueCount);
-            MemorySegment priorities = temp.allocate(JAVA_FLOAT, queueCount);
-            for (int q = 0; q < queueCount; q++) {
-                priorities.setAtIndex(JAVA_FLOAT, q, 1.0f);
+            MemorySegment queueInfos = temp.allocate(DEVICE_QUEUE_CREATE_INFO, asked.size());
+            for (int f = 0; f < asked.size(); f++) {
+                Queues family = asked.get(f);
+                MemorySegment queueInfo = queueInfos.asSlice(f * DEVICE_QUEUE_CREATE_INFO.byteSize(),
+                        DEVICE_QUEUE_CREATE_INFO.byteSize());
+                QCI_sType.set(queueInfo, VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO);
+                QCI_queueFamilyIndex.set(queueInfo, family.family());
+                QCI_queueCount.set(queueInfo, family.count());
+                MemorySegment priorities = temp.allocate(JAVA_FLOAT, family.count());
+                for (int q = 0; q < family.count(); q++) {
+                    priorities.setAtIndex(JAVA_FLOAT, q, family.priority());
+                }
+                QCI_pQueuePriorities.set(queueInfo, priorities);
             }
-            QCI_pQueuePriorities.set(queueInfo, priorities);
 
             java.util.List<String> extensions = new java.util.ArrayList<>();
             if (request.swapchain()) {
@@ -229,8 +284,8 @@ public final class VulkanDevice implements AutoCloseable {
             MemorySegment createInfo = temp.allocate(DEVICE_CREATE_INFO);
             DCI_sType.set(createInfo, VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO);
             DCI_pNext.set(createInfo, features);
-            DCI_queueCreateInfoCount.set(createInfo, 1);
-            DCI_pQueueCreateInfos.set(createInfo, queueInfo);
+            DCI_queueCreateInfoCount.set(createInfo, asked.size());
+            DCI_pQueueCreateInfos.set(createInfo, queueInfos);
             DCI_enabledExtensionCount.set(createInfo, extensions.size());
             DCI_ppEnabledExtensionNames.set(createInfo, extArray);
 
@@ -253,19 +308,24 @@ public final class VulkanDevice implements AutoCloseable {
         this.vkDeviceWaitIdle = command("vkDeviceWaitIdle", FunctionDescriptor.of(JAVA_INT, ADDRESS));
         this.vkDestroyDevice = command("vkDestroyDevice", FunctionDescriptor.ofVoid(ADDRESS, ADDRESS));
 
-        java.util.List<MemorySegment> taken = new java.util.ArrayList<>();
+        java.util.Map<Integer, java.util.List<MemorySegment>> byFamily = new java.util.LinkedHashMap<>();
         try (Arena temp = Arena.ofConfined()) {
             MemorySegment pQueue = temp.allocate(ADDRESS);
-            for (int q = 0; q < request.queueCount(); q++) {
-                try {
-                    vkGetDeviceQueue.invokeExact(handle, queueFamilyIndex, q, pQueue);
-                } catch (Throwable t) {
-                    throw NativeException.rethrow("vkGetDeviceQueue", t);
+            for (Queues family : asked) {
+                java.util.List<MemorySegment> taken = new java.util.ArrayList<>();
+                for (int q = 0; q < family.count(); q++) {
+                    try {
+                        vkGetDeviceQueue.invokeExact(handle, family.family(), q, pQueue);
+                    } catch (Throwable t) {
+                        throw NativeException.rethrow("vkGetDeviceQueue", t);
+                    }
+                    taken.add(pQueue.get(ADDRESS, 0));
                 }
-                taken.add(pQueue.get(ADDRESS, 0));
+                byFamily.put(family.family(), java.util.List.copyOf(taken));
             }
         }
-        this.queues = java.util.List.copyOf(taken);
+        this.familyQueues = java.util.Collections.unmodifiableMap(byFamily);
+        this.queues = familyQueues.get(queueFamilyIndex);
     }
 
     /** Resolve and bind a device-level command through {@code vkGetDeviceProcAddr}. Callers cache the result. */
@@ -354,6 +414,31 @@ public final class VulkanDevice implements AutoCloseable {
      */
     public java.util.List<MemorySegment> queues() {
         return queues;
+    }
+
+    /**
+     * The queues taken from {@code family}: the selection's, or one {@link Request#moreQueues} asked for. Each must
+     * be externally synchronised, as {@link #queues()} says.
+     *
+     * @throws IllegalArgumentException if the device was made with no queues of that family
+     */
+    public java.util.List<MemorySegment> queues(int family) {
+        java.util.List<MemorySegment> taken = familyQueues.get(family);
+        if (taken == null) {
+            throw new IllegalArgumentException("the device has no queues of family " + family + "; it has "
+                    + familyQueues.keySet());
+        }
+        return taken;
+    }
+
+    /** The families the device has queues of, the selection's first. */
+    public java.util.List<Integer> queueFamilies() {
+        return java.util.List.copyOf(familyQueues.keySet());
+    }
+
+    /** Whether the device was made with timeline semaphores ({@link Request#timelineSemaphore}). */
+    public boolean timelineSemaphore() {
+        return timelineSemaphore;
     }
 
     /**
