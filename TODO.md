@@ -20,6 +20,12 @@ highest-value next proof; **P1** deepens the language; **P2** broadens targets; 
 - [x] Bundled native toolchain (`spirv-val`/`dis`/`as`/`opt`, `spirv-cross`) auto-fetched from pinned Vulkan SDK
 - [x] `VulkanCompute` — headless LWJGL compute dispatch, runs our SPIR-V on the GPU
 - [x] `DifferentialHarness` — same `core` body on CPU (Truffle) and GPU (Vulkan), **results asserted equal**
+- [x] A multi-pass program as data, and one runner for it (2026-10-08). `Body` (`vastir.build`) writes a kernel
+      by hand; `Pass`, `BufferSpec` and `Buffered` (`vastir.pass`) describe passes over named buffers; `PassRunner`
+      (vastir-tools) allocates, registers once, records each pass list once as a `DispatchSequence`, or runs the
+      same passes on the CPU. Moved down from vexelray-sim-core, whose simulations each had a runner of their own.
+      *Next candidate:* the counting sort and prefix scan in vexelray-sim-fluid's `Sort`, whose scan and permute
+      are general.
 
 ---
 
