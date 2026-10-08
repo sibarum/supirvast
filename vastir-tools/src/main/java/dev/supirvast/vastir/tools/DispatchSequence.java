@@ -70,8 +70,12 @@ public final class DispatchSequence implements AutoCloseable {
         }
     }
 
-    /** Runs every step, in order: one submission on the GPU, the dispatches one by one otherwise. */
-    public void run() {
+    /**
+     * Runs every step, in order: one submission on the GPU, the dispatches one by one otherwise. Returns without
+     * waiting for the GPU; the {@link Completion} says when the run has finished. Dispatches one by one have
+     * finished when it returns.
+     */
+    public Completion run() {
         if (closed) {
             throw new IllegalStateException("the sequence is closed");
         }
@@ -83,12 +87,12 @@ public final class DispatchSequence implements AutoCloseable {
             }
         }
         if (recorded()) {
-            accelerator.submitSequence(recorded);
-            return;
+            return accelerator.submitSequence(recorded);
         }
         for (Step step : steps) {
             step.handle().dispatch(step.buffers(), step.invocations());
         }
+        return Completion.DONE;
     }
 
     /**

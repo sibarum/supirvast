@@ -114,6 +114,21 @@ public final class Accelerator implements AutoCloseable {
         return on(context, SpirvTarget.unconstrained());
     }
 
+    /**
+     * An accelerator on a device of its own, chosen by {@code selector} as {@code -Dsupirvast.gpu} would choose
+     * one ({@code discrete}, {@code integrated}, or part of a device's name) but for this accelerator alone: so one
+     * process can compute on the integrated GPU while it draws on the discrete one. It opens the device now, and
+     * closes it with itself.
+     *
+     * @throws IllegalStateException if no compute device matches, naming the devices there are
+     */
+    public static Accelerator onDevice(String selector) {
+        Accelerator accelerator = new Accelerator(SpirvTarget.unconstrained());
+        accelerator.context = GpuContext.open(selector);
+        accelerator.gpuAvailable = true;
+        return accelerator;
+    }
+
     /** As {@link #on(GpuContext)}, refusing any capability outside {@code budget}. */
     public static Accelerator on(GpuContext context, SpirvTarget budget) {
         Accelerator accelerator = new Accelerator(budget);
@@ -300,9 +315,10 @@ public final class Accelerator implements AutoCloseable {
         return sequence;
     }
 
-    /** Submits a recorded sequence's run; called by {@link DispatchSequence#run}. */
-    void submitSequence(GpuContext.RecordedSequence recorded) {
-        context().submit(recorded);
+    /** Submits a recorded sequence's run; called by {@link DispatchSequence#run}. Returns without waiting. */
+    Completion submitSequence(GpuContext.RecordedSequence recorded) {
+        GpuContext opened = context();
+        return new Completion(opened, opened.submit(recorded));
     }
 
     /** Stops tracking a sequence its caller has closed. */

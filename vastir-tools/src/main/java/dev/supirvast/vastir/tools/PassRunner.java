@@ -77,8 +77,12 @@ public abstract sealed class PassRunner implements AutoCloseable permits PassRun
     /** Sets every buffer to zero. */
     public abstract void clear();
 
-    /** Runs every pass of {@code passes}, in order. A list is recorded on its first run; pass the same list again. */
-    public abstract void run(List<Pass> passes);
+    /**
+     * Runs every pass of {@code passes}, in order. A list is recorded on its first run; pass the same list again.
+     * Returns without waiting for the GPU; the {@link Completion} says when the passes have finished. On the CPU
+     * they have finished when it returns.
+     */
+    public abstract Completion run(List<Pass> passes);
 
     /** Overwrites the start of {@code buffer} with {@code words}. */
     public abstract void write(String buffer, int[] words);
@@ -153,8 +157,8 @@ public abstract sealed class PassRunner implements AutoCloseable permits PassRun
         }
 
         @Override
-        public void run(List<Pass> passes) {
-            sequences.computeIfAbsent(passes, list -> {
+        public Completion run(List<Pass> passes) {
+            return sequences.computeIfAbsent(passes, list -> {
                 DispatchSequence.Builder builder = accelerator.sequence();
                 for (Pass pass : list) {
                     builder.dispatch(handle(pass), pass.buffers().stream().map(buffers::get).toList(),
@@ -239,11 +243,12 @@ public abstract sealed class PassRunner implements AutoCloseable permits PassRun
         }
 
         @Override
-        public void run(List<Pass> passes) {
+        public Completion run(List<Pass> passes) {
             for (Pass pass : passes) {
                 kernel(pass).dispatch(pass.buffers().stream().map(arrays::get).toArray(int[][]::new),
                         pass.invocations());
             }
+            return Completion.DONE;
         }
 
         private CpuKernel kernel(Pass pass) {

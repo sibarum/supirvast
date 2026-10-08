@@ -126,7 +126,7 @@ public final class GpuContext implements AutoCloseable {
      */
     public static boolean isAvailable() {
         try (VulkanInstance probe = new VulkanInstance(APPLICATION_NAME, List.of())) {
-            return pickComputeDevice(probe) != null;
+            return pickComputeDevice(probe, DeviceSelection.selector()) != null;
         } catch (NoSuchDevice unmatched) {
             throw unmatched;
         } catch (RuntimeException | LinkageError e) {
@@ -155,11 +155,25 @@ public final class GpuContext implements AutoCloseable {
         return deviceType;
     }
 
-    /** Creates the resident context (instance, device, queue, command pool). Caller must {@link #close()} it. */
+    /**
+     * Creates the resident context (instance, device, queue, command pool) on the device {@code -Dsupirvast.gpu}
+     * chooses, or the default one. Caller must {@link #close()} it.
+     */
     public static GpuContext open() {
+        return open(DeviceSelection.selector());
+    }
+
+    /**
+     * As {@link #open()}, on the device {@code selector} chooses — {@code discrete}, {@code integrated}, or part of
+     * a device's name, as {@code -Dsupirvast.gpu} takes them — whatever the system property says. Null or blank is
+     * the default choice. So one process may compute on one GPU and draw on another.
+     *
+     * @throws IllegalStateException if a selector is given and no compute device matches it, naming those there are
+     */
+    public static GpuContext open(String selector) {
         VulkanInstance instance = new VulkanInstance(APPLICATION_NAME, List.of());
         try {
-            VulkanInstance.DeviceInfo info = pickComputeDevice(instance);
+            VulkanInstance.DeviceInfo info = pickComputeDevice(instance, selector);
             if (info == null) {
                 throw new IllegalStateException("no Vulkan compute device available");
             }
@@ -350,11 +364,19 @@ public final class GpuContext implements AutoCloseable {
 
     private final java.util.ArrayDeque<Pending> pending = new java.util.ArrayDeque<>();
 
+    /** The serial the last resident submission was given; the first is 1. */
+    private long submitted;
     /**
-     * A submitted resident command buffer and what to free once its fence signals — both null/0 for a run of a
-     * {@link RecordedSequence}, which owns them itself.
+     * The highest serial known finished. Resident work is all on one queue, which runs in order, so everything at
+     * or below it has finished too.
      */
-    private record Pending(MemorySegment cmd, long fence, long descriptorPool) {}
+    private long completed;
+
+    /**
+     * A submitted resident command buffer, its serial, and what to free once its fence signals — both null/0 for
+     * a run of a {@link RecordedSequence}, which owns them itself.
+     */
+    private record Pending(long serial, MemorySegment cmd, long fence, long descriptorPool) {}
 
     /**
      * A storage buffer in device-local memory that outlives dispatches. {@linkplain #allocateBuffer Made} on any
@@ -532,7 +554,7 @@ public final class GpuContext implements AutoCloseable {
 
         long fence = vk.createFence();
         vk.submit(queues.get(0), cmd, fence);
-        pending.addLast(new Pending(cmd, fence, descriptorPool));
+        pending.addLast(new Pending(++submitted, cmd, fence, descriptorPool));
         reclaim();
     }
 
@@ -590,8 +612,10 @@ public final class GpuContext implements AutoCloseable {
     /**
      * Submits a recorded sequence's dispatches in one submission, without waiting. Like {@link
      * #dispatchResident}, it is ordered after all resident work submitted before it and before all after.
+     *
+     * @return the run's serial, for {@link #done} and {@link #await}
      */
-    public void submit(RecordedSequence sequence) {
+    public long submit(RecordedSequence sequence) {
         if (sequence.closed) {
             throw new IllegalStateException("the sequence is closed");
         }
@@ -600,8 +624,26 @@ public final class GpuContext implements AutoCloseable {
         }
         long fence = vk.createFence();
         vk.submit(queues.get(0), sequence.cmd, fence);
-        pending.addLast(new Pending(null, fence, 0L));   // the sequence keeps its own
+        long serial = ++submitted;
+        pending.addLast(new Pending(serial, null, fence, 0L));   // the sequence keeps its own
         reclaim();
+        return serial;
+    }
+
+    /**
+     * Whether the resident submission given {@code serial} has finished, without waiting. Everything submitted
+     * before it has then finished too: resident work runs on one queue, in order.
+     */
+    public boolean done(long serial) {
+        reclaim();
+        return completed >= serial;
+    }
+
+    /** Blocks until the resident submission given {@code serial}, and everything before it, has finished. */
+    public void await(long serial) {
+        while (completed < serial && !pending.isEmpty()) {
+            retire(pending.removeFirst(), true);
+        }
     }
 
     /**
@@ -664,16 +706,19 @@ public final class GpuContext implements AutoCloseable {
             vk.freeCommandBuffer(commandPool, work.cmd());
             vk.destroyDescriptorPool(work.descriptorPool());
         }
+        completed = Math.max(completed, work.serial());
     }
 
     /** Submits a copy on the resident queue — ordered after every pending dispatch — and waits for it. */
     private void submitResidentAndWait(MemorySegment cmd) {
         long fence = vk.createFence();
         vk.submit(queues.get(0), cmd, fence);
+        long serial = ++submitted;
         vk.waitFence(fence);
         vk.destroyFence(fence);
         vk.freeCommandBuffer(commandPool, cmd);
         reclaim();   // the queue is in order, so everything submitted before this copy has finished too
+        completed = Math.max(completed, serial);
     }
 
     /**
@@ -732,8 +777,8 @@ public final class GpuContext implements AutoCloseable {
 
     // --- device choice and what it supports ------------------------------------------------------------
 
-    /** The device to run on, by the one policy ({@link DeviceSelection}); null when there is none to run on. */
-    private static VulkanInstance.DeviceInfo pickComputeDevice(VulkanInstance instance) {
+    /** The device {@code selector} chooses, by the one policy ({@link DeviceSelection}); null when there is none. */
+    private static VulkanInstance.DeviceInfo pickComputeDevice(VulkanInstance instance, String selector) {
         List<VulkanInstance.DeviceInfo> infos = instance.deviceInfos();
         if (infos.isEmpty()) {
             return null;
@@ -744,7 +789,7 @@ public final class GpuContext implements AutoCloseable {
         }
         int chosen;
         try {
-            chosen = DeviceSelection.choose(candidates, DeviceSelection.selector());
+            chosen = DeviceSelection.choose(candidates, selector);
         } catch (IllegalStateException unmatched) {
             throw new NoSuchDevice(unmatched.getMessage());
         }
