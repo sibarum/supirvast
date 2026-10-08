@@ -24,8 +24,14 @@ highest-value next proof; **P1** deepens the language; **P2** broadens targets; 
       by hand; `Pass`, `BufferSpec` and `Buffered` (`vastir.pass`) describe passes over named buffers; `PassRunner`
       (vastir-tools) allocates, registers once, records each pass list once as a `DispatchSequence`, or runs the
       same passes on the CPU. Moved down from vexelray-sim-core, whose simulations each had a runner of their own.
-      *Next candidate:* the counting sort and prefix scan in vexelray-sim-fluid's `Sort`, whose scan and permute
-      are general.
+- [x] A counting sort on the device (2026-10-08): `CountingSort` (`vastir.pass`), from vexelray-sim-fluid's `Sort`
+      and made general. The key is the caller's: `count` is a fragment of the caller's own kernel, which takes the
+      atomic that counts and ranks. Then three scan passes (blocks in workgroup memory, one workgroup over the
+      block sums, offsets added and counts zeroed), and either `permute` of f32 fields or `order`, which lists the
+      items by key and leaves them where they are. Every pass at a workgroup of `BLOCK`. Not stable. First user:
+      vexelray-sim-rigid's grid broad phase. `CountingSortTest`: 70 001 keys, so the block sums take two chunks,
+      against the host on each backend, and a second sort on the counts the first left at zero.
+      *Still TODO:* vexelray-sim-fluid's `FlipStep` onto it, and its `Sort` deleted.
 
 ---
 
