@@ -509,7 +509,8 @@ final class VkCompute {
         }
     }
 
-    private MemorySegment map(long memory, long size) {
+    /** {@code size} bytes of {@code memory}, mapped until it is unmapped or freed. */
+    MemorySegment map(long memory, long size) {
         try (Arena a = Arena.ofConfined()) {
             MemorySegment pData = a.allocate(ADDRESS);
             check(invoke(vkMapMemory, dev, memory, 0L, size, 0, pData), "vkMapMemory");
@@ -764,6 +765,11 @@ final class VkCompute {
         int stages = PIPELINE_STAGE_COMPUTE_SHADER | PIPELINE_STAGE_TRANSFER;
         memoryBarrier(cmd, stages, stages, ACCESS_SHADER_WRITE | ACCESS_TRANSFER_WRITE,
                 ACCESS_SHADER_READ | ACCESS_SHADER_WRITE | ACCESS_TRANSFER_READ | ACCESS_TRANSFER_WRITE);
+    }
+
+    /** A shader's write made visible to the host's read of it, for memory the host reads where it is. */
+    void shaderToHostBarrier(MemorySegment cmd) {
+        memoryBarrier(cmd, PIPELINE_STAGE_COMPUTE_SHADER, PIPELINE_STAGE_HOST, ACCESS_SHADER_WRITE, ACCESS_HOST_READ);
     }
 
     /** A transfer write made visible to the host's read of it. */

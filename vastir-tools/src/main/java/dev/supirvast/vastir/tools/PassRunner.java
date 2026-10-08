@@ -90,6 +90,12 @@ public abstract sealed class PassRunner implements AutoCloseable permits PassRun
     /** The whole of {@code buffer}, after everything run before. */
     public abstract int[] read(String buffer);
 
+    /**
+     * The whole of a {@linkplain dev.supirvast.vastir.pass.BufferSpec#readout readout} {@code buffer}, as the last
+     * run whose {@link Completion} has been awaited left it: read where it is, with no submission and no wait.
+     */
+    public abstract int[] peek(String buffer);
+
     /** Waits for everything run so far. Nothing to wait for on the CPU. */
     public abstract void finish();
 
@@ -132,13 +138,24 @@ public abstract sealed class PassRunner implements AutoCloseable permits PassRun
         private final Accelerator accelerator;
         private final Map<String, ResidentBuffer> buffers = new LinkedHashMap<>();
         private final Map<Pass, KernelHandle> handles = Collections.synchronizedMap(new IdentityHashMap<>());
+        /**
+         * Every kernel registered, by its function and what it is bound to: passes that differ only in which buffers
+         * of the same lengths they name share one pipeline, rather than lowering and compiling it again each.
+         */
+        private final Map<KernelKey, KernelHandle> compiled = Collections.synchronizedMap(new java.util.HashMap<>());
         private final Map<List<Pass>, DispatchSequence> sequences = new IdentityHashMap<>();
 
         Gpu(Accelerator accelerator, Buffered program, int workgroup, int subgroup) {
             super(program, workgroup, subgroup);
             this.accelerator = accelerator;
-            program.buffers().forEach((name, spec) ->
-                    buffers.put(name, accelerator.allocate(spec.element(), spec.length())));
+            program.buffers().forEach((name, spec) -> buffers.put(name, spec.readout()
+                    ? accelerator.allocateReadout(spec.element(), spec.length())
+                    : accelerator.allocate(spec.element(), spec.length())));
+        }
+
+        @Override
+        public int[] peek(String buffer) {
+            return resident(buffer).peek();
         }
 
         @Override
@@ -169,7 +186,7 @@ public abstract sealed class PassRunner implements AutoCloseable permits PassRun
         }
 
         private KernelHandle handle(Pass pass) {
-            return handles.computeIfAbsent(pass, p -> {
+            return handles.computeIfAbsent(pass, p -> compiled.computeIfAbsent(KernelKey.of(p, buffers), key -> {
                 List<KernelColumn> columns = new ArrayList<>();
                 for (int k = 0; k < p.bindings().size(); k++) {
                     var binding = p.bindings().get(k);
@@ -181,7 +198,27 @@ public abstract sealed class PassRunner implements AutoCloseable permits PassRun
                     spec = spec.withSubgroupSize(subgroup);
                 }
                 return accelerator.register(spec).orElseThrow();
-            });
+            }));
+        }
+
+        /** A kernel by its function's identity, its bindings, and the lengths of the buffers a pass binds to them. */
+        private record KernelKey(Object kernel, List<?> bindings, List<Integer> lengths) {
+
+            static KernelKey of(Pass pass, Map<String, ResidentBuffer> buffers) {
+                return new KernelKey(pass.kernel(), pass.bindings(),
+                        pass.buffers().stream().map(name -> buffers.get(name).elements()).toList());
+            }
+
+            @Override
+            public boolean equals(Object other) {
+                return other instanceof KernelKey key && key.kernel == kernel && key.bindings.equals(bindings)
+                        && key.lengths.equals(lengths);
+            }
+
+            @Override
+            public int hashCode() {
+                return (System.identityHashCode(kernel) * 31 + bindings.hashCode()) * 31 + lengths.hashCode();
+            }
         }
 
         @Override
@@ -212,7 +249,8 @@ public abstract sealed class PassRunner implements AutoCloseable permits PassRun
         public void close() {
             sequences.values().forEach(DispatchSequence::close);
             sequences.clear();
-            handles.values().forEach(accelerator::release);
+            compiled.values().forEach(accelerator::release);
+            compiled.clear();
             handles.clear();
             buffers.values().forEach(ResidentBuffer::close);
         }
@@ -267,6 +305,11 @@ public abstract sealed class PassRunner implements AutoCloseable permits PassRun
         public int[] read(String buffer) {
             super.requireNamed(buffer);
             return arrays.get(buffer).clone();
+        }
+
+        @Override
+        public int[] peek(String buffer) {
+            return read(buffer);
         }
 
         @Override

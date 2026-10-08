@@ -512,13 +512,52 @@ public final class GpuContext implements AutoCloseable {
         private final long buffer;
         private final long memory;
         private final int words;
+        /** The memory, mapped for as long as the buffer lives, when the host reads it where it is; else null. */
+        private final MemorySegment mapped;
+        private final boolean coherent;
         private boolean closed;
 
         private DeviceBuffer(GpuContext owner, long buffer, long memory, int words) {
+            this(owner, buffer, memory, words, null, true);
+        }
+
+        private DeviceBuffer(GpuContext owner, long buffer, long memory, int words, MemorySegment mapped,
+                             boolean coherent) {
             this.owner = owner;
             this.buffer = buffer;
             this.memory = memory;
             this.words = words;
+            this.mapped = mapped;
+            this.coherent = coherent;
+        }
+
+        /** Whether the host reads it where it is ({@link GpuContext#allocateMapped}). */
+        public boolean mapped() {
+            return mapped != null;
+        }
+
+        /**
+         * The first {@code count} words as the device last left them, read where they are: no submission and no
+         * wait. Right only once the recorded run that wrote them is known to have finished, as
+         * {@link GpuContext#done} or {@link GpuContext#await} of its serial says: every recorded run ends by making
+         * its shaders' writes visible to the host, and its fence is what says so.
+         *
+         * @throws IllegalStateException if the buffer was not {@linkplain GpuContext#allocateMapped made mapped}
+         */
+        public int[] peek(int count) {
+            handle();
+            if (mapped == null) {
+                throw new IllegalStateException("only a mapped buffer is read where it is; this one is device-local");
+            }
+            if (count > words) {
+                throw new IllegalArgumentException(count + " words exceed a " + words + "-word buffer");
+            }
+            if (!coherent) {
+                owner.vk.invalidate(memory);
+            }
+            int[] out = new int[count];
+            MemorySegment.copy(mapped, java.lang.foreign.ValueLayout.JAVA_INT, 0, out, 0, count);
+            return out;
         }
 
         /** Capacity in 32-bit words. */
@@ -571,6 +610,27 @@ public final class GpuContext implements AutoCloseable {
         // on an integrated GPU is the same memory anyway.
         VkCompute.Allocation allocation = vk.allocate(buffer, VkCompute.MEMORY_DEVICE_LOCAL, 0);
         return new DeviceBuffer(this, buffer, allocation.memory(), words);
+    }
+
+    /**
+     * As {@link #allocateBuffer}, in memory the host can see, mapped for as long as the buffer lives, so that what a
+     * kernel writes is read where it is ({@link DeviceBuffer#peek}) rather than copied out by a submission of its
+     * own. For the few words the host reads after every run, such as a count that says whether to run again: a
+     * {@link #read} of them costs a staging buffer, a submission and a wait each time. On a discrete GPU a kernel
+     * reaches this memory across the bus, so it is no place for anything large.
+     */
+    public DeviceBuffer allocateMapped(int words) {
+        if (words < 1) {
+            throw new IllegalArgumentException("a device buffer needs at least one word, got " + words);
+        }
+        long size = (long) words * Integer.BYTES;
+        long buffer = vk.createBuffer(size, VkCompute.BUFFER_USAGE_STORAGE
+                | VkCompute.BUFFER_USAGE_TRANSFER_SRC | VkCompute.BUFFER_USAGE_TRANSFER_DST);
+        // Cached where there is such a type, since the host reads it: an uncached read of mapped memory is slow.
+        VkCompute.Allocation allocation = vk.allocate(buffer, VkCompute.MEMORY_HOST_CACHED,
+                VkCompute.MEMORY_HOST_VISIBLE);
+        return new DeviceBuffer(this, buffer, allocation.memory(), words, vk.map(allocation.memory(), size),
+                allocation.coherent());
     }
 
     /** Replaces the start of {@code target} with {@code data}, through a staging buffer. Waits for the copy. */
@@ -730,6 +790,8 @@ public final class GpuContext implements AutoCloseable {
             vk.recordDispatch(cmd, step.kernel().pipeline, step.kernel().pipelineLayout, sets[i],
                     step.invocations(), step.kernel().groupsFor(step.invocations()));
         }
+        // So that a mapped buffer a dispatch wrote is right to read once the run is known to be done.
+        vk.shaderToHostBarrier(cmd);
         vk.endCommandBuffer(cmd);
         return new RecordedSequence(this, cmd, descriptorPool, steps.size());
     }

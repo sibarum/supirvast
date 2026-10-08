@@ -58,6 +58,18 @@ highest-value next proof; **P1** deepens the language; **P2** broadens targets; 
         `VulkanInstance.timestampPeriod`, at an offset counted by hand and checked by a range and by the field
         this file already read. One run of `CompletionTest`'s kernel: 0.10 ms on the RTX, 3.5 ms on the Intel
         GPU; four runs, 3.8 times as long on both.
+- [x] A few words read after every run, without a submission of their own (2026-10-08), for vexelray-sim-rigid's
+      contact rounds, which go on until a count says every contact is solved.
+      - **Readouts.** `BufferSpec.readout(...)`, `Accelerator.allocateReadout`, `GpuContext.allocateMapped`: a
+        storage buffer in host-visible memory (cached where there is such a type), mapped for its life.
+        `ResidentBuffer.peek()` and `PassRunner.peek(name)` read it where it is, once the run's `Completion` has
+        been awaited. Every recorded run now ends with a shader-to-host barrier, which is what makes that right.
+        A `read` of the same words costs a staging buffer, a submission and a wait. `ReadoutTest`, on the RTX:
+        two small dispatches, awaited and peeked, about 200 µs a run; run and read, about 370 µs. Both vary by
+        half again from run to run, and spinning on `done()` was no faster than the fence wait.
+      - **One pipeline per kernel, not per pass.** `PassRunner` registered a kernel for every `Pass` object, and
+        `Accelerator.register` lowers and compiles each time. Passes that differ only in which buffers of the same
+        lengths they bind now share one: the rigid solver's cycle of 49 rounds is one compile.
 
 ---
 

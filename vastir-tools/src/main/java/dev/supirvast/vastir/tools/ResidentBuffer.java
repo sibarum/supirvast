@@ -40,6 +40,11 @@ public final class ResidentBuffer implements AutoCloseable {
                 context.allocateBuffer(elements * wordsPerElement(element)), null);
     }
 
+    static ResidentBuffer mapped(GpuContext context, Type element, int elements) {
+        return new ResidentBuffer(element, elements, context,
+                context.allocateMapped(elements * wordsPerElement(element)), null);
+    }
+
     static ResidentBuffer onHost(Type element, int elements) {
         return new ResidentBuffer(element, elements, null, null, new int[elements * wordsPerElement(element)]);
     }
@@ -93,6 +98,18 @@ public final class ResidentBuffer implements AutoCloseable {
     public int[] read() {
         requireOpen();
         return device != null ? context.read(device, words()) : host.clone();
+    }
+
+    /**
+     * The whole buffer as the last finished run left it, read where it is, with no submission and no wait: for a
+     * {@linkplain Accelerator#allocateReadout readout}, once the {@link Completion} of the run that wrote it has been
+     * awaited. Before then it may be anything. On the CPU backend it is the array, as {@link #read} is.
+     *
+     * @throws IllegalStateException if it is on the device and not a readout
+     */
+    public int[] peek() {
+        requireOpen();
+        return device != null ? device.peek(words()) : host.clone();
     }
 
     @Override

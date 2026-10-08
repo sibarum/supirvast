@@ -264,6 +264,26 @@ public final class Accelerator implements AutoCloseable {
     }
 
     /**
+     * As {@link #allocate}, for the few words the host reads after every run: on a GPU, in memory the host can see
+     * and mapped while the buffer lives, so {@link ResidentBuffer#peek} reads what the last finished run wrote with no
+     * submission of its own. A kernel on a discrete GPU reaches it across the bus, so it is for counts and flags,
+     * not state.
+     */
+    public ResidentBuffer allocateReadout(Type element, int elements) {
+        if (!isSupportedColumnType(element)) {
+            throw new IllegalArgumentException("unsupported element type for a resident buffer: " + element);
+        }
+        if (elements < 1) {
+            throw new IllegalArgumentException("a resident buffer needs at least one element, got " + elements);
+        }
+        ResidentBuffer buffer = gpuAvailable()
+                ? ResidentBuffer.mapped(context(), element, elements)
+                : ResidentBuffer.onHost(element, elements);
+        residentBuffers.add(buffer);
+        return buffer;
+    }
+
+    /**
      * Sets every element of every one of {@code buffers} to zero: on the device, all of them in one submission
      * that writes the memory where it is, which a {@link ResidentBuffer#write write} of zeros would stage on the
      * host and copy over, a buffer at a time. What a newly allocated program's buffers need before a kernel that
