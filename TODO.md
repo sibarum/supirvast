@@ -31,7 +31,7 @@ highest-value next proof; **P1** deepens the language; **P2** broadens targets; 
       items by key and leaves them where they are. Every pass at a workgroup of `BLOCK`. Not stable. First user:
       vexelray-sim-rigid's grid broad phase. `CountingSortTest`: 70 001 keys, so the block sums take two chunks,
       against the host on each backend, and a second sort on the counts the first left at zero.
-      *Still TODO:* vexelray-sim-fluid's `FlipStep` onto it, and its `Sort` deleted.
+      Second: vexelray-sim-fluid's `FlipStep`, keyed by cell in `Scatter.sortCount`, and its own `Sort` deleted.
 
 ---
 
