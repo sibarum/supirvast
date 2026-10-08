@@ -1,0 +1,33 @@
+{
+  "foreign": {
+    "downcalls": [
+        { "returnType": "jint", "parameterTypes": ["void*", "void*", "void*", "void*"] },
+        { "returnType": "void", "parameterTypes": ["void*", "jlong", "void*"] },
+        { "returnType": "jint", "parameterTypes": ["void*", "jlong", "jlong", "jlong"] },
+        { "returnType": "jint", "parameterTypes": ["void*", "jlong", "jlong", "jlong", "jint", "void*"] },
+        { "returnType": "void", "parameterTypes": ["void*", "jlong"] },
+        { "returnType": "jint", "parameterTypes": ["void*", "jint", "void*"] },
+        { "returnType": "jint", "parameterTypes": ["void*", "jlong", "jint", "void*", "void*", "void*"] },
+        { "returnType": "jint", "parameterTypes": ["void*", "void*", "void*"] },
+        { "returnType": "void", "parameterTypes": ["void*", "jint", "void*", "jint", "void*"] },
+        { "returnType": "void", "parameterTypes": ["void*", "jlong", "jint", "void*"] },
+        { "returnType": "jint", "parameterTypes": ["void*", "void*"] },
+        { "returnType": "jint", "parameterTypes": ["void*"] },
+        { "returnType": "void", "parameterTypes": ["void*", "jint", "jlong"] },
+        { "returnType": "void", "parameterTypes": ["void*", "jint", "jlong", "jint", "jint", "void*", "jint", "void*"] },
+        { "returnType": "void", "parameterTypes": ["void*", "jlong", "jint", "jint", "jint", "void*"] },
+        { "returnType": "void", "parameterTypes": ["void*", "jint", "jint", "jint"] },
+        { "returnType": "void", "parameterTypes": ["void*", "jint", "jint", "jint", "jint", "void*", "jint", "void*", "jint", "void*"] },
+        { "returnType": "void", "parameterTypes": ["void*", "jlong", "jlong", "jint", "void*"] },
+        { "returnType": "void", "parameterTypes": ["void*", "jlong", "jlong", "jlong", "jint"] },
+        { "returnType": "jint", "parameterTypes": ["void*", "jint", "void*", "jint", "jlong"] },
+        { "returnType": "jint", "parameterTypes": ["void*", "jlong"] },
+        { "returnType": "jint", "parameterTypes": ["void*", "jint", "void*", "jlong"] },
+        { "returnType": "jint", "parameterTypes": ["void*", "jlong", "void*"] },
+        { "returnType": "jint", "parameterTypes": ["void*", "void*", "jlong"] },
+        { "returnType": "void", "parameterTypes": ["void*", "jlong", "jint", "jint"] },
+        { "returnType": "void", "parameterTypes": ["void*", "jint", "jlong", "jint"] },
+        { "returnType": "jint", "parameterTypes": ["void*", "jlong", "jint", "jint", "jlong", "void*", "jlong", "jint"] }
+      ]
+  }
+}

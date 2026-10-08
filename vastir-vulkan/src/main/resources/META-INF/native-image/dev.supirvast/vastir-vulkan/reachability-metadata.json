@@ -1,0 +1,27 @@
+{
+  "reflection": [
+    {
+      "type": "dev.supirvast.vulkan.VulkanDebugMessenger",
+      "methods": [
+        { "name": "onMessage", "parameterTypes": ["int", "int", "java.lang.foreign.MemorySegment", "java.lang.foreign.MemorySegment"] }
+      ]
+    }
+  ],
+  "foreign": {
+    "upcalls": [
+      { "returnType": "jint", "parameterTypes": ["jint", "jint", "void*", "void*"] }
+    ],
+    "downcalls": [
+        { "returnType": "void", "parameterTypes": ["void*", "void*"] },
+        { "returnType": "jint", "parameterTypes": ["void*", "void*", "void*", "void*"] },
+        { "returnType": "void*", "parameterTypes": ["void*", "void*"] },
+        { "returnType": "void", "parameterTypes": ["void*", "jlong", "void*"] },
+        { "returnType": "jint", "parameterTypes": ["void*", "void*", "void*"] },
+        { "returnType": "void", "parameterTypes": ["void*", "jint", "jint", "void*"] },
+        { "returnType": "jint", "parameterTypes": ["void*"] },
+        { "returnType": "void", "parameterTypes": ["void*", "void*", "void*"] },
+        { "returnType": "jint", "parameterTypes": ["void*", "jint", "jlong", "void*"] },
+        { "returnType": "jint", "parameterTypes": ["void*", "void*"] }
+      ]
+  }
+}
