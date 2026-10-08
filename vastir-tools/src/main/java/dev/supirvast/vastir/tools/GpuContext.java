@@ -81,8 +81,19 @@ public final class GpuContext implements AutoCloseable {
     private final int maxSubgroupSize;
     private final boolean subgroupSizeControl;
 
+    /**
+     * What timing a queue family allows: how many bits of a timestamp are meaningful (0 for none) and how many
+     * nanoseconds one tick is.
+     */
+    private record Timing(int bits, double tickNanos) {}
+
+    private static Timing timing(VulkanInstance instance, MemorySegment physicalDevice, int family) {
+        int bits = instance.queueFamilies(physicalDevice).get(family).timestampValidBits();
+        return new Timing(bits, bits == 0 ? 0 : instance.timestampPeriod(physicalDevice));
+    }
+
     private GpuContext(VulkanInstance instance, VulkanDevice device, int family, boolean ownsDevice,
-            ComputeSupport support, String deviceName, String deviceType) {
+            ComputeSupport support, String deviceName, String deviceType, Timing timing) {
         this.instance = instance;
         this.device = device;
         this.ownsDevice = ownsDevice;
@@ -98,6 +109,9 @@ public final class GpuContext implements AutoCloseable {
         this.minSubgroupSize = support.minSubgroupSize();
         this.maxSubgroupSize = support.maxSubgroupSize();
         this.subgroupSizeControl = support.subgroupSizeControl();
+        this.tickNanos = timing.tickNanos();
+        this.timestampMask = timing.bits() >= 64 ? -1L : (1L << timing.bits()) - 1;
+        this.queryPool = timing.bits() == 0 ? 0L : vk.createTimestampPool(2 * TIMED_SLOTS);
     }
 
     /** The SPIR-V capabilities this device supports (and that have been enabled on the logical device). */
@@ -186,7 +200,8 @@ public final class GpuContext implements AutoCloseable {
                     VulkanDevice.Request.headlessCompute(support, queueCount).withTimelineSemaphore());
             try {
                 return new GpuContext(instance, device, info.computeQueueFamily(), true, support, info.name(),
-                        DeviceSelection.typeName(info.type()));
+                        DeviceSelection.typeName(info.type()), timing(instance, info.physicalDevice(),
+                        info.computeQueueFamily()));
             } catch (RuntimeException | Error e) {
                 device.close();
                 throw e;
@@ -238,7 +253,7 @@ public final class GpuContext implements AutoCloseable {
                     + " cannot run compute, so kernels cannot be dispatched to its queue");
         }
         return new GpuContext(null, device, family, false, support, info.name(),
-                DeviceSelection.typeName(info.type()));
+                DeviceSelection.typeName(info.type()), timing(instance, device.physicalDevice(), family));
     }
 
     /** The queue family this context submits to. */
@@ -456,6 +471,23 @@ public final class GpuContext implements AutoCloseable {
     private static final int MAX_PENDING = 64;
 
     private final java.util.ArrayDeque<Pending> pending = new java.util.ArrayDeque<>();
+
+    /**
+     * Recorded runs timed at once, by slot: twice {@link #MAX_PENDING}, so a slot comes round again only once the
+     * run that last had it has finished and its time been read.
+     */
+    private static final int TIMED_SLOTS = 2 * MAX_PENDING;
+
+    /** Two timestamps a slot, or 0 where the queue family cannot write them. */
+    private final long queryPool;
+    private final double tickNanos;
+    private final long timestampMask;
+    /** Per slot: the command buffers that write its two timestamps, recorded when the slot is first used. */
+    private final MemorySegment[] stampBefore = new MemorySegment[TIMED_SLOTS];
+    private final MemorySegment[] stampAfter = new MemorySegment[TIMED_SLOTS];
+    /** Per slot: the serial of the run that last had it, and that run's time on the GPU, or -1 not yet read. */
+    private final long[] slotSerial = new long[TIMED_SLOTS];
+    private final long[] slotNanos = new long[TIMED_SLOTS];
 
     /** The serial the last resident submission was given; the first is 1. */
     private long submitted;
@@ -725,12 +757,58 @@ public final class GpuContext implements AutoCloseable {
             retire(pending.removeFirst(), true);
         }
         long fence = vk.createFence();
-        vk.submit(queues.get(0), sequence.cmd, fence, handles(waits), values(waits), handles(signals),
+        long serial = submitted + 1;
+        MemorySegment[] commandBuffers = {sequence.cmd};
+        if (queryPool != 0) {
+            int slot = (int) (serial % TIMED_SLOTS);
+            stampsFor(slot);
+            slotSerial[slot] = serial;
+            slotNanos[slot] = -1;
+            commandBuffers = new MemorySegment[] {stampBefore[slot], sequence.cmd, stampAfter[slot]};
+        }
+        vk.submit(queues.get(0), commandBuffers, fence, handles(waits), values(waits), handles(signals),
                 values(signals));
-        long serial = ++submitted;
+        submitted = serial;
         pending.addLast(new Pending(serial, null, fence, 0L));   // the sequence keeps its own
         reclaim();
         return serial;
+    }
+
+    /**
+     * How long the recorded run given {@code serial} took on the GPU, in nanoseconds: from when everything before it
+     * on the queue had finished to when it had. Empty while it runs, where the queue family cannot write timestamps,
+     * for a submission that was not a recorded run, and for one so long ago that its slot has been used again.
+     */
+    public java.util.OptionalLong gpuNanos(long serial) {
+        reclaim();
+        if (queryPool == 0) {
+            return java.util.OptionalLong.empty();
+        }
+        int slot = (int) (serial % TIMED_SLOTS);
+        if (slotSerial[slot] != serial || slotNanos[slot] < 0) {
+            return java.util.OptionalLong.empty();
+        }
+        return java.util.OptionalLong.of(slotNanos[slot]);
+    }
+
+    /**
+     * The slot's two timestamp writers, made the first time it is used. Both stamp at the bottom of the pipe: the
+     * first is written once everything submitted before it has finished — the run's own barrier would hold it there
+     * anyway — and the second once the run has, so the difference is the run's own time, not its wait in the queue.
+     */
+    private void stampsFor(int slot) {
+        if (stampBefore[slot] != null) {
+            return;
+        }
+        MemorySegment before = vk.beginCommandBuffer(commandPool, 0);
+        vk.recordResetQueries(before, queryPool, 2 * slot, 2);
+        vk.recordTimestamp(before, VkCompute.PIPELINE_STAGE_BOTTOM_OF_PIPE, queryPool, 2 * slot);
+        vk.endCommandBuffer(before);
+        MemorySegment after = vk.beginCommandBuffer(commandPool, 0);
+        vk.recordTimestamp(after, VkCompute.PIPELINE_STAGE_BOTTOM_OF_PIPE, queryPool, 2 * slot + 1);
+        vk.endCommandBuffer(after);
+        stampBefore[slot] = before;
+        stampAfter[slot] = after;
     }
 
     private static long[] handles(List<Point> points) {
@@ -818,6 +896,15 @@ public final class GpuContext implements AutoCloseable {
             vk.destroyDescriptorPool(work.descriptorPool());
         }
         completed = Math.max(completed, work.serial());
+        if (queryPool != 0) {
+            int slot = (int) (work.serial() % TIMED_SLOTS);
+            if (slotSerial[slot] == work.serial() && slotNanos[slot] < 0) {
+                long[] ticks = vk.timestamps(queryPool, 2 * slot, 2);
+                if (ticks != null) {
+                    slotNanos[slot] = Math.round(((ticks[1] - ticks[0]) & timestampMask) * tickNanos);
+                }
+            }
+        }
     }
 
     /** Submits a copy on the resident queue — ordered after every pending dispatch — and waits for it. */
@@ -839,6 +926,9 @@ public final class GpuContext implements AutoCloseable {
     @Override
     public void close() {
         finish();
+        if (queryPool != 0) {
+            vk.destroyQueryPool(queryPool);   // the stamp writers go with the command pool
+        }
         vk.destroyCommandPool(commandPool);
         if (ownsDevice) {
             device.close();

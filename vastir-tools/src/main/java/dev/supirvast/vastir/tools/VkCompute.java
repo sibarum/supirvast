@@ -63,6 +63,7 @@ final class VkCompute {
     private static final int STYPE_COMMAND_BUFFER_BEGIN_INFO = 42;
     private static final int STYPE_MEMORY_BARRIER = 46;
     private static final int STYPE_SEMAPHORE_CREATE_INFO = 9;
+    private static final int STYPE_QUERY_POOL_CREATE_INFO = 11;
     private static final int STYPE_SEMAPHORE_TYPE_CREATE_INFO = 1000207002;
     private static final int STYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO = 1000207003;
     private static final int STYPE_SEMAPHORE_WAIT_INFO = 1000207004;
@@ -100,6 +101,11 @@ final class VkCompute {
     private static final int SEMAPHORE_TYPE_TIMELINE = 1;
     private static final int PIPELINE_STAGE_ALL_COMMANDS = 0x10000;
     private static final int VK_TIMEOUT = 2;
+    private static final int QUERY_TYPE_TIMESTAMP = 2;
+    private static final int QUERY_RESULT_64 = 0x1;
+    private static final int VK_NOT_READY = 1;
+    static final int PIPELINE_STAGE_TOP_OF_PIPE = 0x1;
+    static final int PIPELINE_STAGE_BOTTOM_OF_PIPE = 0x2000;
     private static final long WHOLE_SIZE = ~0L;
     private static final int VK_SUCCESS = 0;
     private static final int RESULT_BYTES = Integer.BYTES;
@@ -251,6 +257,11 @@ final class VkCompute {
             MemoryLayout.paddingLayout(4), ADDRESS.withName("pSignalSemaphoreValues")
     ).withName("VkTimelineSemaphoreSubmitInfo");
 
+    private static final GroupLayout QUERY_POOL_CREATE_INFO = MemoryLayout.structLayout(
+            JAVA_INT.withName("sType"), MemoryLayout.paddingLayout(4), ADDRESS.withName("pNext"),
+            JAVA_INT.withName("flags"), JAVA_INT.withName("queryType"), JAVA_INT.withName("queryCount"),
+            JAVA_INT.withName("pipelineStatistics")).withName("VkQueryPoolCreateInfo");
+
     private static final FunctionDescriptor CREATE =
             FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS);
     private static final FunctionDescriptor DESTROY = FunctionDescriptor.ofVoid(ADDRESS, JAVA_LONG, ADDRESS);
@@ -302,6 +313,11 @@ final class VkCompute {
     private final MethodHandle vkGetSemaphoreCounterValue;
     private final MethodHandle vkWaitSemaphores;
     private final MethodHandle vkSignalSemaphore;
+    private final MethodHandle vkCreateQueryPool;
+    private final MethodHandle vkDestroyQueryPool;
+    private final MethodHandle vkCmdResetQueryPool;
+    private final MethodHandle vkCmdWriteTimestamp;
+    private final MethodHandle vkGetQueryPoolResults;
     /** The device's queue families, when there is more than one, for buffers every one of them may use; else null. */
     private final int[] sharingFamilies;
 
@@ -378,6 +394,14 @@ final class VkCompute {
         vkWaitSemaphores = device.command("vkWaitSemaphores",
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG));
         vkSignalSemaphore = device.command("vkSignalSemaphore", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS));
+        vkCreateQueryPool = device.command("vkCreateQueryPool", CREATE);
+        vkDestroyQueryPool = device.command("vkDestroyQueryPool", DESTROY);
+        vkCmdResetQueryPool = device.command("vkCmdResetQueryPool",
+                FunctionDescriptor.ofVoid(ADDRESS, JAVA_LONG, JAVA_INT, JAVA_INT));
+        vkCmdWriteTimestamp = device.command("vkCmdWriteTimestamp",
+                FunctionDescriptor.ofVoid(ADDRESS, JAVA_INT, JAVA_LONG, JAVA_INT));
+        vkGetQueryPoolResults = device.command("vkGetQueryPoolResults", FunctionDescriptor.of(JAVA_INT, ADDRESS,
+                JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG, JAVA_INT));
         java.util.List<Integer> families = device.queueFamilies();
         sharingFamilies = families.size() > 1 ? families.stream().mapToInt(Integer::intValue).toArray() : null;
     }
@@ -811,12 +835,20 @@ final class VkCompute {
      */
     void submit(MemorySegment queue, MemorySegment cmd, long fence, long[] waits, long[] waitValues, long[] signals,
                 long[] signalValues) {
+        submit(queue, new MemorySegment[] {cmd}, fence, waits, waitValues, signals, signalValues);
+    }
+
+    /** As above, for several command buffers run in order as one submission. */
+    void submit(MemorySegment queue, MemorySegment[] commandBuffers, long fence, long[] waits, long[] waitValues,
+                long[] signals, long[] signalValues) {
         try (Arena a = Arena.ofConfined()) {
-            MemorySegment cmds = a.allocate(ADDRESS);
-            cmds.set(ADDRESS, 0, cmd);
+            MemorySegment cmds = a.allocate(ADDRESS, commandBuffers.length);
+            for (int c = 0; c < commandBuffers.length; c++) {
+                cmds.setAtIndex(ADDRESS, c, commandBuffers[c]);
+            }
             MemorySegment info = a.allocate(SUBMIT_INFO);
             si(info, SUBMIT_INFO, "sType", STYPE_SUBMIT_INFO);
-            si(info, SUBMIT_INFO, "commandBufferCount", 1);
+            si(info, SUBMIT_INFO, "commandBufferCount", commandBuffers.length);
             sa(info, SUBMIT_INFO, "pCommandBuffers", cmds);
             if (waits.length + signals.length > 0) {
                 MemorySegment timeline = a.allocate(TIMELINE_SEMAPHORE_SUBMIT_INFO);
@@ -841,6 +873,47 @@ final class VkCompute {
                 sa(info, SUBMIT_INFO, "pNext", timeline);
             }
             check(invoke(vkQueueSubmit, queue, 1, info, fence), "vkQueueSubmit");
+        }
+    }
+
+    // --- timestamps -----------------------------------------------------------------------------------
+
+    long createTimestampPool(int queries) {
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment info = a.allocate(QUERY_POOL_CREATE_INFO);
+            si(info, QUERY_POOL_CREATE_INFO, "sType", STYPE_QUERY_POOL_CREATE_INFO);
+            si(info, QUERY_POOL_CREATE_INFO, "queryType", QUERY_TYPE_TIMESTAMP);
+            si(info, QUERY_POOL_CREATE_INFO, "queryCount", queries);
+            MemorySegment out = a.allocate(JAVA_LONG);
+            check(invoke(vkCreateQueryPool, dev, info, MemorySegment.NULL, out), "vkCreateQueryPool");
+            return out.get(JAVA_LONG, 0);
+        }
+    }
+
+    void destroyQueryPool(long pool) {
+        invokeVoid(vkDestroyQueryPool, dev, pool, MemorySegment.NULL);
+    }
+
+    void recordResetQueries(MemorySegment cmd, long pool, int first, int count) {
+        invokeVoid(vkCmdResetQueryPool, cmd, pool, first, count);
+    }
+
+    /** A timestamp written to query {@code query} once every command before it has reached {@code stage}. */
+    void recordTimestamp(MemorySegment cmd, int stage, long pool, int query) {
+        invokeVoid(vkCmdWriteTimestamp, cmd, stage, pool, query);
+    }
+
+    /** Queries {@code first .. first + count - 1} as 64-bit ticks, or null when any is not written yet. */
+    long[] timestamps(long pool, int first, int count) {
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment out = a.allocate(JAVA_LONG, count);
+            int result = invoke(vkGetQueryPoolResults, dev, pool, first, count, (long) count * Long.BYTES, out,
+                    (long) Long.BYTES, QUERY_RESULT_64);
+            if (result == VK_NOT_READY) {
+                return null;
+            }
+            check(result, "vkGetQueryPoolResults");
+            return out.toArray(JAVA_LONG);
         }
     }
 

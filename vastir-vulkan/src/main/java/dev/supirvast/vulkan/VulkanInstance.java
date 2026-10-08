@@ -16,6 +16,7 @@ import java.util.Optional;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
 import static java.lang.foreign.ValueLayout.JAVA_BYTE;
+import static java.lang.foreign.ValueLayout.JAVA_FLOAT;
 import static java.lang.foreign.ValueLayout.JAVA_INT;
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
 
@@ -524,6 +525,33 @@ public final class VulkanInstance implements AutoCloseable {
      * The device's {@code maxComputeSharedMemorySize}: the most workgroup memory one compute pipeline may
      * declare. 16 KB at least; 32 to 64 KB on current desktop hardware.
      */
+    /**
+     * Where {@code timestampPeriod} sits in {@code VkPhysicalDeviceProperties}: the limits start at 296 (after the
+     * name, the UUID and four bytes of alignment), and it is the limits' 93rd field, at 424 of them. Counted from the
+     * specification's declaration, and checked against the field this file already reads: the same count puts
+     * {@code maxComputeSharedMemorySize} at 296 + 216 = 512, where the layout above reads it.
+     */
+    private static final long TIMESTAMP_PERIOD_OFFSET = 296 + 424;
+
+    /**
+     * How many nanoseconds one tick of a timestamp written on {@code physicalDevice} is: 1 on NVIDIA, tens on
+     * Intel. What turns two timestamps into a duration.
+     */
+    public float timestampPeriod(MemorySegment physicalDevice) {
+        try (Arena temp = Arena.ofConfined()) {
+            MemorySegment props = temp.allocate(PHYSICAL_DEVICE_PROPERTIES);
+            properties(physicalDevice, props);
+            float period = props.get(JAVA_FLOAT, TIMESTAMP_PERIOD_OFFSET);
+            // Real devices report from fractions of a nanosecond to about a hundred; anything else means the offset
+            // above is wrong, and a wrong one reads as a plausible float far more often than as garbage.
+            if (!(period > 0.001f && period < 100_000f)) {
+                throw new NativeException("timestampPeriod read as " + period + "; suspect its offset in this "
+                        + "file's VkPhysicalDeviceProperties layout");
+            }
+            return period;
+        }
+    }
+
     public long maxComputeSharedMemoryBytes(MemorySegment physicalDevice) {
         try (Arena temp = Arena.ofConfined()) {
             MemorySegment props = temp.allocate(PHYSICAL_DEVICE_PROPERTIES);

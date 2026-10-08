@@ -35,4 +35,13 @@ public final class Completion {
             context.await(serial);
         }
     }
+
+    /**
+     * How long the work took on the GPU, in nanoseconds, from two timestamps written around it: once it is
+     * {@link #done}, and where the device can write them. Empty for work that ran on the CPU, which has no such
+     * clock, and for a run so long ago that the context has since reused its timestamps.
+     */
+    public java.util.OptionalLong gpuNanos() {
+        return context == null ? java.util.OptionalLong.empty() : context.gpuNanos(serial);
+    }
 }

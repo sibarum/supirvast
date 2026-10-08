@@ -137,6 +137,49 @@ class CompletionTest {
         assumeTrue(opened > 0, "no discrete or integrated GPU");
     }
 
+    /**
+     * A run says how long it took on the GPU, on each GPU there is: a time, once it is done, no longer than the
+     * wall clock saw, and four times as long for four times the work.
+     */
+    @Test
+    void aRunSaysHowLongItTookOnTheGpu() {
+        int timed = 0;
+        for (String selector : List.of("discrete", "integrated")) {
+            Accelerator accelerator;
+            try {
+                accelerator = Accelerator.onDevice(selector);
+            } catch (IllegalStateException none) {
+                continue;
+            }
+            try (accelerator) {
+                Program program = new Program();
+                List<Pass> four = List.of(program.step.get(0), program.step.get(0), program.step.get(0),
+                        program.step.get(0));
+                try (PassRunner runner = PassRunner.gpu(accelerator, program, WORKGROUP, PassRunner.NO_SUBGROUP)) {
+                    runner.prepare(program.step);
+                    runner.clear();
+                    runner.run(program.step).await();   // first use, out of the comparison
+                    long start = System.nanoTime();
+                    Completion once = runner.run(program.step);
+                    once.await();
+                    long wall = System.nanoTime() - start;
+                    Completion fourTimes = runner.run(four);
+                    fourTimes.await();
+                    long one = once.gpuNanos().orElseThrow();
+                    long four4 = fourTimes.gpuNanos().orElseThrow();
+                    System.out.printf("[completion] %s: one run %.3f ms on the GPU, %.3f ms on the wall; four %.3f ms%n",
+                            accelerator.capabilities().deviceName(), one / 1e6, wall / 1e6, four4 / 1e6);
+                    assertTrue(one > 0 && one <= wall, "the GPU's time is not within the wall's: " + one + " ns");
+                    double ratio = (double) four4 / one;
+                    assertTrue(ratio > 2.5 && ratio < 6, "four times the work took " + ratio + " times as long");
+                    timed++;
+                }
+            }
+        }
+        assumeTrue(timed > 0, "no GPU");
+        assertTrue(Completion.DONE.gpuNanos().isEmpty(), "work on the CPU has no GPU time");
+    }
+
     /** The host's answer to {@code runs} runs over a buffer of zeros. */
     private static int[] expected(int runs) {
         int[] data = new int[N];

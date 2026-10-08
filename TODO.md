@@ -52,7 +52,12 @@ highest-value next proof; **P1** deepens the language; **P2** broadens targets; 
         front and ordered only by the timeline. Without the copy's wait it reads the buffer before the kernel
         has written it. Clean under `VK_LAYER_KHRONOS_validation`, which the SDK SupirVast caches for its tools
         provides (`VK_ADD_LAYER_PATH` to its `Bin`, `-Dvexelray.vulkan.validation=true`).
-      *Still TODO:* GPU timestamps, to measure what a step costs on the device.
+      - **GPU timestamps.** Every recorded run on a family that can write them is submitted between two
+        timestamp writers, both at the bottom of the pipe, so the time is the run's own and not its wait in the
+        queue; read once its fence has signalled, without waiting. `Completion.gpuNanos()`. The tick comes from
+        `VulkanInstance.timestampPeriod`, at an offset counted by hand and checked by a range and by the field
+        this file already read. One run of `CompletionTest`'s kernel: 0.10 ms on the RTX, 3.5 ms on the Intel
+        GPU; four runs, 3.8 times as long on both.
 
 ---
 
