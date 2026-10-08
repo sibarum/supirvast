@@ -86,9 +86,9 @@ the results are identical.
 | Module | Role |
 | --- | --- |
 | `vastir-codegen` | Build-time generator: emits typed Java from the pinned official SPIR-V grammar. |
-| `vastir` | The `core` IR, the shared type system, and the `CoreToSpirv` lowering + SPIR-V binary emitter. No GraalVM dependency. |
+| `vastir` | The `core` IR, the shared type system, and the `CoreToSpirv` lowering + SPIR-V binary emitter. `Body` writes a kernel tersely by hand; `Pass`, `BufferSpec` and `Buffered` describe a multi-pass program over named buffers as data. No GraalVM dependency. |
 | `vast` | `CoreToTruffle` — the executable Truffle AST backend (CPU). |
-| `vastir-tools` | Bundled native SPIR-V toolchain, Vulkan compute execution, and the CPU-vs-GPU differential harness. |
+| `vastir-tools` | Bundled native SPIR-V toolchain, Vulkan compute execution, and the CPU-vs-GPU differential harness. `PassRunner` runs a multi-pass program over its named buffers, recorded once on the GPU or lowered to the CPU. |
 
 ## Status
 
