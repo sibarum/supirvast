@@ -70,6 +70,8 @@ highest-value next proof; **P1** deepens the language; **P2** broadens targets; 
       - **One pipeline per kernel, not per pass.** `PassRunner` registered a kernel for every `Pass` object, and
         `Accelerator.register` lowers and compiles each time. Passes that differ only in which buffers of the same
         lengths they bind now share one: the rigid solver's cycle of 49 rounds is one compile.
+      - **`PassRunner.run(passes, waits, signals)`**, as `DispatchSequence` has: on the GPU the timeline points go
+        on the submission; on the CPU the waits are awaited and the signals made from the host.
 
 ---
 

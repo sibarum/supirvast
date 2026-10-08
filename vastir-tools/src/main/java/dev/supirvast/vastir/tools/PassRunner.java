@@ -84,6 +84,14 @@ public abstract sealed class PassRunner implements AutoCloseable permits PassRun
      */
     public abstract Completion run(List<Pass> passes);
 
+    /**
+     * As {@link #run(List)}, starting once every timeline of {@code waits} has reached its value and setting every
+     * timeline of {@code signals} to its value when done, on the GPU: so work on another queue can follow it. On the
+     * CPU, where everything is done when this returns, the signals are made from the host and the waits are awaited
+     * there first.
+     */
+    public abstract Completion run(List<Pass> passes, List<GpuContext.Point> waits, List<GpuContext.Point> signals);
+
     /** Overwrites the start of {@code buffer} with {@code words}. */
     public abstract void write(String buffer, int[] words);
 
@@ -175,6 +183,11 @@ public abstract sealed class PassRunner implements AutoCloseable permits PassRun
 
         @Override
         public Completion run(List<Pass> passes) {
+            return run(passes, List.of(), List.of());
+        }
+
+        @Override
+        public Completion run(List<Pass> passes, List<GpuContext.Point> waits, List<GpuContext.Point> signals) {
             return sequences.computeIfAbsent(passes, list -> {
                 DispatchSequence.Builder builder = accelerator.sequence();
                 for (Pass pass : list) {
@@ -182,7 +195,7 @@ public abstract sealed class PassRunner implements AutoCloseable permits PassRun
                             pass.invocations());
                 }
                 return builder.build();
-            }).run();
+            }).run(waits, signals);
         }
 
         private KernelHandle handle(Pass pass) {
@@ -287,6 +300,18 @@ public abstract sealed class PassRunner implements AutoCloseable permits PassRun
                         pass.invocations());
             }
             return Completion.DONE;
+        }
+
+        @Override
+        public Completion run(List<Pass> passes, List<GpuContext.Point> waits, List<GpuContext.Point> signals) {
+            for (GpuContext.Point wait : waits) {
+                wait.timeline().await(wait.value(), Long.MAX_VALUE);
+            }
+            Completion done = run(passes);
+            for (GpuContext.Point signal : signals) {
+                signal.timeline().signal(signal.value());
+            }
+            return done;
         }
 
         private CpuKernel kernel(Pass pass) {
