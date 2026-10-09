@@ -272,6 +272,22 @@ public abstract sealed class PassRunner implements AutoCloseable permits PassRun
     static final class Cpu extends PassRunner {
         private final Map<String, int[]> arrays = new LinkedHashMap<>();
         private final Map<Pass, CpuKernel> lowered = Collections.synchronizedMap(new IdentityHashMap<>());
+        /** Every kernel lowered, by its function and bindings: passes that differ only in their buffers share one. */
+        private final Map<CpuKey, CpuKernel> byKernel = Collections.synchronizedMap(new java.util.HashMap<>());
+
+        /** A kernel by its function's identity and its bindings. */
+        private record CpuKey(Object kernel, List<?> bindings) {
+
+            @Override
+            public boolean equals(Object other) {
+                return other instanceof CpuKey key && key.kernel == kernel && key.bindings.equals(bindings);
+            }
+
+            @Override
+            public int hashCode() {
+                return System.identityHashCode(kernel) * 31 + bindings.hashCode();
+            }
+        }
 
         Cpu(Buffered program, int workgroup, int subgroup) {
             super(program, workgroup, subgroup);
@@ -315,9 +331,10 @@ public abstract sealed class PassRunner implements AutoCloseable permits PassRun
         }
 
         private CpuKernel kernel(Pass pass) {
-            return lowered.computeIfAbsent(pass, p -> subgroup == NO_SUBGROUP
-                    ? new CoreToTruffle().lowerDispatch(p.kernel(), p.bindings(), workgroup)
-                    : new CoreToTruffle().lowerDispatch(p.kernel(), p.bindings(), workgroup, subgroup));
+            return lowered.computeIfAbsent(pass, p -> byKernel.computeIfAbsent(new CpuKey(p.kernel(), p.bindings()),
+                    key -> subgroup == NO_SUBGROUP
+                            ? new CoreToTruffle().lowerDispatch(p.kernel(), p.bindings(), workgroup)
+                            : new CoreToTruffle().lowerDispatch(p.kernel(), p.bindings(), workgroup, subgroup)));
         }
 
         @Override

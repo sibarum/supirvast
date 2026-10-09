@@ -72,6 +72,8 @@ highest-value next proof; **P1** deepens the language; **P2** broadens targets; 
         lengths they bind now share one: the rigid solver's cycle of 49 rounds is one compile.
       - **`PassRunner.run(passes, waits, signals)`**, as `DispatchSequence` has: on the GPU the timeline points go
         on the submission; on the CPU the waits are awaited and the signals made from the host.
+      - **The CPU runner shares lowered kernels too.** It lowered one through Truffle for every `Pass` object; passes
+        of the same function and bindings now share one, as the GPU runner's share a pipeline.
 
 ---
 
