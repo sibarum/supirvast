@@ -1090,8 +1090,9 @@ public final class CoreToSpirv {
     }
 
     /**
-     * Data-parallel kernel resources: storage buffers (runtime arrays of i32, one variable per binding, all
-     * sharing one Block struct type) and the invocation-index builtin inputs ({@code GlobalInvocationId},
+     * Data-parallel kernel resources: storage buffers (runtime arrays, one variable per binding; the written
+     * buffers of an element type share one Block struct type, and each read-only buffer has its own) and the
+     * invocation-index builtin inputs ({@code GlobalInvocationId},
      * {@code LocalInvocationId}, {@code WorkgroupId}) the kernel reads. Buffer elements are reached with a
      * two-index {@code OpAccessChain} (struct member 0, then the dynamic array index).
      */
@@ -1101,8 +1102,6 @@ public final class CoreToSpirv {
         private final Map<BuiltIn, Integer> builtinVariables = new LinkedHashMap<>();
 
         private int memberIndexConst;   // signed-int 0 (the struct member index), shared by all blocks
-        // One Block/runtime-array per distinct element type; a buffer var uses the block for its element type.
-        private final Map<Type, Integer> blockPointerByElement = new LinkedHashMap<>();
         private final Map<Type, Integer> memberPointerByElement = new LinkedHashMap<>();
         private int uintType;
         private int builtinComponentPointer; // Input* uint
@@ -1136,31 +1135,36 @@ public final class CoreToSpirv {
         void declare(Builder b, TypeTable types, ConstantTable constants) {
             memberIndexConst = constants.intConst(Type.int32(), 0);
 
-            // A Block (struct wrapping a runtime array) + its pointer types, one per distinct element type.
-            LinkedHashSet<Type> elementTypes = new LinkedHashSet<>();
+            // A runtime array per distinct element type; the buffers written share a Block (struct wrapping it)
+            // per element type, and each read-only buffer has a Block of its own (see below).
+            Map<Type, Integer> runtimeArrayByElement = new LinkedHashMap<>();
             for (Buffer buffer : buffers) {
-                elementTypes.add(buffer.element());
-            }
-            for (Type element : elementTypes) {
+                Type element = buffer.element();
+                if (runtimeArrayByElement.containsKey(element)) {
+                    continue;
+                }
                 int elementType = types.idOf(element);
                 int runtimeArray = b.allocateId();
                 b.emit(b.globals, Op.OpTypeRuntimeArray).id(runtimeArray).id(elementType);
-                int blockType = b.allocateId();
-                b.emit(b.globals, Op.OpTypeStruct).id(blockType).id(runtimeArray);
-                int blockPointer = b.allocateId();
-                b.emit(b.globals, Op.OpTypePointer).id(blockPointer)
-                        .enumValue(StorageClass.StorageBuffer.value()).id(blockType);
-                blockPointerByElement.put(element, blockPointer);
-                memberPointerByElement.put(element, types.pointerType(StorageClass.StorageBuffer.value(), element));
                 b.emit(b.annotations, Op.OpDecorate).id(runtimeArray)
                         .enumValue(Decoration.ArrayStride.value()).literal(byteSize(element));
-                b.emit(b.annotations, Op.OpMemberDecorate).id(blockType).literal(0)
-                        .enumValue(Decoration.Offset.value()).literal(0);
-                b.emit(b.annotations, Op.OpDecorate).id(blockType).enumValue(Decoration.Block.value());
+                runtimeArrayByElement.put(element, runtimeArray);
+                memberPointerByElement.put(element, types.pointerType(StorageClass.StorageBuffer.value(), element));
             }
+            Map<Type, Integer> writtenBlockPointerByElement = new LinkedHashMap<>();
             for (Buffer buffer : buffers) {
                 int variable = variableByBinding.get(buffer.binding());
-                b.emit(b.globals, Op.OpVariable).id(blockPointerByElement.get(buffer.element()))
+                int runtimeArray = runtimeArrayByElement.get(buffer.element());
+                // A NonWritable buffer never shares its struct type with another buffer. Sharing is valid
+                // SPIR-V, the decoration being on the variable, but on an NVIDIA RTX (driver 610.78) a load
+                // from a written buffer that shared a read-only one's type could read memory from before a
+                // store to it (SharedBlockStoreTest). glslang gives every block its own type, so drivers
+                // are not tested on the shape; written buffers still share, as they always have.
+                int blockPointer = storedBindings.contains(buffer.binding())
+                        ? writtenBlockPointerByElement.computeIfAbsent(buffer.element(),
+                                element -> declareBlock(b, runtimeArray))
+                        : declareBlock(b, runtimeArray);
+                b.emit(b.globals, Op.OpVariable).id(blockPointer)
                         .id(variable).enumValue(StorageClass.StorageBuffer.value());
                 b.emit(b.annotations, Op.OpDecorate).id(variable)
                         .enumValue(Decoration.DescriptorSet.value()).literal(0);
@@ -1171,9 +1175,7 @@ public final class CoreToSpirv {
                     // fragmentStoresAndAtomics device feature -- which nothing should enable to buy silence,
                     // because it promises the implementation a write that never comes -- a fragment shader's
                     // storage buffers must all carry this (VUID-RuntimeSpirv-NonWritable-06340). On the
-                    // variable rather than the block's member: variables are per buffer already, where the
-                    // block type below is shared by every buffer of the same element type and could not
-                    // carry a decoration that differs between two of them.
+                    // variable rather than the block's member, as the variable is what the buffer is.
                     b.emit(b.annotations, Op.OpDecorate).id(variable)
                             .enumValue(Decoration.NonWritable.value());
                 }
@@ -1194,6 +1196,19 @@ public final class CoreToSpirv {
                             .enumValue(Decoration.BuiltIn.value()).enumValue(builtin.getKey().value());
                 }
             }
+        }
+
+        /** A new Block struct wrapping {@code runtimeArray}, decorated; returns its StorageBuffer pointer type. */
+        private static int declareBlock(Builder b, int runtimeArray) {
+            int blockType = b.allocateId();
+            b.emit(b.globals, Op.OpTypeStruct).id(blockType).id(runtimeArray);
+            int blockPointer = b.allocateId();
+            b.emit(b.globals, Op.OpTypePointer).id(blockPointer)
+                    .enumValue(StorageClass.StorageBuffer.value()).id(blockType);
+            b.emit(b.annotations, Op.OpMemberDecorate).id(blockType).literal(0)
+                    .enumValue(Decoration.Offset.value()).literal(0);
+            b.emit(b.annotations, Op.OpDecorate).id(blockType).enumValue(Decoration.Block.value());
+            return blockPointer;
         }
 
         private static boolean isScalar(BuiltIn builtin) {

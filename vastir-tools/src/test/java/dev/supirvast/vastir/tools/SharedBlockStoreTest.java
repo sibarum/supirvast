@@ -26,7 +26,8 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * A store, then a load of the same word, while a read-only buffer of the same element type has been loaded
  * first: the load must see the store.
  *
- * <p>On an NVIDIA GeForce RTX 5070 Ti Laptop GPU, driver 610.78, it does not. The kernel
+ * <p>On an NVIDIA GeForce RTX 5070 Ti Laptop GPU, driver 610.78, it did not while {@code CoreToSpirv} gave
+ * every buffer of an element type one {@code Block} struct type. The kernel
  *
  * <pre>
  *   ignored = r[0];      // r is only loaded, so it is decorated NonWritable
@@ -34,18 +35,16 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  *   x[0] = x[0];
  * </pre>
  *
- * <p>leaves {@code x[0]} as it was: the load reads memory from before the store, as though {@code x} could not
- * be written either. The CPU backend gives 7. The module passes {@code spirv-val}. The two buffers are two
- * variables of the one {@code Block} struct type {@code CoreToSpirv} declares per element type, and
- * {@code NonWritable} is on {@code r}'s variable, as SPIR-V allows; the driver acts as if it were on the type.
- * glslang, which gives every block its own struct type, never emits this shape.
+ * <p>left {@code x[0]} as it was: the load read memory from before the store, as though {@code x} could not be
+ * written either. The CPU backend gave 7, and the module passed {@code spirv-val}: {@code NonWritable} was on
+ * {@code r}'s variable, as SPIR-V allows, and the driver acted as if it were on the type the two variables
+ * shared. glslang, which gives every block its own struct type, never emits that shape.
  *
- * <p>Each of these makes it pass, and so is what the case needs: the read-only buffer loaded after the store
- * rather than before; {@code r} given another element type, so another struct type; {@code r} stored to as
- * well, so nothing is {@code NonWritable}; and, tried as a change to the lowering, a struct type of its own for
- * each {@code NonWritable} buffer. It was found in vexelray-sim-rigid's walls pass, where a sphere's position
- * stored in one branch and reloaded after it came back as the position before, and a sphere fell through the
- * floor.
+ * <p>Each of these made it pass: the read-only buffer loaded after the store rather than before; {@code r} given
+ * another element type, so another struct type; {@code r} stored to as well, so nothing is {@code NonWritable};
+ * and a struct type of its own for each {@code NonWritable} buffer, which is what the lowering now does. It was
+ * found in vexelray-sim-rigid's walls pass, where a sphere's position stored in one branch and reloaded after it
+ * came back as the position before, and a sphere fell through the floor.
  */
 class SharedBlockStoreTest {
 
@@ -124,12 +123,12 @@ class SharedBlockStoreTest {
         assertEquals(STORED, onCpu(kernel(true)));
     }
 
-    /** The failing case. */
+    /** The case the driver got wrong. */
     @Test
     void aLoadAfterAStoreSeesItWhenAReadOnlyBufferOfTheSameTypeWasLoadedFirst() {
         assertEquals(STORED, onGpu(kernel(true)),
-                "the GPU's load of x read memory from before its store: a NonWritable buffer of the same "
-                        + "Block struct type was loaded first");
+                "the GPU's load of x read memory from before its store: a NonWritable buffer of the same element "
+                        + "type was loaded first");
     }
 
     /** The same statements with the read-only load moved after the store, which the GPU runs right. */
