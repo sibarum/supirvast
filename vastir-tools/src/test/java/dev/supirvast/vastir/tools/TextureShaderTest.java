@@ -70,6 +70,37 @@ class TextureShaderTest {
         assertTrue(glsl.contains("sampler2D"), () -> "expected a GLSL sampler2D:\n" + glsl);
     }
 
+    /** {@code fragColor = textureLod(albedoTex, vUv, 2.0);} — an explicit mip level. */
+    private static byte[] lodShader() {
+        Texture albedo = new Texture("albedoTex", 0, 0);
+        InterfaceVar uv = InterfaceVar.input("vUv", 0, VEC2);
+        InterfaceVar fragColor = InterfaceVar.output("fragColor", 0, VEC4);
+        Region body = Region.of(
+                new Statement.InterfaceWrite(fragColor, new Expr.SampleTexture(albedo,
+                        new Expr.InterfaceRead(uv), new Expr.ConstFloat(F32, 2.0))),
+                new Statement.ReturnVoid());
+        Function main = new Function("main", new Type.FunctionType(Type.VOID, List.of()), body);
+        return new CoreToSpirv()
+                .lower(new CoreModule().addEntryPoint(EntryPoint.of(main, ShaderStage.FRAGMENT)))
+                .toByteArray();
+    }
+
+    @Test
+    void anExplicitLevelLowersToAnExplicitLodSample() {
+        NativeTools tools = new NativeTools();
+        assumeTrue(tools.isAvailable(), "native SPIR-V toolchain not bundled for this platform");
+
+        byte[] spirv = lodShader();
+        NativeTools.ValidationResult validation = tools.validate(spirv);
+        assertTrue(validation.valid(), () -> "spirv-val rejected the explicit-LOD shader:\n" + validation.output());
+
+        String disasm = tools.disassemble(spirv);
+        assertTrue(disasm.contains("OpImageSampleExplicitLod") && disasm.contains("Lod"),
+                () -> "expected an explicit-LOD sample:\n" + disasm);
+        String glsl = tools.crossCompile(spirv, NativeTools.ShaderLanguage.GLSL);
+        assertTrue(glsl.contains("textureLod"), () -> "expected GLSL textureLod:\n" + glsl);
+    }
+
     /** {@code fragColor = texture(env, vDir);} — a cubemap sampled with a direction vector. */
     private static byte[] cubeShader() {
         Texture env = Texture.cube("env", 0);

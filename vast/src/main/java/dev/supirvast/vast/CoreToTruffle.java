@@ -303,7 +303,7 @@ public final class CoreToTruffle {
                 case Expr.VectorExtract v -> scan(v.vector());
                 case Expr.Call c -> c.arguments().forEach(this::scan);
                 case Expr.MathCall m -> m.args().forEach(this::scan);
-                case Expr.SampleTexture s -> scan(s.uv());
+                case Expr.SampleTexture s -> s.operands().forEach(this::scan);
                 case Expr.MatrixTimesVector m -> { scan(m.matrix()); scan(m.vector()); }
                 default -> { }
             }

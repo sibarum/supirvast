@@ -499,7 +499,7 @@ public final class CoreToSpirv {
             case Expr.Unary u -> collectBuffers(u.operand(), out);
             case Expr.Call c -> c.arguments().forEach(a -> collectBuffers(a, out));
             case Expr.MathCall mc -> mc.args().forEach(a -> collectBuffers(a, out));
-            case Expr.SampleTexture s -> collectBuffers(s.uv(), out);
+            case Expr.SampleTexture s -> s.operands().forEach(a -> collectBuffers(a, out));
             case Expr.PushConstantRead ignored -> { }
             case Expr.MatrixTimesVector m -> {
                 collectBuffers(m.matrix(), out);
@@ -619,7 +619,7 @@ public final class CoreToSpirv {
             case Expr.Unary u -> scanKernel(u.operand(), scan);
             case Expr.Call c -> c.arguments().forEach(a -> scanKernel(a, scan));
             case Expr.MathCall mc -> mc.args().forEach(a -> scanKernel(a, scan));
-            case Expr.SampleTexture s -> scanKernel(s.uv(), scan);
+            case Expr.SampleTexture s -> s.operands().forEach(a -> scanKernel(a, scan));
             case Expr.PushConstantRead ignored -> { }
             case Expr.MatrixTimesVector m -> {
                 scanKernel(m.matrix(), scan);
@@ -763,7 +763,7 @@ public final class CoreToSpirv {
             case Expr.InterfaceRead r -> scan.variables.add(r.variable());
             case Expr.SampleTexture s -> {
                 scan.textures.add(s.texture());
-                scanInterface(s.uv(), scan);
+                s.operands().forEach(a -> scanInterface(a, scan));
             }
             case Expr.PushConstantRead r -> scan.pushConstants = r.block();
             case Expr.MatrixTimesVector m -> {
@@ -974,7 +974,7 @@ public final class CoreToSpirv {
             }
             case Expr.SampleTexture s -> {
                 types.idOf(s.type());   // vec4 result
-                prepareExpr(s.uv(), types, constants);
+                s.operands().forEach(a -> prepareExpr(a, types, constants));
             }
             case Expr.PushConstantRead r -> {
                 types.idOf(r.type());
@@ -2073,13 +2073,20 @@ public final class CoreToSpirv {
         /** Loads the combined image+sampler and samples it (implicit LOD) at the coordinate. */
         private int lowerSampleTexture(Expr.SampleTexture sample) {
             int coordinate = lowerExpr(sample.uv());   // lower the coordinate before emitting the load/sample
+            int lod = sample.lod() == null ? -1 : lowerExpr(sample.lod());
             int loaded = b.allocateId();
             b.emit(b.functions, Op.OpLoad)
                     .id(textures.sampledImageType(sample.texture().kind())).id(loaded)
                     .id(textures.variable(sample.texture()));
             int resultType = types.idOf(sample.type());
             int result = b.allocateId();
-            b.emit(b.functions, Op.OpImageSampleImplicitLod).id(resultType).id(result).id(loaded).id(coordinate);
+            if (lod < 0) {
+                b.emit(b.functions, Op.OpImageSampleImplicitLod).id(resultType).id(result).id(loaded).id(coordinate);
+            } else {
+                // Image operands: the Lod bit (0x2), then the level.
+                b.emit(b.functions, Op.OpImageSampleExplicitLod).id(resultType).id(result).id(loaded).id(coordinate)
+                        .literal(0x2).id(lod);
+            }
             return result;
         }
 

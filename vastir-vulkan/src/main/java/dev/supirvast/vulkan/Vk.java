@@ -25,6 +25,7 @@ public final class Vk {
 
     // Formats
     public static final int FORMAT_R8G8B8A8_UNORM = 37;
+    public static final int FORMAT_R8G8B8A8_SRGB = 43;
 
     // Image
     public static final int IMAGE_TYPE_2D = 1;
@@ -163,6 +164,7 @@ public final class Vk {
     // Sampler
     public static final int FILTER_LINEAR = 1;
     public static final int SAMPLER_MIPMAP_MODE_NEAREST = 0;
+    public static final int SAMPLER_MIPMAP_MODE_LINEAR = 1;
     public static final int SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE = 2;
     public static final int BORDER_COLOR_FLOAT_OPAQUE_BLACK = 0;
 

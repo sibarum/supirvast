@@ -221,12 +221,27 @@ public sealed interface Expr {
 
     /**
      * Samples a {@link Texture} at {@code uv} (a {@code vec2}), yielding the RGBA texel as a {@code vec4}.
-     * Fragment-stage only — it lowers to implicit-LOD sampling, which needs fragment-quad derivatives.
+     *
+     * <p>With no {@code lod}, fragment-stage only: it lowers to implicit-LOD sampling, the level of detail chosen
+     * from fragment-quad derivatives. With a {@code lod} (a {@code float}, the mip level), it lowers to explicit-LOD
+     * sampling at that level: for coordinates whose derivatives mean nothing, such as ones snapped to texel centres,
+     * which jump at every texel's edge and would read a blurred level there.
      */
-    record SampleTexture(Texture texture, Expr uv) implements Expr {
+    record SampleTexture(Texture texture, Expr uv, Expr lod) implements Expr {
+
+        /** Implicit level of detail: the usual sample. */
+        public SampleTexture(Texture texture, Expr uv) {
+            this(texture, uv, null);
+        }
+
         @Override
         public Type type() {
             return new Type.Vector(Type.float32(), 4);
+        }
+
+        /** The expressions it reads: the coordinate, and the level when it has one. */
+        public java.util.List<Expr> operands() {
+            return lod == null ? java.util.List.of(uv) : java.util.List.of(uv, lod);
         }
     }
 

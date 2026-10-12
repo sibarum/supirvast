@@ -58,7 +58,7 @@ public final class Subgroups {
             case Expr.VectorExtract v -> uses(v.vector());
             case Expr.Call c -> c.arguments().stream().anyMatch(Subgroups::uses);
             case Expr.MathCall m -> m.args().stream().anyMatch(Subgroups::uses);
-            case Expr.SampleTexture s -> uses(s.uv());
+            case Expr.SampleTexture s -> s.operands().stream().anyMatch(Subgroups::uses);
             case Expr.MatrixTimesVector m -> uses(m.matrix()) || uses(m.vector());
             default -> false;
         };

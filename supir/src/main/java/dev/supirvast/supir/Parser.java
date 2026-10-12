@@ -609,7 +609,15 @@ final class Parser {
                     throw new SupirParseException(texTok.span(), "undefined texture '" + texName + "'");
                 }
                 expect(Lexer.Kind.COMMA, ",");
-                yield new Expr.SampleTexture(texture, atom(scope));
+                Expr uv = atom(scope);
+                // An explicit level: ", lod <atom>". Looked at two tokens ahead, since a sample can be an argument.
+                if (peek().kind() == Lexer.Kind.COMMA && index + 1 < tokens.size()
+                        && "lod".equals(tokens.get(index + 1).text())) {
+                    advance();
+                    advance();
+                    yield new Expr.SampleTexture(texture, uv, atom(scope));
+                }
+                yield new Expr.SampleTexture(texture, uv);
             }
             case "call" -> call(scope);
             case "vec" -> vecGeneral(scope);

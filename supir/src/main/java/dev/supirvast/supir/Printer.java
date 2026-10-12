@@ -342,7 +342,8 @@ final class Printer {
                 }
                 yield sb.toString();
             }
-            case Expr.SampleTexture st -> "sample " + st.texture().name() + ", " + arg.apply(st.uv());
+            case Expr.SampleTexture st -> "sample " + st.texture().name() + ", " + arg.apply(st.uv())
+                    + (st.lod() == null ? "" : ", lod " + arg.apply(st.lod()));
             case Expr.MathCall mc -> mathMnemonic(mc.fn()) + " " + joinArgs(mc.args(), arg);
             case Expr.BufferLoad bl -> bl.buffer().name() + "[" + arg.apply(bl.index()) + "]";
             case Expr.SharedLoad sl -> sl.array().name() + "[" + arg.apply(sl.index()) + "]";
@@ -652,7 +653,7 @@ final class Printer {
             }
             case Expr.SampleTexture st -> {
                 res.add(st.texture());
-                collectExpr(st.uv(), res);
+                st.operands().forEach(a -> collectExpr(a, res));
             }
             case Expr.Binary b -> {
                 collectExpr(b.lhs(), res);
