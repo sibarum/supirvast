@@ -330,9 +330,15 @@ which is its own piece of work and not on this path.
    precompiled in its jar (`DemoShader`).
 
 Then the icon API (`IconView`, `IconButton`, a theme's icon looks) moves onto looks, and only after that do icons
-roll out into the applications. Begun: an icon with effects is drawn by a look (`ImageField.look`), its glow and shadow
-still `FieldStyle`'s, drawn by the core `fieldFill`; a plain icon is drawn as it was. What is left is a theme's icon
-looks, and `FieldStyle`'s glow and shadow as painters of their own.
+roll out into the applications. Done: `FieldStyle` is gone from the GUI's API (an `ImageField` is a tint and a look;
+the canvas keeps `FieldStyle` as its own low-level form, and the icon baker writes the new API). Glow and shadow are
+core painters of their own, `glow` and `dropShadow`, of any source, so a box can glow too; an icon's look is outline,
+fill, glow, shadow, front to back, and the Icons chapter is pixel-identical drawn so. What an icon that is a whole
+control does under the pointer and when on is the theme's (`Theme.icons()`, `IconEffects`).
+
+A look's lengths are in the canvas units it was drawn in, and do not follow a scale the canvas has pushed (a node
+turned and scaled as it is drawn): the old field kind scaled its glow and shadow with it. No chapter draws a glowing
+icon under a scale, so nothing shows it yet; per-instance lengths, or the canvas's scale in the record, would.
 
 ## Still to settle
 
