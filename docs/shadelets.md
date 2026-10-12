@@ -287,7 +287,13 @@ which is its own piece of work and not on this path.
 - `FieldStyle` (tint, glow, shadow): its three fields become the fill, glow and shadow styles.
 - The shape kind's separate shadow and stroke quads: inline painters, the quad grown by the effect's reach, as a
   field already spills into its margin. One quad where there were three, but it touches every widget that draws an
-  elevation shadow, so it lands behind a visual pass.
+  elevation shadow, so it lands behind a visual pass. Done in the renderer: a node's box is one element of the core
+  `nodeStroke`, `nodeFill`/`nodeLit` and `nodeShadow` painters, every value per instance (a node's colours change
+  with its state), so a dozen looks cover every node. A border over an image, a field or a picture stays its own
+  element after them, as it must to be over them. The pictures change by rounding along box edges (1 or 2 levels of
+  255 for nearly every changed pixel, the layers now composited in float rather than blended through eight bits), and
+  where a clip cuts a box with a shadow under it: the box is clipped once as a whole, where its layers were each
+  clipped before.
 - The lit kind: the emboss painter over the box source.
 - The image filter and the field's parameters sharing `loc8`: the image painter's style, and the field source's.
 - The text atlas becomes MTSDF (a true distance in the alpha channel) with a wider range, or text outlines and glows
