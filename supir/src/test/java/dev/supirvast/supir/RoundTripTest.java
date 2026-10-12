@@ -78,6 +78,49 @@ class RoundTripTest {
         assertFixpoint(new CoreModule().addEntryPoint(EntryPoint.of(main, ShaderStage.FRAGMENT)));
     }
 
+    @Test
+    void aFlatVaryingRoundTripsFlat() {
+        InterfaceVar vIndex = InterfaceVar.input("vIndex", 0, Type.int32()).asFlat();
+        InterfaceVar fragColor = InterfaceVar.output("fragColor", 0, VEC4);
+        Expr x = new Expr.Convert(new Expr.InterfaceRead(vIndex), F32);
+        Region body = Region.of(
+                new Statement.InterfaceWrite(fragColor, new Expr.VectorConstruct(VEC4, List.of(x, x, x, x))),
+                new Statement.ReturnVoid());
+        Function main = new Function("main", new Type.FunctionType(Type.VOID, List.of()), body);
+        CoreModule module = new CoreModule().addEntryPoint(EntryPoint.of(main, ShaderStage.FRAGMENT));
+        assertTrue(Supir.print(module).contains("in vIndex: i32 @loc 0 @flat"), () -> Supir.print(module));
+        assertFixpoint(module);
+    }
+
+    @Test
+    void aBufferOutsideSetZeroRoundTrips() {
+        Buffer styles = new Buffer("styles", 2, 1, F32);
+        InterfaceVar fragColor = InterfaceVar.output("fragColor", 0, VEC4);
+        Expr x = new Expr.BufferLoad(styles, new Expr.ConstInt(Type.int32(), 0));
+        Region body = Region.of(
+                new Statement.InterfaceWrite(fragColor, new Expr.VectorConstruct(VEC4, List.of(x, x, x, x))),
+                new Statement.ReturnVoid());
+        Function main = new Function("main", new Type.FunctionType(Type.VOID, List.of()), body);
+        CoreModule module = new CoreModule().addEntryPoint(EntryPoint.of(main, ShaderStage.FRAGMENT));
+        assertTrue(Supir.print(module).contains("@set 2 @binding 1"), () -> Supir.print(module));
+        assertFixpoint(module);
+    }
+
+    @Test
+    void anExplicitLevelSampleRoundTrips() {
+        dev.supirvast.vastir.core.Texture tex = new dev.supirvast.vastir.core.Texture("tex", 0, 0);
+        InterfaceVar vUv = InterfaceVar.input("vUv", 0, new Type.Vector(F32, 2));
+        InterfaceVar fragColor = InterfaceVar.output("fragColor", 0, VEC4);
+        Region body = Region.of(
+                new Statement.InterfaceWrite(fragColor,
+                        new Expr.SampleTexture(tex, new Expr.InterfaceRead(vUv), f(2))),
+                new Statement.ReturnVoid());
+        Function main = new Function("main", new Type.FunctionType(Type.VOID, List.of()), body);
+        CoreModule module = new CoreModule().addEntryPoint(EntryPoint.of(main, ShaderStage.FRAGMENT));
+        assertTrue(Supir.print(module).contains(", lod "), () -> Supir.print(module));
+        assertFixpoint(module);
+    }
+
     /**
      * Atomics in all three spellings — a discarded update, one that declares its old value, and a
      * compare-exchange in a retry loop that reuses a variable declared before it — plus a float add.

@@ -129,13 +129,14 @@ final class Printer {
 
     private void printDeclarations(Resources res) {
         for (InterfaceVar v : res.inputs()) {
-            line("in " + v.name() + ": " + typeText(v.type()) + " @loc " + v.location());
+            line("in " + v.name() + ": " + typeText(v.type()) + " @loc " + v.location() + (v.flat() ? " @flat" : ""));
         }
         for (InterfaceVar v : res.outputs()) {
-            line("out " + v.name() + ": " + typeText(v.type()) + " @loc " + v.location());
+            line("out " + v.name() + ": " + typeText(v.type()) + " @loc " + v.location() + (v.flat() ? " @flat" : ""));
         }
         for (Buffer b : res.buffers()) {
-            line("buffer " + b.name() + ": " + typeText(b.element()) + " @binding " + b.binding());
+            line("buffer " + b.name() + ": " + typeText(b.element()) + (b.set() == 0 ? "" : " @set " + b.set())
+                    + " @binding " + b.binding());
         }
         for (SharedArray a : res.shared()) {
             line("shared " + a.name() + ": " + typeText(a.element()) + "[" + a.length() + "]");

@@ -112,6 +112,8 @@ public final class CoreToSpirv {
         KernelUsage usage = collectKernelUsage(module);
         InterfaceUsage iface = collectInterface(module);
         checkWorkgroupUsage(module, usage, target);
+        checkInterfaceAgrees(iface);
+        checkIntegerInputsFlat(module, iface);
         KernelResources kernel = (!buffers.isEmpty() || !usage.builtins().isEmpty())
                 ? new KernelResources(b, buffers, usage.builtins(), storedBindings(module)) : null;
         WorkgroupResources workgroup = usage.sharedArrays().isEmpty()
@@ -348,6 +350,26 @@ public final class CoreToSpirv {
         }
     }
 
+    /**
+     * A fragment stage's integer input must be {@link InterfaceVar#flat}: there is no interpolating an integer, and
+     * Vulkan refuses the shader. Said here, naming the variable, rather than as a validator's message about a
+     * decoration nobody wrote.
+     */
+    private static void checkIntegerInputsFlat(CoreModule module, InterfaceUsage iface) {
+        boolean fragment = module.entryPoints().stream().anyMatch(e -> e.stage() == ShaderStage.FRAGMENT);
+        if (!fragment) {
+            return;
+        }
+        for (InterfaceVar variable : iface.variables()) {
+            Type scalar = variable.type() instanceof Type.Vector v ? v.component() : variable.type();
+            if (variable.direction() == InterfaceVar.Direction.INPUT && scalar instanceof Type.Int
+                    && !variable.flat()) {
+                throw new IllegalArgumentException("fragment input '" + variable.name() + "' is an integer and "
+                        + "must be flat: declare it with InterfaceVar.asFlat(), in both stages");
+            }
+        }
+    }
+
     private boolean usesStoreResult(CoreModule module) {
         for (Function function : module.functions()) {
             if (regionUsesStoreResult(function.body())) {
@@ -370,6 +392,39 @@ public final class CoreToSpirv {
             }
         }
         return false;
+    }
+
+    /**
+     * Records {@code buffer} at its binding, refusing a different buffer already there. Two declarations of one
+     * binding happen when a shader is assembled from parts written apart; keeping the first would read the second's
+     * data with the first's element type, and nothing downstream would say so.
+     */
+    private static void putBuffer(Map<Integer, Buffer> out, Buffer buffer) {
+        Buffer previous = out.putIfAbsent(buffer.binding(), buffer);
+        if (previous != null && !previous.equals(buffer)) {
+            throw new IllegalArgumentException("binding " + buffer.binding() + " is declared twice, differently: "
+                    + previous + " and " + buffer);
+        }
+    }
+
+    /** As {@link #putBuffer}, for the module's interface variables (by direction and location) and textures. */
+    private static void checkInterfaceAgrees(InterfaceUsage iface) {
+        Map<String, InterfaceVar> variables = new LinkedHashMap<>();
+        for (InterfaceVar v : iface.variables()) {
+            InterfaceVar previous = variables.putIfAbsent(v.direction() + " " + v.location(), v);
+            if (previous != null) {
+                throw new IllegalArgumentException(v.direction().name().toLowerCase(java.util.Locale.ROOT)
+                        + " location " + v.location() + " is declared twice, differently: " + previous + " and " + v);
+            }
+        }
+        Map<String, Texture> textures = new LinkedHashMap<>();
+        for (Texture t : iface.textures()) {
+            Texture previous = textures.putIfAbsent(t.set() + "/" + t.binding(), t);
+            if (previous != null) {
+                throw new IllegalArgumentException("set " + t.set() + " binding " + t.binding()
+                        + " is declared twice, differently: " + previous + " and " + t);
+            }
+        }
     }
 
     private List<Buffer> collectBuffers(CoreModule module) {
@@ -426,17 +481,17 @@ public final class CoreToSpirv {
         for (Statement statement : region.statements()) {
             switch (statement) {
                 case Statement.BufferStore s -> {
-                    out.putIfAbsent(s.buffer().binding(), s.buffer());
+                    putBuffer(out, s.buffer());
                     collectBuffers(s.index(), out);
                     collectBuffers(s.value(), out);
                 }
                 case Statement.AtomicUpdate s -> {
-                    out.putIfAbsent(s.buffer().binding(), s.buffer());
+                    putBuffer(out, s.buffer());
                     collectBuffers(s.index(), out);
                     collectBuffers(s.value(), out);
                 }
                 case Statement.AtomicCompareExchange s -> {
-                    out.putIfAbsent(s.buffer().binding(), s.buffer());
+                    putBuffer(out, s.buffer());
                     collectBuffers(s.index(), out);
                     collectBuffers(s.expected(), out);
                     collectBuffers(s.desired(), out);
@@ -484,7 +539,7 @@ public final class CoreToSpirv {
     private void collectBuffers(Expr expr, Map<Integer, Buffer> out) {
         switch (expr) {
             case Expr.BufferLoad l -> {
-                out.putIfAbsent(l.buffer().binding(), l.buffer());
+                putBuffer(out, l.buffer());
                 collectBuffers(l.index(), out);
             }
             case Expr.SharedLoad l -> collectBuffers(l.index(), out);
@@ -1167,7 +1222,7 @@ public final class CoreToSpirv {
                 b.emit(b.globals, Op.OpVariable).id(blockPointer)
                         .id(variable).enumValue(StorageClass.StorageBuffer.value());
                 b.emit(b.annotations, Op.OpDecorate).id(variable)
-                        .enumValue(Decoration.DescriptorSet.value()).literal(0);
+                        .enumValue(Decoration.DescriptorSet.value()).literal(buffer.set());
                 b.emit(b.annotations, Op.OpDecorate).id(variable)
                         .enumValue(Decoration.Binding.value()).literal(buffer.binding());
                 if (!storedBindings.contains(buffer.binding())) {
@@ -1388,6 +1443,9 @@ public final class CoreToSpirv {
                 b.emit(b.globals, Op.OpVariable).id(pointerType).id(variableId).enumValue(storageClass);
                 b.emit(b.annotations, Op.OpDecorate).id(variableId)
                         .enumValue(Decoration.Location.value()).literal(variable.location());
+                if (variable.flat()) {
+                    b.emit(b.annotations, Op.OpDecorate).id(variableId).enumValue(Decoration.Flat.value());
+                }
             }
         }
 

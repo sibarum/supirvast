@@ -186,14 +186,24 @@ final class Parser {
                 InterfaceVar var = word.equals("in")
                         ? InterfaceVar.input(name, location, type)
                         : InterfaceVar.output(name, location, type);
+                // Not interpolated: "@flat" after the location.
+                if (peek().kind() == Lexer.Kind.AT && index + 1 < tokens.size()
+                        && "flat".equals(tokens.get(index + 1).text())) {
+                    advance();
+                    advance();
+                    var = var.asFlat();
+                }
                 scope.defineInterface(name, var, start.span());
             }
             case "buffer" -> {
                 String name = ident("buffer name");
                 expect(Lexer.Kind.COLON, ":");
                 Type element = type();
+                // "@set N" before the binding, for a buffer outside set 0.
+                int set = peek().kind() == Lexer.Kind.AT && index + 1 < tokens.size()
+                        && "set".equals(tokens.get(index + 1).text()) ? at("set") : 0;
                 int binding = at("binding");
-                scope.defineBuffer(name, new Buffer(name, binding, element), start.span());
+                scope.defineBuffer(name, new Buffer(name, set, binding, element), start.span());
             }
             case "shared" -> {
                 // shared NAME : TYPE [ LENGTH ]
