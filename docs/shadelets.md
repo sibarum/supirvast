@@ -322,10 +322,17 @@ which is its own piece of work and not on this path.
    frame. `ShadeletAgreementTest`: weight, outline, box morph and fill agree on Truffle and the GPU within 4e-6, vast
    computing some intrinsics in double). `Canvas.box`/`field` with a look and per-instance values; records per frame;
    the application's composition in `GuiApp` (`LookCaptureTest`).
-5. Unknown styles dropped and warned once; a stale shader refused at load.
+5. ~~Unknown styles dropped and warned once; a stale shader refused at load.~~ Done, through a framework widget:
+   `IconView.weight`/`outline` and `IconButton`'s hover weight are looks naming `Effects.WEIGHT` and `OUTLINE`. With the
+   core-only shader they draw pixel-identically to the plain icon and say each dropped effect once; with
+   `Effects.ALL` the weight adds 76% to an icon's pixels and the outline lies along its edge (`UnknownEffectsTest`). A
+   stale shader is lowered at startup rather than refused (see Unknown styles). The demo composes `Effects.ALL`,
+   precompiled in its jar (`DemoShader`).
 
 Then the icon API (`IconView`, `IconButton`, a theme's icon looks) moves onto looks, and only after that do icons
-roll out into the applications.
+roll out into the applications. Begun: an icon with effects is drawn by a look (`ImageField.look`), its glow and shadow
+still `FieldStyle`'s, drawn by the core `fieldFill`; a plain icon is drawn as it was. What is left is a theme's icon
+looks, and `FieldStyle`'s glow and shadow as painters of their own.
 
 ## Still to settle
 
