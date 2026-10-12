@@ -197,10 +197,15 @@ floats, exact to 2^24. The layout is in `Composition`'s javadoc:
   `@PerInstance`: a morph's `t`, a reveal's progress, a progress fill's amount, a colour animating between two
   themes. Written when the element is emitted, which is when its animated value is known. An element with no such
   fields writes only its look, and every such element of a look can share one record: the canvas's kinds each have
-  one, written with the table (`CoreLooks`), so the core set's buffer is static. Records with per-instance values are
-  rewritten every frame, so they move to a buffer of their own, one per frame in flight, as the vertex buffer is
-  (vexelray's `StorageBuffer` is one mapped buffer, and says the caller must wait for the draw before writing it).
-  That buffer arrives with the first effect that has a per-instance field.
+  one, written with the table (`CoreLooks`). Records with per-instance values are rewritten every frame, by the
+  canvas, at `Composition.RECORDS_BASE` and above: a fixed line, so an element's offset goes into its vertices as it is
+  drawn while a look first drawn that frame is still being added below it. A frame's records are capped
+  (`RECORDS_CAPACITY`, a million floats); past it an element draws as a plain fill, said once.
+
+Each window keeps its own buffer, beside its vertex buffer and under the same synchronisation: windows wait on their
+own fences, so one buffer shared by two would have one window's records written while the other's frame reads them.
+The look table is one per device (`DeviceImages`) and copied into a window's buffer when its `version()` has moved;
+it only ever grows, so a copy under a frame in flight changes nothing that frame reads.
 
 A shadelet reads its style through the generated accessors and does not know which buffer a field came from: whether
 a field is shared or per element is a property of the style record, and changing it is an annotation, not a shader
@@ -222,11 +227,24 @@ composes its own: the box, MSDF and field sources, and the fill and image painte
 `filtered()` with it). Everything a framework widget must draw to be usable is in it. Effects (outline, glow, shadow,
 emboss, weight, morph) are on top.
 
-*Open*: who owns the pipeline and vertex layout. Today `GuiApp.canvasConfig`, the canvas technique, the panel
-technique and headless capture all assume the framework's one shader. They take the application's composed shader
-instead, and capture uses the same one, or a capture draws differently from the window. The composed shader cannot
-take the framework's names (`canvas.vert`, `canvas.frag`), which `Shaders.loadOrLower` would resolve to whichever jar
-comes first.
+**The application picks its composition once**, when it is constructed: `new GuiApp(config, fonts, composed)`, where
+`composed` is its `CanvasShader.Composed` subclass (`CoreShadelets.composition().with(Effects.ALL)`, say); every other
+constructor draws with the core set. Every window, its offscreen capture and the headless `GuiApp.capture(...,
+composed, ...)` draw with that one shader and one look table, so a capture is the window's picture. A composition that
+cannot draw the canvas's own kinds is refused before a device is made. `GuiApp.looks()` is the table, for a theme to
+install looks in; it is on the app, not on `Gui`, because it belongs to the shader, and a tree can be shown anywhere.
+The vertex layout stays the framework's. The canvas and panel techniques draw with the core set.
+
+The effects are in their own module, `vexelray-shadelets` (`Effects.WEIGHT`, `OUTLINE`, `BOX_MORPH`, `FIELD_MORPH`), so
+an application that draws none of them carries none of their code.
+
+**Reach adds up.** A look's reach is its source's, plus each modifier's (a weight moves the edge, out or in), plus the
+farthest painter's (which reaches past the edge as moved). A shadelet whose reach depends on what an element carries,
+as a morph to a larger box does, answers from the element's per-instance values and its own half extents
+(`Shadelet.reach(shared, instance, halfW, halfH)`). A field's quad is not grown: its margin is its room.
+
+The field source moves its UV by `filter.y`, the field's V per unit, on both axes: right for an atlas square in texture
+coordinates, as the icon set's is, and wrong across for one that is not.
 
 ## Unknown styles: drawn without, said once, never a crash
 
@@ -288,9 +306,9 @@ which is its own piece of work and not on this path.
    the writers for the style table and an element's record), `LookTable`, `Manifest`, `CanvasVertex.LOC_ELEMENT`.
 3. ~~Done~~: `CoreShadelets`, `CoreLooks`; every host binds the tables at set 2 (`RunRecorder`, the presenters,
    `OffscreenDraw`, both techniques, `GuiApp`/`GuiWindow` through `DeviceImages`); `CaptureDiff` and
-   `capture-chapters.ps1` in vexelray-gui. 15 of 16 demo chapters pixel-identical at tolerance 0; Plot differs only by
-   its plot's layout height, from a concurrent change to capture's settling, and its baseline is to be re-taken. The
-   panel scene is not yet diffed. The composed fragment shader is named by its manifest's hash (`CanvasShader.Composed`).
+   `capture-chapters.ps1` in vexelray-gui. All 16 demo chapters pixel-identical at tolerance 0 (Plot's baseline
+   re-taken after capture learned to settle, which moved its plot), and the panel scene at eight points of its orbit,
+   frontal to edge-on. The composed fragment shader is named by its manifest's hash (`CanvasShader.Composed`).
    As planned:
    The existing kinds as sources and painters: box, MSDF and field sources; fill, image (with `filtered()`), stroke,
    shadow and emboss painters; `CanvasShader` and `PanelShader` re-expressed as the core composition, drawing exactly
@@ -298,8 +316,12 @@ which is its own piece of work and not on this path.
    for its 16 chapters, before and after), and of a scene with a panel in the world. Nothing in the repositories
    diffs images yet, so the slice brings a small tool that does: per pixel, with a tolerance, writing a difference
    image when it fails.
-4. Weight, outline and morph (field to field, box to box) as the first new effects, each with a GPU test, and a
-   CPU/GPU agreement test where it is pure.
+4. ~~Weight, outline and morph (field to field, box to box) as the first new effects, each with a GPU test, and a
+   CPU/GPU agreement test where it is pure.~~ Done: `vexelray-shadelets` (`EffectsRenderTest`: weight moves each edge
+   3.496 px for 3.5; morphs match their ends pixel for pixel; two elements of one look with their own values in one
+   frame. `ShadeletAgreementTest`: weight, outline, box morph and fill agree on Truffle and the GPU within 4e-6, vast
+   computing some intrinsics in double). `Canvas.box`/`field` with a look and per-instance values; records per frame;
+   the application's composition in `GuiApp` (`LookCaptureTest`).
 5. Unknown styles dropped and warned once; a stale shader refused at load.
 
 Then the icon API (`IconView`, `IconButton`, a theme's icon looks) moves onto looks, and only after that do icons
@@ -309,9 +331,7 @@ roll out into the applications.
 
 Technical work items, not decisions waiting on anyone: each is settled by building or measuring it.
 
-- Which code picks the shader the GUI draws with (the *open* paragraph under Composing and compiling): the window
-  setup, the canvas, the panel and capture all load the framework's shader today, and must all take the
-  application's, the same one.
+- ~~Which code picks the shader the GUI draws with.~~ The application, at construction: see Composing and compiling.
 - ~~Can a non-entry `Function` sample a texture?~~ It should: a `Texture` is module-scoped (name, set, binding,
   kind), `CoreToSpirv.collectInterface` scans every function's body for the textures it samples, and
   `lowerSampleTexture` loads the global variable wherever the sample is. Not yet proven on the GPU:
