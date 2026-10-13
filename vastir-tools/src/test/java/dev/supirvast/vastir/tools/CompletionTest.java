@@ -163,10 +163,18 @@ class CompletionTest {
                     Completion once = runner.run(program.step);
                     once.await();
                     long wall = System.nanoTime() - start;
-                    Completion fourTimes = runner.run(four);
-                    fourTimes.await();
                     long one = once.gpuNanos().orElseThrow();
-                    long four4 = fourTimes.gpuNanos().orElseThrow();
+                    long four4 = Long.MAX_VALUE;
+                    // The fastest of several, each way: one sample swings with the clocks of a GPU that is also
+                    // drawing the desktop (an integrated one ramps up part-way through), and the ratio with it.
+                    for (int sample = 0; sample < 7; sample++) {
+                        Completion single = runner.run(program.step);
+                        single.await();
+                        one = Math.min(one, single.gpuNanos().orElseThrow());
+                        Completion fourTimes = runner.run(four);
+                        fourTimes.await();
+                        four4 = Math.min(four4, fourTimes.gpuNanos().orElseThrow());
+                    }
                     System.out.printf("[completion] %s: one run %.3f ms on the GPU, %.3f ms on the wall; four %.3f ms%n",
                             accelerator.capabilities().deviceName(), one / 1e6, wall / 1e6, four4 / 1e6);
                     assertTrue(one > 0 && one <= wall, "the GPU's time is not within the wall's: " + one + " ns");
