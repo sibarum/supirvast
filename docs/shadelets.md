@@ -162,8 +162,9 @@ a glyph's UV and `screenPxRange`, a field's range, the colour, the clip. Mixed t
 depend on that. What leaves the vertex is what an effect adds; what joins it is **one number, the element's index**.
 The canvas draws its quads from one vertex buffer of floats, not as instances, so the index is a float attribute the
 canvas writes (exact to 2^24 elements a frame), not `gl_InstanceIndex`. The vertex stage converts it to an integer and
-hands it to the fragment stage with the `Flat` decoration, so it arrives exact, not interpolated. The vertex is 28
-floats, however many effects an application has and however many of their values animate.
+hands it to the fragment stage with the `Flat` decoration, so it arrives exact, not interpolated. The vertex is 27
+floats (the index took the place of the old `kind`), however many effects an application has and however many of
+their values animate.
 
 ### A look is several styles
 
@@ -196,8 +197,8 @@ floats, exact to 2^24. The layout is in `Composition`'s javadoc:
 - **The element records**: one per drawn element, at the offset its vertices carry: its look, and its fields marked
   `@PerInstance`: a morph's `t`, a reveal's progress, a progress fill's amount, a colour animating between two
   themes. Written when the element is emitted, which is when its animated value is known. An element with no such
-  fields writes only its look, and every such element of a look can share one record: the canvas's kinds each have
-  one, written with the table (`CoreLooks`). Records with per-instance values are rewritten every frame, by the
+  fields writes only its look, and every such element of a look can share one record: the canvas's own primitives
+  (box, text, image, field) each have one, written with the table (`CoreLooks`). Records with per-instance values are rewritten every frame, by the
   canvas, at `Composition.RECORDS_BASE` and above: a fixed line, so an element's offset goes into its vertices as it is
   drawn while a look first drawn that frame is still being added below it. A frame's records are capped
   (`RECORDS_CAPACITY`, a million floats); past it an element draws as a plain fill, said once.
@@ -231,7 +232,7 @@ emboss, weight, morph) are on top.
 `composed` is its `CanvasShader.Composed` subclass (`CoreShadelets.composition().with(Effects.ALL)`, say); every other
 constructor draws with the core set. Every window, its offscreen capture and the headless `GuiApp.capture(...,
 composed, ...)` draw with that one shader and one look table, so a capture is the window's picture. A composition that
-cannot draw the canvas's own kinds is refused before a device is made. `GuiApp.looks()` is the table, for a theme to
+cannot draw the canvas's own primitives is refused before a device is made. `GuiApp.looks()` is the table, for a theme to
 install looks in; it is on the app, not on `Gui`, because it belongs to the shader, and a tree can be shown anywhere.
 The vertex layout stays the framework's. The canvas and panel techniques draw with the core set.
 
@@ -336,15 +337,21 @@ which is its own piece of work and not on this path.
    precompiled in its jar (`DemoShader`).
 
 Then the icon API (`IconView`, `IconButton`, a theme's icon looks) moves onto looks, and only after that do icons
-roll out into the applications. Done: `FieldStyle` is gone from the GUI's API (an `ImageField` is a tint and a look;
-the canvas keeps `FieldStyle` as its own low-level form, and the icon baker writes the new API). Glow and shadow are
+roll out into the applications. Done: `FieldStyle` is gone from the GUI's API (an `ImageField` is a tint and a look,
+and the icon baker writes the new API), and since from the canvas too (see below). Glow and shadow are
 core painters of their own, `glow` and `dropShadow`, of any source, so a box can glow too; an icon's look is outline,
 fill, glow, shadow, front to back, and the Icons chapter is pixel-identical drawn so. What an icon that is a whole
 control does under the pointer and when on is the theme's (`Theme.icons()`, `IconEffects`).
 
 A look's lengths are in the canvas units it was drawn in, and do not follow a scale the canvas has pushed (a node
-turned and scaled as it is drawn): the old field kind scaled its glow and shadow with it. No chapter draws a glowing
-icon under a scale, so nothing shows it yet; per-instance lengths, or the canvas's scale in the record, would.
+turned and scaled as it is drawn): the old field kind scaled its glow and shadow with it, and the old stroke, shadow
+and lit kinds their width, blur and bevel. So a node's border width and shadow lift do not scale either. Nothing in
+the chapter captures shows it yet; per-instance lengths, or the canvas's scale in the record, would fix it.
+
+## Removing what looks made obsolete
+
+Done: the canvas's kinds, the renderer's separate-quad path, `FieldStyle` and the kind in the vertex are gone, in the
+order [shadelets-legacy.md](shadelets-legacy.md) gives, which also records what moved.
 
 ## Still to settle
 
