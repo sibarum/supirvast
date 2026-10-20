@@ -781,6 +781,11 @@ public final class GpuContext implements AutoCloseable {
             vk.bindBuffers(sets[i], handles);
         }
 
+        return new RecordedSequence(this, List.copyOf(steps), sets, recordRun(steps, sets), descriptorPool);
+    }
+
+    /** The command buffer one run of {@code steps} submits, each step with its descriptor set of {@code sets}. */
+    private MemorySegment recordRun(List<Step> steps, long[] sets) {
         // Simultaneous use: a run may be submitted again while the last one is still executing. The
         // descriptor sets are only read, so the runs can share them; the opening barrier orders them.
         MemorySegment cmd = vk.beginCommandBuffer(commandPool, VkCompute.COMMAND_BUFFER_SIMULTANEOUS_USE);
@@ -793,7 +798,19 @@ public final class GpuContext implements AutoCloseable {
         // So that a mapped buffer a dispatch wrote is right to read once the run is known to be done.
         vk.shaderToHostBarrier(cmd);
         vk.endCommandBuffer(cmd);
-        return new RecordedSequence(this, cmd, descriptorPool, steps.size());
+        return cmd;
+    }
+
+    /**
+     * Whether a command buffer on this device must not be submitted again while it is still executing, despite
+     * {@code VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT}. Mesa's Dozen, Vulkan over Direct3D 12, on Intel's
+     * D3D12 driver loses the device (the next wait or object creation fails with {@code VK_ERROR_DEVICE_LOST}
+     * or {@code VK_ERROR_OUT_OF_DEVICE_MEMORY}) on some of the runs that overlap themselves, when other processes
+     * are using the GPU too — clean under the validation layer, never on Intel's own Vulkan driver, nor on Dozen
+     * over NVIDIA or WARP, nor once each queued run has its own command buffer.
+     */
+    private static boolean overlappingRunsLoseTheDevice(String deviceName) {
+        return deviceName.startsWith("Microsoft Direct3D12 (") && deviceName.contains("Intel");
     }
 
     /**
@@ -820,13 +837,14 @@ public final class GpuContext implements AutoCloseable {
         }
         long fence = vk.createFence();
         long serial = submitted + 1;
-        MemorySegment[] commandBuffers = {sequence.cmd};
+        MemorySegment cmd = sequence.commandBufferFor(serial);
+        MemorySegment[] commandBuffers = {cmd};
         if (queryPool != 0) {
             int slot = (int) (serial % TIMED_SLOTS);
             stampsFor(slot);
             slotSerial[slot] = serial;
             slotNanos[slot] = -1;
-            commandBuffers = new MemorySegment[] {stampBefore[slot], sequence.cmd, stampAfter[slot]};
+            commandBuffers = new MemorySegment[] {stampBefore[slot], cmd, stampAfter[slot]};
         }
         vk.submit(queues.get(0), commandBuffers, fence, handles(waits), values(waits), handles(signals),
                 values(signals));
@@ -899,26 +917,62 @@ public final class GpuContext implements AutoCloseable {
 
     /**
      * Dispatches recorded once into one command buffer, reused for every run: the per-dispatch cost left is
-     * a share of one submission. Must be {@link #close closed} before the context, and before any pipeline or
-     * buffer it records is.
+     * a share of one submission. (On a device where a run may not overlap itself, each run in flight at once has
+     * a copy of its own, recorded the first time that many are.) Must be {@link #close closed} before the context,
+     * and before any pipeline or buffer it records is.
      */
     public static final class RecordedSequence implements AutoCloseable {
         private final GpuContext context;
-        private final MemorySegment cmd;
+        private final List<Step> steps;
+        private final long[] sets;
+        /**
+         * The recorded command buffer — and, where {@link #overlappingRunsLoseTheDevice} a run may not overlap
+         * itself, copies recorded as runs pile up — each with the serial of the last run that submitted it.
+         */
+        private final List<MemorySegment> cmds = new ArrayList<>();
+        private final List<Long> lastRuns = new ArrayList<>();
+        private final boolean oneRunPerCommandBuffer;
         private final long descriptorPool;
-        private final int dispatches;
         private boolean closed;
 
-        private RecordedSequence(GpuContext context, MemorySegment cmd, long descriptorPool, int dispatches) {
+        private RecordedSequence(GpuContext context, List<Step> steps, long[] sets, MemorySegment cmd,
+                                 long descriptorPool) {
             this.context = context;
-            this.cmd = cmd;
+            this.steps = steps;
+            this.sets = sets;
+            this.cmds.add(cmd);
+            this.lastRuns.add(0L);
+            this.oneRunPerCommandBuffer = overlappingRunsLoseTheDevice(context.deviceName);
             this.descriptorPool = descriptorPool;
-            this.dispatches = dispatches;
         }
 
         /** How many dispatches one run submits. */
         public int dispatches() {
-            return dispatches;
+            return steps.size();
+        }
+
+        /**
+         * The command buffer the run given {@code serial} submits: the recorded one, unless it may not overlap
+         * itself — then one no run is still executing, recorded afresh when every copy is.
+         */
+        private MemorySegment commandBufferFor(long serial) {
+            int free = 0;
+            if (oneRunPerCommandBuffer) {
+                context.reclaim();
+                free = -1;
+                for (int i = 0; i < cmds.size() && free < 0; i++) {
+                    if (lastRuns.get(i) <= context.completed) {
+                        free = i;
+                    }
+                }
+                if (free < 0) {
+                    cmds.add(context.recordRun(steps, sets));
+                    lastRuns.add(0L);
+                    free = cmds.size() - 1;
+                }
+            }
+            lastRuns.set(free, serial);
+            return cmds.get(free);
         }
 
         /** Waits for every run in flight — the command buffer and sets are in use until then — and frees them. */
@@ -929,7 +983,9 @@ public final class GpuContext implements AutoCloseable {
             }
             closed = true;
             context.finish();
-            context.vk.freeCommandBuffer(context.commandPool, cmd);
+            for (MemorySegment cmd : cmds) {
+                context.vk.freeCommandBuffer(context.commandPool, cmd);
+            }
             context.vk.destroyDescriptorPool(descriptorPool);
         }
     }
