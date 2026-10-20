@@ -7,7 +7,7 @@
     <parent>
         <groupId>dev.supirvast</groupId>
         <artifactId>supir-vast</artifactId>
-        <version>0.2.1-SNAPSHOT</version>
+        <version>0.2.1</version>
     </parent>
 
     <artifactId>vastir</artifactId>
