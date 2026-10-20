@@ -18,12 +18,12 @@ import static java.lang.foreign.ValueLayout.ADDRESS;
  * This is the sanctioned "loader-based library" variant of the binding convention (see
  * {@code docs/native-bindings.md} §4.4); like all bindings it routes through {@link Ffi}.
  *
- * <p>The loader library name is platform-specific ({@code vulkan-1} on Windows). Windows-first for now; a later
- * step sources the name from the active platform when Linux/macOS land.
+ * <p>The loader's file name is the one thing here that differs per OS, so it is not here: the OS module on the class
+ * path names it ({@link VulkanLoaderLibrary}).
  */
 public final class VkLoader {
 
-    private static final SymbolLookup LIB = Ffi.library("vulkan-1");
+    private static final SymbolLookup LIB = Ffi.libraryFile(loaderFileName());
 
     /** {@code vkGetInstanceProcAddr} — the one command resolved by name; everything else goes through it. */
     private static final MemorySegment GET_INSTANCE_PROC_ADDR_PTR = LIB.find("vkGetInstanceProcAddr")
@@ -33,6 +33,19 @@ public final class VkLoader {
             FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS));
 
     private VkLoader() {
+    }
+
+    /** The file name the class path's one {@link VulkanLoaderLibrary} gives. */
+    private static String loaderFileName() {
+        java.util.List<VulkanLoaderLibrary> found = java.util.ServiceLoader.load(VulkanLoaderLibrary.class).stream()
+                .map(java.util.ServiceLoader.Provider::get)
+                .toList();
+        if (found.size() != 1) {
+            throw new NativeException((found.isEmpty() ? "no" : found.size() + "")
+                    + " Vulkan loader OS modules on the class path; exactly one of vastir-vulkan-windows or "
+                    + "vastir-vulkan-linux is needed, which the consumer's OS-activated build profile adds");
+        }
+        return found.getFirst().fileName();
     }
 
     /**

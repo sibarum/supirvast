@@ -28,6 +28,9 @@
         <module>vastir-ffi</module>
         <!-- The stack's one Panama binding to Vulkan: loader, instance, device. Depends on vastir-ffi. -->
         <module>vastir-vulkan</module>
+        <!-- vastir-vulkan's OS halves: where the Vulkan loader is. A consumer's OS-activated profile adds one. -->
+        <module>vastir-vulkan-windows</module>
+        <module>vastir-vulkan-linux</module>
         <!-- Bundled native SPIR-V toolchain + differential harness; depends on vastir and vast. -->
         <module>vastir-tools</module>
         <!-- Maven plugin: pre-compiles ShaderSource implementations to SPIR-V classpath resources. -->
@@ -89,6 +92,16 @@
             <dependency>
                 <groupId>dev.supirvast</groupId>
                 <artifactId>vastir-vulkan</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>dev.supirvast</groupId>
+                <artifactId>vastir-vulkan-windows</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>dev.supirvast</groupId>
+                <artifactId>vastir-vulkan-linux</artifactId>
                 <version>${project.version}</version>
             </dependency>
 

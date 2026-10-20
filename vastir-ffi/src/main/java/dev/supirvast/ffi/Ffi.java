@@ -38,6 +38,15 @@ public final class Ffi {
         return SymbolLookup.libraryLookup(System.mapLibraryName(name), GLOBAL);
     }
 
+    /**
+     * Open a system library by its exact file name ({@code libX11.so.6}, {@code libvulkan.so.1}). On Linux the
+     * runtime library is the versioned soname: the bare {@code libX11.so} that {@link #library} maps to is a
+     * development symlink, present only where the {@code -dev} package is installed.
+     */
+    public static SymbolLookup libraryFile(String fileName) {
+        return SymbolLookup.libraryLookup(fileName, GLOBAL);
+    }
+
     /** A downcall handle for {@code symbol} in {@code lib}. Fails loudly if the symbol is absent. */
     public static MethodHandle downcall(SymbolLookup lib, String symbol, FunctionDescriptor descriptor) {
         MemorySegment address = lib.find(symbol)

@@ -76,4 +76,30 @@
             </plugin>
         </plugins>
     </build>
+
+    <!-- Where the Vulkan loader is: exactly one vastir-vulkan OS module, picked by the build host's OS. -->
+    <profiles>
+        <profile>
+            <id>platform-windows</id>
+            <activation><os><family>windows</family></os></activation>
+            <dependencies>
+                <dependency>
+                    <groupId>dev.supirvast</groupId>
+                    <artifactId>vastir-vulkan-windows</artifactId>
+                    <scope>runtime</scope>
+                </dependency>
+            </dependencies>
+        </profile>
+        <profile>
+            <id>platform-linux</id>
+            <activation><os><family>unix</family><name>linux</name></os></activation>
+            <dependencies>
+                <dependency>
+                    <groupId>dev.supirvast</groupId>
+                    <artifactId>vastir-vulkan-linux</artifactId>
+                    <scope>runtime</scope>
+                </dependency>
+            </dependencies>
+        </profile>
+    </profiles>
 </project>
