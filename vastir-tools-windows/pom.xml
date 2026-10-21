@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>dev.supirvast</groupId>
+        <artifactId>supir-vast</artifactId>
+        <version>0.2.2-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>vastir-tools-windows</artifactId>
+
+    <name>Supir-Vast :: vastir-tools-windows</name>
+    <description>
+        vastir-tools' native SPIR-V toolchain for Windows (SPIRV-Tools: spirv-val/dis/as/opt, and SPIRV-Cross),
+        fetched from the pinned LunarG Vulkan SDK at build time (cached under ~/.supirvast) and packaged into this
+        jar, with META-INF/supirvast/spirv-tools.properties saying where. vastir-tools' OS-activated profile adds it.
+    </description>
+
+    <properties>
+        <!-- Pinned to match the SPIRV-Headers grammar tag used by vastir-codegen. -->
+        <vulkan.sdk.version>1.4.350.0</vulkan.sdk.version>
+        <!-- The fetch runs the SDK's Windows installer, so only a Windows build does it (the profile below). Set
+             -Dvast.skipNativeTools=true there to skip it too (offline/CI without natives). -->
+        <vast.skipNativeTools>true</vast.skipNativeTools>
+    </properties>
+
+    <build>
+        <plugins>
+            <!-- Fetch + bundle after compile (so the installer class exists) and before package (so the binaries
+                 are inside the jar). -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>bundle-native-tools</id>
+                        <phase>process-classes</phase>
+                        <goals>
+                            <goal>java</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${vast.skipNativeTools}</skip>
+                            <mainClass>dev.supirvast.vastir.tools.windows.NativeToolsInstaller</mainClass>
+                            <arguments>
+                                <argument>${project.build.outputDirectory}</argument>
+                                <argument>${vulkan.sdk.version}</argument>
+                            </arguments>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <profile>
+            <id>fetch-on-windows</id>
+            <activation><os><family>windows</family></os></activation>
+            <properties>
+                <vast.skipNativeTools>false</vast.skipNativeTools>
+            </properties>
+        </profile>
+    </profiles>
+</project>

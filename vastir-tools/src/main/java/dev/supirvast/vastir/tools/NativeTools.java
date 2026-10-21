@@ -10,14 +10,17 @@ import java.nio.file.attribute.PosixFilePermission;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 /**
  * Runtime access to the bundled native SPIR-V toolchain.
  *
- * <p>On first use, the executables packaged for the {@linkplain Platform#current() host platform} are
- * extracted from the classpath to a temporary directory and invoked as processes. Operates on the raw SPIR-V
+ * <p>On first use, the executables a {@code vastir-tools-<os>} module bundles for this platform are extracted from
+ * the classpath to a temporary directory and invoked as processes. Which they are, where, and what this OS calls an
+ * executable, the module says in {@code META-INF/supirvast/spirv-tools.properties}; this class names no OS. Where no
+ * such module is on the class path, {@link #isAvailable()} is false. Operates on the raw SPIR-V
  * bytes produced by the vastir emitter, so the full lower → validate → cross-compile path runs from one jar.
  */
 public final class NativeTools {
@@ -28,22 +31,32 @@ public final class NativeTools {
     /** Result of running {@code spirv-val}: validity plus the tool's diagnostic output. */
     public record ValidationResult(boolean valid, String output) {}
 
-    private static final String RESOURCE_BASE = "/dev/supirvast/vastir/tools/native/";
+    private static final String DESCRIPTOR = "/META-INF/supirvast/spirv-tools.properties";
 
-    private final Platform platform;
+    /** The OS module's account of its tools, or null when there is no OS module with tools. */
+    private static final Properties BUNDLE = loadBundle();
+
     private volatile Path extractedDir;
 
     public NativeTools() {
-        this(Platform.current());
     }
 
-    public NativeTools(Platform platform) {
-        this.platform = platform;
+    private static Properties loadBundle() {
+        try (InputStream in = NativeTools.class.getResourceAsStream(DESCRIPTOR)) {
+            if (in == null) {
+                return null;
+            }
+            Properties p = new Properties();
+            p.load(in);
+            return p;
+        } catch (IOException e) {
+            throw new UncheckedIOException("failed to read " + DESCRIPTOR, e);
+        }
     }
 
-    /** Whether native tools for the host platform are bundled in this artifact. */
+    /** Whether native tools for this platform are on the class path. */
     public boolean isAvailable() {
-        return NativeTools.class.getResource(resourcePath("spirv-val")) != null;
+        return BUNDLE != null && NativeTools.class.getResource(resourcePath("spirv-val")) != null;
     }
 
     /** Validates a SPIR-V module with {@code spirv-val}. */
@@ -169,15 +182,23 @@ public final class NativeTools {
 
     // --- internals -------------------------------------------------------------------------------------
 
-    private String resourcePath(String tool) {
-        return RESOURCE_BASE + platform.dir() + "/" + platform.executableName(tool);
+    private static String executableName(String tool) {
+        return tool + BUNDLE.getProperty("suffix", "");
+    }
+
+    private static String resourcePath(String tool) {
+        return BUNDLE.getProperty("resources") + executableName(tool);
     }
 
     private Path toolPath(String tool) {
+        if (BUNDLE == null) {
+            throw new IllegalStateException("no native SPIR-V tools for this platform (no vastir-tools-<os> module"
+                    + " with them on the class path)");
+        }
         ensureExtracted();
-        Path path = extractedDir.resolve(platform.executableName(tool));
+        Path path = extractedDir.resolve(executableName(tool));
         if (!Files.isRegularFile(path)) {
-            throw new IllegalStateException("native tool not bundled: " + tool + " (" + platform + ")");
+            throw new IllegalStateException("native tool not bundled: " + tool);
         }
         return path;
     }
@@ -193,7 +214,7 @@ public final class NativeTools {
             try {
                 Path dir = Files.createTempDirectory("vast-spirv-tools");
                 dir.toFile().deleteOnExit();
-                for (String tool : NativeToolsInstaller.REQUIRED_TOOLS) {
+                for (String tool : BUNDLE.getProperty("tools", "").split(",")) {
                     extractTool(tool, dir);
                 }
                 extractedDir = dir;
@@ -209,7 +230,7 @@ public final class NativeTools {
             if (in == null) {
                 return; // not bundled; toolPath() reports a clear error if it is later requested
             }
-            Path target = dir.resolve(platform.executableName(tool));
+            Path target = dir.resolve(executableName(tool));
             Files.copy(in, target, StandardCopyOption.REPLACE_EXISTING);
             makeExecutable(target);
             target.toFile().deleteOnExit();

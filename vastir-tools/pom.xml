@@ -14,18 +14,11 @@
 
     <name>Supir-Vast :: vastir-tools</name>
     <description>
-        Bundles the native SPIR-V toolchain (SPIRV-Tools: spirv-val/dis/as/opt, and SPIRV-Cross) for the host
-        platform and exposes a runtime API to validate, disassemble, and cross-compile SPIR-V produced by the
-        vastir emitter. Binaries are fetched from the pinned LunarG Vulkan SDK at build time (cached under
-        ~/.supirvast) and packaged into the jar; the runtime extracts and invokes them as processes.
+        A runtime API to validate, disassemble, and cross-compile SPIR-V produced by the vastir emitter, over the
+        native SPIR-V toolchain (SPIRV-Tools: spirv-val/dis/as/opt, and SPIRV-Cross). The binaries come from a
+        vastir-tools-&lt;os&gt; module, which the OS-activated profiles below add; the runtime extracts and invokes
+        them as processes. Where there is no such module for the OS, the tools are unavailable.
     </description>
-
-    <properties>
-        <!-- Pinned to match the SPIRV-Headers grammar tag used by vastir-codegen. -->
-        <vulkan.sdk.version>1.4.350.0</vulkan.sdk.version>
-        <!-- Set -Dvast.skipNativeTools=true to skip the SDK fetch/bundle (offline/CI without natives). -->
-        <vast.skipNativeTools>false</vast.skipNativeTools>
-    </properties>
 
     <dependencies>
         <dependency>
@@ -47,36 +40,6 @@
         </dependency>
     </dependencies>
 
-    <build>
-        <plugins>
-            <!--
-              Fetch + bundle the native SPIR-V tools after compile (so this module's installer class exists)
-              and before test/package (so the binaries are on the test classpath and inside the jar).
-            -->
-            <plugin>
-                <groupId>org.codehaus.mojo</groupId>
-                <artifactId>exec-maven-plugin</artifactId>
-                <executions>
-                    <execution>
-                        <id>bundle-native-tools</id>
-                        <phase>process-classes</phase>
-                        <goals>
-                            <goal>java</goal>
-                        </goals>
-                        <configuration>
-                            <skip>${vast.skipNativeTools}</skip>
-                            <mainClass>dev.supirvast.vastir.tools.NativeToolsInstaller</mainClass>
-                            <arguments>
-                                <argument>${project.build.outputDirectory}</argument>
-                                <argument>${vulkan.sdk.version}</argument>
-                            </arguments>
-                        </configuration>
-                    </execution>
-                </executions>
-            </plugin>
-        </plugins>
-    </build>
-
     <!-- Where the Vulkan loader is: exactly one vastir-vulkan OS module, picked by the build host's OS. -->
     <profiles>
         <profile>
@@ -86,6 +49,12 @@
                 <dependency>
                     <groupId>dev.supirvast</groupId>
                     <artifactId>vastir-vulkan-windows</artifactId>
+                    <scope>runtime</scope>
+                </dependency>
+                <!-- And the SPIR-V tools for Windows. -->
+                <dependency>
+                    <groupId>dev.supirvast</groupId>
+                    <artifactId>vastir-tools-windows</artifactId>
                     <scope>runtime</scope>
                 </dependency>
             </dependencies>

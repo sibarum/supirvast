@@ -32,6 +32,8 @@
         <module>vastir-vulkan-windows</module>
         <module>vastir-vulkan-linux</module>
         <!-- Bundled native SPIR-V toolchain + differential harness; depends on vastir and vast. -->
+        <!-- The SPIR-V tools for Windows, which vastir-tools' OS-activated profile adds. -->
+        <module>vastir-tools-windows</module>
         <module>vastir-tools</module>
         <!-- Maven plugin: pre-compiles ShaderSource implementations to SPIR-V classpath resources. -->
         <module>supirvast-maven-plugin</module>
@@ -102,6 +104,11 @@
             <dependency>
                 <groupId>dev.supirvast</groupId>
                 <artifactId>vastir-vulkan-linux</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>dev.supirvast</groupId>
+                <artifactId>vastir-tools-windows</artifactId>
                 <version>${project.version}</version>
             </dependency>
 

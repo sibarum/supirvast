@@ -1,4 +1,4 @@
-package dev.supirvast.vastir.tools;
+package dev.supirvast.vastir.tools.windows;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -14,7 +14,8 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Build-time tool that bundles the host platform's native SPIR-V toolchain into the module output.
+ * Build-time tool that bundles the Windows native SPIR-V toolchain into this module's output, with
+ * {@code META-INF/supirvast/spirv-tools.properties} saying where and what for {@code vastir-tools} to find.
  *
  * <p>Binaries are sourced from the pinned LunarG Vulkan SDK — the only single distribution carrying both
  * SPIRV-Tools and SPIRV-Cross, pinned and QA-tested. The SDK is downloaded once and silently installed in
@@ -29,6 +30,10 @@ public final class NativeToolsInstaller {
     static final List<String> REQUIRED_TOOLS =
             List.of("spirv-val", "spirv-dis", "spirv-as", "spirv-opt", "spirv-cross");
 
+    /** Where in the jar they go, and the resource that tells vastir-tools so. */
+    static final String RESOURCES = "dev/supirvast/vastir/tools/native/windows-x64/";
+    static final String DESCRIPTOR = "META-INF/supirvast/spirv-tools.properties";
+
     private NativeToolsInstaller() {
     }
 
@@ -42,32 +47,23 @@ public final class NativeToolsInstaller {
         }
         Path outputDir = Path.of(args[0]);
         String sdkVersion = args[1];
-        Platform platform = Platform.current();
-
-        if (platform != Platform.WINDOWS_X64) {
-            // Host-platform-only scope; the SDK fetch is currently wired for Windows x64.
-            log("host platform " + platform + " not yet supported for fetch; no binaries bundled");
-            return;
-        }
-
         Path cacheRoot = Path.of(System.getProperty("user.home"), ".supirvast", "vulkan", sdkVersion);
         Path sdkRoot = cacheRoot.resolve("sdk"); // install target; kept separate from the installer download
         Path binDir = sdkRoot.resolve("Bin");
 
-        if (allToolsPresent(binDir, platform)) {
+        if (allToolsPresent(binDir)) {
             log("using cached Vulkan SDK " + sdkVersion + " at " + sdkRoot);
         } else {
             downloadAndInstall(cacheRoot, sdkRoot, sdkVersion);
-            if (!allToolsPresent(binDir, platform)) {
+            if (!allToolsPresent(binDir)) {
                 throw new IllegalStateException("SDK install did not yield expected tools in " + binDir);
             }
         }
-        bundle(binDir, outputDir, platform);
+        bundle(binDir, outputDir);
     }
 
-    private static boolean allToolsPresent(Path binDir, Platform platform) {
-        return REQUIRED_TOOLS.stream()
-                .allMatch(tool -> Files.isRegularFile(binDir.resolve(platform.executableName(tool))));
+    private static boolean allToolsPresent(Path binDir) {
+        return REQUIRED_TOOLS.stream().allMatch(tool -> Files.isRegularFile(binDir.resolve(tool + ".exe")));
     }
 
     private static void downloadAndInstall(Path cacheRoot, Path sdkRoot, String sdkVersion) throws Exception {
@@ -113,13 +109,19 @@ public final class NativeToolsInstaller {
         }
     }
 
-    private static void bundle(Path binDir, Path outputDir, Platform platform) throws IOException {
-        Path dest = outputDir.resolve("dev/supirvast/vastir/tools/native").resolve(platform.dir());
+    private static void bundle(Path binDir, Path outputDir) throws IOException {
+        Path dest = outputDir.resolve(RESOURCES);
         Files.createDirectories(dest);
         for (String tool : REQUIRED_TOOLS) {
-            String exe = platform.executableName(tool);
+            String exe = tool + ".exe";
             Files.copy(binDir.resolve(exe), dest.resolve(exe), StandardCopyOption.REPLACE_EXISTING);
         }
+        Path descriptor = outputDir.resolve(DESCRIPTOR);
+        Files.createDirectories(descriptor.getParent());
+        Files.writeString(descriptor, "# Where vastir-tools finds the SPIR-V tools this module bundles.\n"
+                + "resources=/" + RESOURCES + "\n"
+                + "suffix=.exe\n"
+                + "tools=" + String.join(",", REQUIRED_TOOLS) + "\n");
         log("bundled " + REQUIRED_TOOLS.size() + " native tools into " + dest);
     }
 
