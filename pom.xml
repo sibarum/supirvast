@@ -183,6 +183,7 @@
                     <execution>
                         <goals>
                             <goal>identify</goal>
+                            <goal>isolate</goal>
                         </goals>
                     </execution>
                 </executions>
