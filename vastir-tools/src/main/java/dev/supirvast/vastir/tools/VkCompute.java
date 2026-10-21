@@ -278,6 +278,7 @@ final class VkCompute {
     private final MethodHandle vkMapMemory;
     private final MethodHandle vkUnmapMemory;
     private final MethodHandle vkInvalidateMappedMemoryRanges;
+    private final MethodHandle vkFlushMappedMemoryRanges;
     private final MethodHandle vkCreateShaderModule;
     private final MethodHandle vkDestroyShaderModule;
     private final MethodHandle vkCreateDescriptorSetLayout;
@@ -336,6 +337,8 @@ final class VkCompute {
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, ADDRESS));
         vkUnmapMemory = device.command("vkUnmapMemory", FunctionDescriptor.ofVoid(ADDRESS, JAVA_LONG));
         vkInvalidateMappedMemoryRanges = device.command("vkInvalidateMappedMemoryRanges",
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS));
+        vkFlushMappedMemoryRanges = device.command("vkFlushMappedMemoryRanges",
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS));
         vkCreateShaderModule = device.command("vkCreateShaderModule", CREATE);
         vkDestroyShaderModule = device.command("vkDestroyShaderModule", DESTROY);
@@ -495,6 +498,18 @@ final class VkCompute {
         MemorySegment.copy(mapped, JAVA_INT, 0, out, 0, length);
         unmap(memory);
         return out;
+    }
+
+    /** Make what the host wrote to non-coherent memory visible to the device's next submission. */
+    void flush(long memory) {
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment range = a.allocate(MAPPED_MEMORY_RANGE);
+            si(range, MAPPED_MEMORY_RANGE, "sType", STYPE_MAPPED_MEMORY_RANGE);
+            sl(range, MAPPED_MEMORY_RANGE, "memory", memory);
+            sl(range, MAPPED_MEMORY_RANGE, "offset", 0L);
+            sl(range, MAPPED_MEMORY_RANGE, "size", WHOLE_SIZE);
+            check(invoke(vkFlushMappedMemoryRanges, dev, 1, range), "vkFlushMappedMemoryRanges");
+        }
     }
 
     /** Make what the device wrote to non-coherent memory visible to the host's next read of it. */

@@ -112,6 +112,27 @@ public final class ResidentBuffer implements AutoCloseable {
         return device != null ? device.peek(words()) : host.clone();
     }
 
+    /**
+     * Replaces the start of the buffer with {@code words}, written where it is, with no submission and no wait: for a
+     * {@linkplain Accelerator#allocateReadout readout}, the host's side of a buffer it fills before each run rather
+     * than reads after. Seen by every run submitted after it; right only once every run still reading it has been
+     * awaited. On the CPU backend it is the array, as {@link #write} is.
+     *
+     * @throws IllegalStateException if it is on the device and not a readout
+     */
+    public void poke(int[] words) {
+        requireOpen();
+        if (words.length > words()) {
+            throw new IllegalArgumentException(words.length + " words do not fit a buffer of " + elements + " "
+                    + element + " (" + words() + " words)");
+        }
+        if (device != null) {
+            device.poke(words);
+        } else {
+            System.arraycopy(words, 0, host, 0, words.length);
+        }
+    }
+
     @Override
     public void close() {
         if (!closed) {

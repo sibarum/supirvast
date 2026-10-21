@@ -560,6 +560,28 @@ public final class GpuContext implements AutoCloseable {
             return out;
         }
 
+        /**
+         * Replaces the start of the buffer with {@code data}, written where it is: no staging buffer, no submission
+         * and no wait, so any thread holding the buffer may do it while another submits. Seen by every submission
+         * made after it returns (a host write before {@code vkQueueSubmit} needs nothing more, once flushed). Right
+         * only while no run still in flight reads the buffer: await the last one that does first.
+         *
+         * @throws IllegalStateException if the buffer was not {@linkplain GpuContext#allocateMapped made mapped}
+         */
+        public void poke(int[] data) {
+            handle();
+            if (mapped == null) {
+                throw new IllegalStateException("only a mapped buffer is written where it is; this one is device-local");
+            }
+            if (data.length > words) {
+                throw new IllegalArgumentException(data.length + " words exceed a " + words + "-word buffer");
+            }
+            MemorySegment.copy(data, 0, mapped, java.lang.foreign.ValueLayout.JAVA_INT, 0, data.length);
+            if (!coherent) {
+                owner.vk.flush(memory);
+            }
+        }
+
         /** Capacity in 32-bit words. */
         public int words() {
             return words;

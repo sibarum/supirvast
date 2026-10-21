@@ -267,7 +267,8 @@ public final class Accelerator implements AutoCloseable {
      * As {@link #allocate}, for the few words the host reads after every run: on a GPU, in memory the host can see
      * and mapped while the buffer lives, so {@link ResidentBuffer#peek} reads what the last finished run wrote with no
      * submission of its own. A kernel on a discrete GPU reaches it across the bus, so it is for counts and flags,
-     * not state.
+     * not state. The same holds the other way: what the host fills before every run, {@link ResidentBuffer#poke}
+     * writes where it is, where a {@link ResidentBuffer#write} would stage, submit and wait.
      */
     public ResidentBuffer allocateReadout(Type element, int elements) {
         if (!isSupportedColumnType(element)) {
