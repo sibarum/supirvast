@@ -2,6 +2,8 @@
 
 **One shader IR in Java — runs on the GPU as SPIR-V, and on the CPU as an executable Truffle AST, from the same source.**
 
+Part of the [VexelRay](https://sibarum.github.io/) stack. Building an application on it? Start at the [developer guide](https://sibarum.github.io/vexelray-framework/developers/).
+
 Supir-Vast is a Java / GraalVM framework for describing GPU programs (compute kernels and shaders) as a
 typed, structured intermediate representation called **`core`**. A `core` program lowers two ways:
 
