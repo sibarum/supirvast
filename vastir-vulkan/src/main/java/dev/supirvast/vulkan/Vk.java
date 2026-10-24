@@ -24,6 +24,7 @@ public final class Vk {
     public static final int STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER = 45;
 
     // Formats
+    public static final int FORMAT_R8_UNORM = 9;
     public static final int FORMAT_R8G8B8A8_UNORM = 37;
     public static final int FORMAT_R8G8B8A8_SRGB = 43;
 
@@ -89,6 +90,9 @@ public final class Vk {
 
     // Image view / attachments
     public static final int IMAGE_VIEW_TYPE_2D = 1;
+    /** VkComponentSwizzle: what an image view reads into each channel. */
+    public static final int COMPONENT_SWIZZLE_IDENTITY = 0;
+    public static final int COMPONENT_SWIZZLE_R = 3;
     public static final int IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL = 2;
     public static final int ATTACHMENT_LOAD_OP_CLEAR = 1;
     public static final int ATTACHMENT_STORE_OP_STORE = 0;
