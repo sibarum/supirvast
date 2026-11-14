@@ -63,7 +63,7 @@
             <dependency>
                 <groupId>sibarum.atchung</groupId>
                 <artifactId>atchung-probe</artifactId>
-                <version>1.3-SNAPSHOT</version>
+                <version>1.4-SNAPSHOT</version>
             </dependency>
             <!-- Truffle (used by the vast module only). -->
             <dependency>
