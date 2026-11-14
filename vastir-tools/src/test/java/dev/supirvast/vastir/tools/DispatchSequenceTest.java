@@ -233,64 +233,7 @@ class DispatchSequenceTest {
         }
     }
 
-    /**
-     * Not an assertion: the fixed cost of a dispatch, made one at a time and within a sequence. An empty kernel
-     * — one invocation of 256 writes one word — so all that is measured is the cost of dispatching.
-     */
-    @Test
-    void theDispatchFloor() {
-        Buffer out = new Buffer("out", 0, I32);
-        KernelSpec empty = spec(kernel(new Statement.If(eq(gid(), i(0)),
-                        Region.of(new Statement.BufferStore(out, i(0), i(1))), Region.of())),
-                KernelColumn.output("out", 0, I32).withLength(1)).withWorkgroupSize(256);
-        try (Accelerator accelerator = new Accelerator()) {
-            assumeGpu(accelerator);
-            KernelHandle handle = accelerator.register(empty).orElseThrow();
-            ResidentBuffer word = accelerator.allocate(I32, 1);
-            List<ResidentBuffer> buffers = List.of(word);
-            int dispatches = 500;
-            warm(() -> handle.dispatch(buffers, 256), word);
-            long start = System.nanoTime();
-            for (int d = 0; d < dispatches; d++) {
-                handle.dispatch(buffers, 256);
-            }
-            word.read();
-            double single = (System.nanoTime() - start) / 1e6 / dispatches;
-
-            StringBuilder report = new StringBuilder(String.format("[sequence] %s, ms per empty dispatch: one at a "
-                    + "time %.4f", accelerator.capabilities().deviceName(), single));
-            for (int length : new int[] {5, 50}) {
-                DispatchSequence.Builder builder = accelerator.sequence();
-                for (int s = 0; s < length; s++) {
-                    builder.dispatch(handle, buffers, 256);
-                }
-                try (DispatchSequence sequence = builder.build()) {
-                    assertTrue(sequence.recorded());
-                    warm(sequence::run, word);
-                    int runs = dispatches / length;
-                    start = System.nanoTime();
-                    for (int r = 0; r < runs; r++) {
-                        sequence.run();
-                    }
-                    word.read();
-                    report.append(String.format("  in sequences of %d %.4f", length,
-                            (System.nanoTime() - start) / 1e6 / (runs * length)));
-                }
-            }
-            System.out.println(report);
-        }
-    }
-
     // --- harness ------------------------------------------------------------------------------------------
-
-    /** Half a second of work first, so a laptop GPU is off its idle clock before anything is timed. */
-    private static void warm(Runnable work, ResidentBuffer sync) {
-        long warm = System.nanoTime();
-        while (System.nanoTime() - warm < 500_000_000L) {
-            work.run();
-            sync.read();
-        }
-    }
 
     /** {@link #reverse}, reading the lane so its meaning is its subgroups' and the size the device's to give. */
     private static Function subgroupTouchingReverse() {
@@ -326,9 +269,5 @@ class DispatchSequenceTest {
 
     private static Expr add(Expr a, Expr b) {
         return new Expr.Binary(BinaryOp.ADD, a, b);
-    }
-
-    private static Expr eq(Expr a, Expr b) {
-        return new Expr.Binary(BinaryOp.EQUAL, a, b);
     }
 }

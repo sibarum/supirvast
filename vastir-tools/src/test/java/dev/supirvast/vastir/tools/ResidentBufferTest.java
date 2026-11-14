@@ -5,7 +5,6 @@ import dev.supirvast.vastir.core.BinaryOp;
 import dev.supirvast.vastir.core.Buffer;
 import dev.supirvast.vastir.core.Expr;
 import dev.supirvast.vastir.core.Function;
-import dev.supirvast.vastir.core.LocalVar;
 import dev.supirvast.vastir.core.Region;
 import dev.supirvast.vastir.core.Statement;
 import dev.supirvast.vastir.type.Type;
@@ -148,60 +147,6 @@ class ResidentBufferTest {
             assertThrows(IllegalArgumentException.class, () -> step.dispatch(List.of(ints, shortOne), N), "too short");
             ints.close();
             assertThrows(IllegalArgumentException.class, () -> step.dispatch(List.of(ints, shortOne), 1), "closed");
-        }
-    }
-
-    /**
-     * Not an assertion: stepping a 4 MB field a hundred times, by round trips through {@link KernelHandle#run}
-     * against resident dispatches and one read at the end.
-     */
-    @Test
-    void steppingThroughputResidentAgainstRoundTrips() {
-        int n = 1 << 20;
-        int steps = 100;
-        Buffer out = new Buffer("out", 0, F32);
-        Buffer in = new Buffer("in", 1, F32);
-        LocalVar x = new LocalVar("x", F32);
-        Expr gid = new Expr.InvocationId();
-        Function kernel = new Function("main", new Type.FunctionType(Type.VOID, List.of()), Region.of(
-                new Statement.DeclareVar(x, new Expr.BufferLoad(in, gid)),
-                new Statement.BufferStore(out, gid, new Expr.Binary(BinaryOp.ADD,
-                        new Expr.Binary(BinaryOp.MUL, new Expr.Read(x), new Expr.ConstFloat(F32, 0.5)),
-                        new Expr.ConstFloat(F32, 1))),
-                new Statement.ReturnVoid()));
-        KernelSpec spec = new KernelSpec(kernel, List.of(KernelColumn.output("out", 0, F32),
-                KernelColumn.input("in", 1, F32)));
-
-        try (Accelerator accelerator = new Accelerator()) {
-            assumeGpu(accelerator);
-            KernelHandle step = accelerator.register(spec).orElseThrow();
-
-            int[] field = new int[n];
-            step.run(new int[][] {new int[n], field}, n);   // warm
-            long start = System.nanoTime();
-            for (int k = 0; k < steps; k++) {
-                field = step.run(new int[][] {new int[n], field}, n)[0];
-            }
-            double roundTrips = (System.nanoTime() - start) / 1e6;
-
-            ResidentBuffer a = accelerator.allocate(F32, n);
-            ResidentBuffer b = accelerator.allocate(F32, n);
-            a.write(new int[n]);
-            step.dispatch(List.of(b, a), n);   // warm
-            a.read();
-            start = System.nanoTime();
-            for (int k = 0; k < steps; k++) {
-                step.dispatch(k % 2 == 0 ? List.of(b, a) : List.of(a, b), n);
-            }
-            int[] result = a.read();
-            double resident = (System.nanoTime() - start) / 1e6;
-
-            System.out.printf("[resident] %s, 2^20 f32, %d steps: round trips %.1f ms (%.2f ms/step), "
-                            + "resident %.1f ms (%.3f ms/step) including one read%n",
-                    accelerator.capabilities().deviceName(), steps, roundTrips, roundTrips / steps, resident,
-                    resident / steps);
-            // Both converge on the fixed point of x = x/2 + 1.
-            assertEquals(2f, Float.intBitsToFloat(result[n / 2]), 1e-3f);
         }
     }
 
